@@ -629,31 +629,36 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
       <div class="sechead">
         <h2>laxity, not the clock</h2>
         <p class="lede">Escalation is driven by deadline <em>risk</em>, not elapsed time.
-          A batch that is draining fast enough never moves, no matter how much of its window
-          has passed. A batch falling behind climbs on its own, early, without dragging
-          every other batch up with it.</p>
+          Urgency is measured against a <b>6&#8239;h escalation horizon</b> — the last stretch of
+          slack — not against the 24&#8239;h window, so a batch that is draining fast enough never
+          moves, no matter how much of its window has passed. A batch falling behind climbs on
+          its own, early, without dragging every other batch up with it.</p>
         <p class="src">co-serving spec &#167;7 &#183; src/tidal/dispatcher/laxity.py</p>
       </div>
 
       <!-- FIGURE 4 — laxity escalation -->
       <figure class="fig">
         <div class="fig-head">
-          <span>fig. 4 &nbsp;least-laxity-first escalation, first 2 h of a 24 h window</span>
+          <span>fig. 4 &nbsp;least-laxity-first escalation &#8212; a 6 h horizon inside a 24 h window</span>
           <span class="tag">schematic</span>
         </div>
         <div class="scroller s-wide" tabindex="0" role="region" aria-label="Laxity escalation chart, horizontally scrollable">
           <svg viewBox="0 0 940 444" role="img" aria-labelledby="f4t f4d" preserveAspectRatio="xMinYMin meet">
             <title id="f4t">Laxity-driven priority escalation for three batches</title>
             <desc id="f4d">Priority is plotted on an inverted axis, so higher on the chart
-              means more urgent: 100 at the bottom, 1 at the top. Batch A1, five thousand items
-              draining at twelve per second, sits exactly at the 100 cap and completes after
-              seven minutes without ever escalating. Batch A2, eighty-six thousand items at the
-              same rate, sits perfectly flat at priority 92 for the full two hours — its laxity
-              is constant at twenty-two hours, so the clock alone never moves it. Batch B starts
-              at 94 and, as online load collapses its completion rate, climbs continuously to
-              the priority-1 cap at 59 minutes — only 4.1 percent of its 24-hour window. A dotted
-              line above the cap marks priority 0, online parity, which escalation reaches only
-              when sla_strict is enabled.</desc>
+              means more urgent: 100 at the bottom, 1 at the top. Urgency is one minus laxity
+              divided by the six-hour escalation horizon, clamped to zero and one, so any batch
+              with at least six hours of slack sits at exactly priority 100. Batch A1, five
+              thousand items draining at twelve per second, has 23 hours 53 minutes of laxity;
+              it sits at 100 and completes after seven minutes without ever escalating. Batch
+              A2, eighty-six thousand items at the same rate, has a constant laxity of 22 hours
+              1 minute and also sits at exactly 100 for the full two hours — the clock alone
+              never moves it. Batch B also holds at 100 while online load collapses its
+              completion rate; its laxity crosses below the six-hour horizon at 54 minutes, and
+              from there it climbs the whole way to the priority-1 cap in 4.6 minutes, pinning
+              at 58.5 minutes when laxity reaches zero — 4.1 percent of its 24-hour window. A
+              dotted line above the cap marks priority 0, online parity, which escalation
+              reaches only when sla_strict is enabled.</desc>
 
             <defs>
               <clipPath id="f4clip"><rect id="f4-clip" x="88" y="40" width="614" height="300"/></clipPath>
@@ -697,30 +702,42 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
             <text class="svg-lab mut sm" x="395" y="356" text-anchor="middle">elapsed &#8212; the full window is 24 h; this is its first 8.3%</text>
 
             <g clip-path="url(#f4clip)">
-              <!-- A2: 86,000 items @ 12/s -> laxity constant 22h01m -> priority 92, flat -->
-              <line class="f4-a2" x1="90" y1="300.6" x2="697.2" y2="300.6"
-                    stroke="var(--batch)" stroke-width="2" fill="none"/>
-              <!-- A1: 5,000 items @ 12/s -> priority 100, completes at 7m -->
+              <!-- the escalation horizon: the only stretch of B's run where urgency is non-zero -->
+              <rect x="363.7" y="80" width="23.5" height="240" fill="var(--risk)" opacity=".09"/>
+              <!-- A1: 5,000 items @ 12/s -> laxity 23h53m -> priority 100, completes at 7m.
+                   Drawn as a wide translucent band because it lies exactly on A2 and B. -->
               <line class="f4-a1" x1="90" y1="320" x2="125.3" y2="320"
-                    stroke="var(--batch)" stroke-width="2" fill="none" opacity=".55"/>
+                    stroke="var(--batch)" stroke-width="7" fill="none" opacity=".22"/>
               <circle cx="125.3" cy="320" r="3.5" fill="var(--batch)" opacity=".55"/>
-              <!-- B: rate collapses under online load -->
+              <!-- A2: 86,000 items @ 12/s -> laxity constant 22h01m >= 6h -> priority 100, flat -->
+              <line class="f4-a2" x1="90" y1="320" x2="697.2" y2="320"
+                    stroke="var(--batch)" stroke-width="2" fill="none"/>
+              <!-- B before the horizon: laxity > 6h, so also exactly 100 — dashed so it reads
+                   through A2's solid line rather than hiding under it -->
+              <line class="f4-b0" x1="90" y1="320" x2="363.7" y2="320"
+                    stroke="var(--risk)" stroke-width="2.25" fill="none" stroke-dasharray="5 4"/>
+              <!-- B inside the horizon: rate has collapsed under online load, 100 -> 1 in 4.6 m -->
               <polyline class="f4-b" fill="none" stroke="var(--risk)" stroke-width="2.25"
-                points="90.0,305.5 91.7,305.5 93.4,305.5 95.1,305.5 96.8,305.5 98.5,305.5 100.2,305.5 101.9,305.5 103.6,305.5 105.2,305.5 106.9,305.5 108.6,305.5 110.3,305.5 112.0,305.5 113.7,305.5 115.4,305.5 117.1,305.5 118.8,305.5 120.5,305.5 122.2,305.5 123.9,305.5 125.6,305.5 127.3,305.5 129.0,305.5 130.7,305.5 132.4,305.5 134.1,305.5 135.8,305.5 137.4,305.5 139.1,305.5 140.8,305.5 142.5,305.5 144.2,305.5 145.9,305.5 147.6,305.5 149.3,305.5 151.0,305.5 152.7,303.0 154.4,303.0 156.1,303.0 157.8,303.0 159.5,303.0 161.2,303.0 162.9,303.0 164.6,303.0 166.2,300.6 167.9,300.6 169.6,300.6 171.3,300.6 173.0,300.6 174.7,300.6 176.4,298.2 178.1,298.2 179.8,298.2 181.5,298.2 183.2,298.2 184.9,298.2 186.6,295.8 188.3,295.8 190.0,295.8 191.7,295.8 193.4,295.8 195.1,295.8 196.8,293.3 198.4,293.3 200.1,293.3 201.8,293.3 203.5,293.3 205.2,290.9 206.9,290.9 208.6,290.9 210.3,290.9 212.0,288.5 213.7,288.5 215.4,288.5 217.1,288.5 218.8,286.1 220.5,286.1 222.2,286.1 223.9,286.1 225.6,283.6 227.2,283.6 228.9,283.6 230.6,281.2 232.3,281.2 234.0,281.2 235.7,281.2 237.4,278.8 239.1,278.8 240.8,278.8 242.5,276.4 244.2,276.4 245.9,273.9 247.6,273.9 249.3,273.9 251.0,271.5 252.7,271.5 254.4,271.5 256.1,269.1 257.8,269.1 259.4,266.7 261.1,266.7 262.8,266.7 264.5,264.2 266.2,264.2 267.9,261.8 269.6,261.8 271.3,259.4 273.0,259.4 274.7,257.0 276.4,257.0 278.1,254.5 279.8,254.5 281.5,252.1 283.2,252.1 284.9,249.7 286.6,247.3 288.2,247.3 289.9,244.8 291.6,244.8 293.3,242.4 295.0,240.0 296.7,240.0 298.4,237.6 300.1,235.2 301.8,235.2 303.5,232.7 305.2,230.3 306.9,227.9 308.6,227.9 310.3,225.5 312.0,223.0 313.7,220.6 315.4,220.6 317.1,218.2 318.8,215.8 320.4,213.3 322.1,210.9 323.8,208.5 325.5,206.1 327.2,203.6 328.9,201.2 330.6,198.8 332.3,196.4 334.0,193.9 335.7,191.5 337.4,189.1 339.1,186.7 340.8,184.2 342.5,181.8 344.2,177.0 345.9,174.5 347.6,172.1 349.2,169.7 350.9,164.8 352.6,162.4 354.3,160.0 356.0,155.2 357.7,152.7 359.4,150.3 361.1,145.5 362.8,143.0 364.5,138.2 366.2,133.3 367.9,130.9 369.6,126.1 371.3,123.6 373.0,118.8 374.7,113.9 376.4,109.1 378.1,104.2 379.8,101.8 381.4,97.0 383.1,92.1 384.8,87.3 386.5,82.4 388.2,80.0 700.0,80.0"/>
+                points="363.7,320.0 364.1,317.6 364.5,312.7 364.9,310.3 365.3,305.5 365.7,303.0 366.1,298.2 366.5,295.8 366.9,290.9 367.3,288.5 367.7,283.6 368.1,281.2 368.5,276.4 368.9,273.9 369.3,269.1 369.7,264.2 370.1,261.8 370.5,257.0 370.9,254.5 371.3,249.7 371.7,247.3 372.1,242.4 372.5,237.6 372.9,235.2 373.3,230.3 373.7,225.5 374.1,223.0 374.5,218.2 374.9,213.3 375.3,210.9 375.7,206.1 376.1,201.2 376.5,198.8 376.9,193.9 377.3,189.1 377.7,186.7 378.1,181.8 378.5,177.0 378.9,172.1 379.3,169.7 379.7,164.8 380.1,160.0 380.5,155.2 380.9,150.3 381.3,147.9 381.7,143.0 382.1,138.2 382.5,133.3 382.9,128.5 383.3,126.1 383.7,121.2 384.1,116.4 384.5,111.5 384.9,106.7 385.3,101.8 385.7,97.0 386.1,92.1 386.5,87.3 386.9,82.4 387.2,80.0 700.0,80.0"/>
             </g>
 
             <!-- markers -->
             <line id="f4-play" class="svg-rule2" x1="700" y1="46" x2="700" y2="326"/>
-            <line class="svg-rule" x1="379.8" y1="80" x2="379.8" y2="320" stroke-dasharray="2 3"/>
-            <text class="svg-lab rk sm" x="100" y="264">urgency &gt; 0.9 at t = 57 m &#8212;</text>
-            <text class="svg-lab rk sm" x="100" y="276">token-bucket floor engages</text>
-            <circle cx="388.2" cy="80" r="3.5" fill="var(--risk)"/>
-            <text class="svg-lab rk sm" x="398" y="100">pinned at 1 &#8212; t = 59 m,</text>
+            <line class="svg-rule" x1="363.7" y1="80" x2="363.7" y2="320" stroke-dasharray="2 3"/>
+            <text class="svg-lab rk sm" x="100" y="180">B&#8217;s laxity falls below the 6 h</text>
+            <text class="svg-lab rk sm" x="100" y="192">horizon at t = 54 m &#8212; priority is</text>
+            <text class="svg-lab rk sm" x="100" y="204">exactly 100 everywhere left of it</text>
+            <circle cx="385.1" cy="104.2" r="3" fill="none" stroke="var(--risk)" stroke-width="1.25"/>
+            <circle cx="387.2" cy="80" r="3.5" fill="var(--risk)"/>
+            <text class="svg-lab rk sm" x="398" y="100">pinned at 1 &#8212; t = 58.5 m, laxity &#8804; 0,</text>
             <text class="svg-lab rk sm" x="398" y="112">only 4.1% of the 24 h window</text>
+            <text class="svg-lab rk sm" x="398" y="134">urgency &gt; 0.9 at t = 58.1 m &#8212;</text>
+            <text class="svg-lab rk sm" x="398" y="146">token-bucket floor engages</text>
+            <text class="svg-lab mut sm" x="398" y="164">the whole 100&#8594;1 ramp is 4.6 m wide</text>
 
-            <text class="svg-lab ba sm" x="132" y="316">A&#8321; done, never escalated</text>
-            <text class="svg-lab ba sm" x="440" y="294">A&#8322; &#8212; flat at 92 for the whole run</text>
-            <text class="svg-lab rk sm" x="96" y="299">B</text>
+            <text class="svg-lab rk sm" x="96" y="312">B</text>
+            <text class="svg-lab ba sm" x="132" y="312">A&#8321; done at 7 m &#183; laxity 23h 53m</text>
+            <text class="svg-lab ba sm" x="400" y="312">A&#8322; &#8212; laxity 22h 01m, flat at 100</text>
 
             <!-- readout panel -->
             <line class="svg-rule2" x1="716" y1="40" x2="716" y2="424"/>
@@ -731,19 +748,19 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
             <g class="svg-lab sm">
               <text x="730" y="114">remaining</text><text id="f4-a-rem" x="910" y="114" text-anchor="end">0</text>
               <text x="730" y="128">observed rate</text><text id="f4-a-rate" x="910" y="128" text-anchor="end">12.00 /s</text>
-              <text x="730" y="142">projected drain</text><text id="f4-a-drain" x="910" y="142" text-anchor="end">0m</text>
-              <text x="730" y="156">laxity</text><text id="f4-a-lax" x="910" y="156" text-anchor="end">22h 01m</text>
-              <text x="730" y="170">urgency</text><text id="f4-a-urg" x="910" y="170" text-anchor="end">0.083</text>
+              <text x="730" y="142">projected drain</text><text id="f4-a-drain" x="910" y="142" text-anchor="end">&#8212;</text>
+              <text x="730" y="156">laxity</text><text id="f4-a-lax" x="910" y="156" text-anchor="end">22h 0m</text>
+              <text x="730" y="170">urgency</text><text id="f4-a-urg" x="910" y="170" text-anchor="end">0.000</text>
             </g>
             <text class="svg-lab mut sm" x="730" y="190">priority</text>
-            <text id="f4-a-pri" class="svg-lab ba hd" x="910" y="190" text-anchor="end">92</text>
+            <text id="f4-a-pri" class="svg-lab ba hd" x="910" y="190" text-anchor="end">100</text>
 
             <text class="svg-lab rk" x="730" y="222">B &#8212; at risk</text>
             <g class="svg-lab sm">
-              <text x="730" y="238">remaining</text><text id="f4-b-rem" x="910" y="238" text-anchor="end">34,071</text>
-              <text x="730" y="252">observed rate</text><text id="f4-b-rate" x="910" y="252" text-anchor="end">0.19 /s</text>
-              <text x="730" y="266">projected drain</text><text id="f4-b-drain" x="910" y="266" text-anchor="end">50h 41m</text>
-              <text x="730" y="280">laxity</text><text id="f4-b-lax" x="910" y="280" text-anchor="end">&#8722;28h 41m</text>
+              <text x="730" y="238">remaining</text><text id="f4-b-rem" x="910" y="238" text-anchor="end">41,708</text>
+              <text x="730" y="252">observed rate</text><text id="f4-b-rate" x="910" y="252" text-anchor="end">0.06 /s</text>
+              <text x="730" y="266">projected drain</text><text id="f4-b-drain" x="910" y="266" text-anchor="end">193h 6m</text>
+              <text x="730" y="280">laxity</text><text id="f4-b-lax" x="910" y="280" text-anchor="end">&#8722;171h 6m</text>
               <text x="730" y="294">urgency</text><text id="f4-b-urg" x="910" y="294" text-anchor="end">1.000</text>
             </g>
             <text class="svg-lab mut sm" x="730" y="314">priority</text>
@@ -754,26 +771,32 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
               <text x="730" y="348">drain = remaining / rate</text>
               <text x="730" y="362">laxity = (expires_at &#8722; now)</text>
               <text x="746" y="374">&#8722; drain</text>
-              <text x="730" y="392">u = clamp(1 &#8722; laxity/24h,0,1)</text>
-              <text x="730" y="410">priority = round(100 &#8722; u&#215;99)</text>
+              <text x="730" y="390">u = clamp(1 &#8722; laxity/H, 0, 1)</text>
+              <text x="730" y="402">H = escalation_horizon = 6 h</text>
+              <text x="730" y="420">priority = round(100 &#8722; u&#215;99)</text>
             </g>
-            <text class="svg-lab mut sm" x="22" y="382">A&#8322;&#8217;s laxity is <tspan class="svg-lab ba sm">constant</tspan> while it drains at its observed rate &#8212; the two time terms cancel out.</text>
-            <text class="svg-lab mut sm" x="22" y="398">Only a falling rate or a growing backlog moves a batch. The clock alone never does.</text>
-            <text class="svg-lab mut sm" x="22" y="414">A&#8321; sits exactly at the 100 cap: it drains in under 0.5% of its 24 h window.</text>
+            <text class="svg-lab mut sm" x="22" y="382">A&#8321; (laxity 23h 53m) and A&#8322; (22h 01m) both sit at exactly 100: laxity &#8805; the 6 h horizon &#8658; urgency 0.</text>
+            <text class="svg-lab mut sm" x="22" y="398">A&#8322;&#8217;s laxity is <tspan class="svg-lab ba sm">constant</tspan> while it drains at its observed rate &#8212; the time terms cancel, so priority never drifts.</text>
+            <text class="svg-lab mut sm" x="22" y="414">B is dashed where it coincides with A&#8322; at 100. Only a falling rate or a growing backlog moves a batch.</text>
           </svg>
         </div>
         <figcaption>
           <ul class="legend">
-            <li><span class="sw b"></span>on track — flat</li>
-            <li><span class="sw r"></span>at risk — climbing</li>
+            <li><span class="sw b"></span>on track — flat at 100</li>
+            <li><span class="sw r"></span>at risk — flat, then climbing inside the horizon</li>
           </ul>
           Priority is recomputed from <b>laxity</b> — the slack left after the projected drain
-          time — and applied when each item is submitted. Because both time terms cancel for a
-          batch draining at a steady rate, an on-track batch's priority is <b>constant</b>: it
-          does not drift upward just because the day is passing, so healthy batches cause zero
-          extra interference and at-risk batches never escalate as a synchronized flood.
-          B maxes out at <b>59 minutes</b>, having burned 4.1% of its window — early enough
-          that the token-bucket floor still has 23 hours to recover it.
+          time — and applied when each item is submitted. Urgency ramps only inside the final
+          6 h of slack (<code>escalation_horizon</code>); scaling by the full 24 h window would
+          escalate healthy batches on wall-clock alone. Because both time terms cancel for a
+          batch draining at a steady rate, an on-track batch's laxity is <b>constant</b> — A₁ at
+          23h 53m and A₂ at 22h 01m, both far outside the horizon, so both sit at exactly
+          <b>100</b> and never drift just because the day is passing. Healthy batches therefore
+          cause zero extra interference, and at-risk batches never escalate as a synchronized
+          flood. B holds at 100 for 54 minutes, crosses into the horizon, and pins at 1 by
+          <b>58.5 minutes</b> — 4.1% of its window, early enough that the token-bucket floor
+          still has 23 hours to recover it. Not shown: once the floor engages, the guaranteed
+          rate raises laxity back — a closed loop that stabilizes at the floor.
         </figcaption>
       </figure>
     </div>
@@ -826,7 +849,7 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
               <td>leaves slack on the floor by design</td>
               <td>fills every step; unfilled slack is an alarmed metric</td></tr>
             <tr><th scope="row">24 h SLA</th>
-              <td>laxity escalation at submission time</td>
+              <td>laxity escalation (6 h horizon) at submission time</td>
               <td>same, gateway-set; in-engine aging deferred past v1</td></tr>
             <tr><th scope="row">blast radius</th>
               <td>none — the engine is untouched</td>
@@ -1163,19 +1186,23 @@ b = client.batches.create(input_file_id=f.id,
 
   /* ─────────── fig 4 — laxity escalation ─────────── */
   register("f4-play", function () {
-    var W = 86400, AXIS = 7200, X0 = 90, X1 = 700;
+    // W is the 24 h completion window; H is cfg.escalation_horizon_s (6 h) — urgency is
+    // measured against H, never against W. Same closed form as src/tidal/dispatcher/laxity.py.
+    var W = 86400, H = 21600, AXIS = 7200, X0 = 90, X1 = 700;
     var clip = el("f4-clip"), play = el("f4-play"), tN = el("f4-t");
 
-    function urg(l) { return Math.min(1, Math.max(0, 1 - l / W)); }
+    function urg(l) { return Math.min(1, Math.max(0, 1 - l / H)); }
     function prio(u) { return Math.min(100, Math.max(1, Math.floor(100 - u * 99 + 0.5))); }
 
-    // A2 — 86,000 items, steady 12/s: laxity is invariant, so priority never drifts
+    // A2 — 86,000 items, steady 12/s: laxity is invariant at 22h 01m, far outside the
+    // horizon, so urgency is 0 and priority sits at exactly 100 for the whole run
     function simA(t) {
       var rate = 12, rem = Math.max(0, 86000 - rate * t);
       var drain = rem > 0 ? rem / rate : 0, lax = (W - t) - drain, u = urg(lax);
       return { rem: rem, rate: rate, drain: drain, lax: lax, u: u, p: prio(u) };
     }
-    // B — 60,000 items; rate collapses from 12/s as online load takes the GPU
+    // B — 60,000 items; rate collapses from 12/s as online load takes the GPU. Laxity stays
+    // above H until t = 53.8 m, then crosses the whole 100→1 ramp in 4.6 m.
     var K = Math.log(200) / 4876;
     function rateB(t) {
       if (t < 600) return 12;
@@ -1218,7 +1245,7 @@ b = client.batches.create(input_file_id=f.id,
       panel("f4-a-", simA(t));
       panel("f4-b-", simB(t));
     };
-  }, 13.2);
+  }, 5.96);   // static frame: t = 3300 s (55 m) — B has just crossed into the horizon
 
   /* ─────────── driver ─────────── */
   var paused = reduce, raf = null, base = null, clock = 0;
