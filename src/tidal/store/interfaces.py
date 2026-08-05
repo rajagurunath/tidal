@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Protocol
 
 
-class BatchStatus(str, enum.Enum):
+class BatchStatus(enum.StrEnum):
     VALIDATING = "validating"
     FAILED = "failed"
     IN_PROGRESS = "in_progress"
@@ -34,7 +34,7 @@ class BatchStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class ItemState(str, enum.Enum):
+class ItemState(enum.StrEnum):
     PENDING = "pending"
     INFLIGHT = "inflight"
     SUCCEEDED = "succeeded"

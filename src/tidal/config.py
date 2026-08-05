@@ -52,7 +52,7 @@ class TidalConfig:
     batch_discount: float = 0.5
 
     @classmethod
-    def from_env(cls) -> "TidalConfig":
+    def from_env(cls) -> TidalConfig:
         kwargs = {}
         for f in fields(cls):
             env = os.environ.get(f"TIDAL_{f.name.upper()}")
