@@ -454,6 +454,17 @@ async def test_at_risk_batch_escalates_priority_and_on_track_batch_does_not():
     assert early.escalated_priorities[on_track.id] == 100
     assert fresh_client.priorities == [100]
 
+    # Halfway through the 24h window with a healthy drain rate is still "on
+    # track": 12h of slack is twice the escalation horizon, so the batch must
+    # not escalate at all. (A window-wide urgency ramp would put it at ~51.)
+    midway_repo, midway_client = FakeRepo(), FakeClient(kv_usage=0.10)
+    midway_batch = midway_repo.add_batch(10, created_at=T0, window_hours=24)
+    midway = make_dispatcher(midway_repo, midway_client)
+    for i in range(3):
+        report = await run_tick(midway, T0 + timedelta(hours=12, seconds=i))
+    assert report.escalated_priorities[midway_batch.id] == 100
+    assert set(midway_client.priorities) == {100}
+
 
 async def test_escalation_floor_keeps_items_flowing_under_sustained_load():
     cfg = TidalConfig(max_inflight=4, floor_items_per_s=0.2, floor_urgency=0.9)
@@ -461,7 +472,9 @@ async def test_escalation_floor_keeps_items_flowing_under_sustained_load():
     at_risk = repo.add_batch(20, created_at=T0, window_hours=24)
     disp = make_dispatcher(repo, client, cfg)
 
-    start = T0 + timedelta(hours=23)  # urgency ~0.96 > floor_urgency
+    # 30 minutes of slack against a 6h escalation horizon → urgency ~0.92,
+    # above floor_urgency, so the token bucket must keep the batch draining.
+    start = T0 + timedelta(hours=23, minutes=30)
     for i in range(10):
         await run_tick(disp, start + timedelta(seconds=i))
 

@@ -241,19 +241,29 @@ class Dispatcher:
         floor = 0
         for batch, pending, inflight in snapshot:
             remaining = pending + inflight
-            window_s = (batch.expires_at - batch.created_at).total_seconds()
-            rate = self._rate_for(batch.id)
-            if rate is None:  # cold start: no drain estimate yet
-                laxity = laxity_seconds(batch.expires_at, now, 0, 1.0)
-            else:
-                laxity = laxity_seconds(batch.expires_at, now, remaining, rate)
-            u = urgency(laxity, window_s)
-            priorities[batch.id] = priority_for(u, self.cfg)
+            priority, u = self._priority_for(batch, remaining, now)
+            priorities[batch.id] = priority
             if remaining > 0 and u > self.cfg.floor_urgency:
                 bucket = self._buckets.setdefault(batch.id, TokenBucket.from_config(self.cfg))
                 if bucket.try_take(self._now_ts):
                     floor = max(floor, 1)
         return priorities, floor
+
+    def _priority_for(self, batch: BatchRecord, remaining: int, now: datetime) -> tuple[int, float]:
+        """``(priority, urgency)`` for one batch at ``now``.
+
+        Urgency is measured against ``cfg.escalation_horizon_s`` — the last H
+        seconds of *slack* — not against the SLA window, so a batch that is on
+        track stays at ``batch_priority_max`` however deep into its 24h window
+        it is.
+        """
+        rate = self._rate_for(batch.id)
+        if rate is None:  # cold start: no drain estimate yet
+            laxity = laxity_seconds(batch.expires_at, now, 0, 1.0)
+        else:
+            laxity = laxity_seconds(batch.expires_at, now, remaining, rate)
+        u = urgency(laxity, self.cfg.escalation_horizon_s)
+        return priority_for(u, self.cfg), u
 
     async def _fill(
         self,

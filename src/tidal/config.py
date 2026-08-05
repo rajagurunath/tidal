@@ -33,6 +33,7 @@ class TidalConfig:
     online_waiting_tolerance: int = 0
 
     # -- laxity escalation (both techniques) --
+    escalation_horizon_s: float = 6 * 3600.0  # urgency ramps only inside this much slack
     batch_priority_max: int = 100  # fully safe
     batch_priority_min: int = 1  # most urgent, still below online (0)
     sla_strict: bool = False  # True → urgency 1.0 may reach priority 0

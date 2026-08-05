@@ -5,13 +5,23 @@ takes its clock by injection, so the dispatcher's escalation behaviour is
 testable without sleeping, without a wall clock and without an engine::
 
     laxity(b)   = (b.expires_at - now) - remaining(b) / observed_rate(b)
-    urgency(b)  = clamp(1 - laxity(b) / SLA_WINDOW, 0, 1)
+    urgency(b)  = clamp(1 - laxity(b) / ESCALATION_HORIZON, 0, 1)
     priority(b) = round(P_MAX - urgency * (P_MAX - P_MIN))
 
 On-track batches sit at ``batch_priority_max`` (100) and cause zero
 interference; batches whose projected drain time eats into their remaining
 window climb continuously toward ``batch_priority_min`` (1, still below
 online's 0 — unless ``sla_strict``, where urgency exactly 1.0 reaches 0).
+
+**The horizon is not the SLA window.** Urgency is measured against
+``cfg.escalation_horizon_s`` (default 6h), not the full 24h completion window.
+Dividing by the window would make *slack itself* escalating: a perfectly
+healthy batch 12h from its deadline with minutes of work left would show
+urgency 0.5 and priority ~51, stealing capacity from online traffic for no
+reason. With a horizon, laxity ≥ H means urgency 0 and priority 100 — an
+on-track batch never escalates, however far through its window it is — and the
+ramp to priority 1 happens over the last H seconds of slack, which is the only
+region where escalation buys anything.
 """
 
 from __future__ import annotations
@@ -74,18 +84,20 @@ def laxity_seconds(
     return slack - remaining_items / rate
 
 
-def urgency(laxity_s: float, window_s: float) -> float:
-    """``clamp(1 - laxity / window, 0, 1)``.
+def urgency(laxity_s: float, horizon_s: float) -> float:
+    """``clamp(1 - laxity / horizon, 0, 1)``.
 
-    0.0 when the batch has a full SLA window of slack, 1.0 the moment its
-    projected finish time reaches its deadline. A degenerate (non-positive)
-    window is treated as "already due": urgent iff laxity has run out.
+    0.0 while the batch still has a full escalation horizon of slack (so an
+    on-track batch never escalates, no matter how much of its SLA window has
+    elapsed), 1.0 the moment its projected finish time reaches its deadline,
+    linear in between. A degenerate (non-positive) horizon is treated as
+    "already due": urgent iff laxity has run out.
     """
-    if window_s <= 0:
+    if horizon_s <= 0:
         return 1.0 if laxity_s <= 0 else 0.0
     if math.isnan(laxity_s):
         return 1.0
-    return min(1.0, max(0.0, 1.0 - laxity_s / window_s))
+    return min(1.0, max(0.0, 1.0 - laxity_s / horizon_s))
 
 
 def priority_for(urgency_value: float, cfg: TidalConfig) -> int:

@@ -17,6 +17,8 @@ from tidal.dispatcher.laxity import (
 )
 
 WINDOW_S = 24 * 3600.0
+#: Escalation horizon: urgency only ramps inside the final H of *slack*.
+HORIZON_S = TidalConfig().escalation_horizon_s
 T0 = datetime(2026, 8, 6, 12, 0, 0)
 EXPIRES = T0 + timedelta(hours=24)
 
@@ -70,28 +72,43 @@ def test_laxity_goes_negative_past_expiry():
 # --------------------------------------------------------------------------- urgency
 
 
-def test_urgency_is_zero_when_laxity_equals_full_window():
-    assert urgency(WINDOW_S, WINDOW_S) == 0.0
+def test_urgency_is_zero_when_laxity_equals_the_horizon():
+    assert urgency(HORIZON_S, HORIZON_S) == 0.0
 
 
-def test_urgency_clamps_at_zero_for_laxity_beyond_the_window():
-    assert urgency(WINDOW_S * 3, WINDOW_S) == 0.0
+def test_urgency_clamps_at_zero_for_laxity_beyond_the_horizon():
+    assert urgency(HORIZON_S * 3, HORIZON_S) == 0.0
+    # The whole point of the horizon: a batch with far more slack than H is
+    # *not* half-urgent just because it is halfway through its SLA window.
+    assert urgency(WINDOW_S / 2, HORIZON_S) == 0.0
 
 
 def test_urgency_is_exactly_one_at_zero_laxity_and_clamps_below():
-    assert urgency(0.0, WINDOW_S) == 1.0
-    assert urgency(-WINDOW_S * 10, WINDOW_S) == 1.0
+    assert urgency(0.0, HORIZON_S) == 1.0
+    assert urgency(-HORIZON_S * 10, HORIZON_S) == 1.0
 
 
-def test_urgency_is_linear_in_between():
-    assert urgency(WINDOW_S / 2, WINDOW_S) == pytest.approx(0.5)
-    assert urgency(WINDOW_S * 0.25, WINDOW_S) == pytest.approx(0.75)
+def test_urgency_is_linear_inside_the_horizon():
+    assert urgency(HORIZON_S / 2, HORIZON_S) == pytest.approx(0.5)
+    assert urgency(HORIZON_S * 0.25, HORIZON_S) == pytest.approx(0.75)
 
 
-def test_urgency_with_nonpositive_window_degenerates_safely():
+def test_urgency_with_nonpositive_horizon_degenerates_safely():
     assert urgency(10.0, 0.0) == 0.0
     assert urgency(0.0, 0.0) == 1.0
     assert urgency(-1.0, -5.0) == 1.0
+
+
+def test_urgency_stays_at_zero_until_slack_drops_below_the_horizon():
+    # A healthy batch, 12h from its deadline with 10 items of work left: it has
+    # ~12h of slack, twice the horizon, so it must not escalate at all.
+    lax = laxity_seconds(EXPIRES, EXPIRES - timedelta(hours=12), 10, 1.0)
+    assert lax > HORIZON_S
+    assert urgency(lax, HORIZON_S) == 0.0
+
+    # It only starts to climb once slack itself falls inside the horizon.
+    inside = laxity_seconds(EXPIRES, EXPIRES - timedelta(hours=3), 10, 1.0)
+    assert 0.0 < urgency(inside, HORIZON_S) < 1.0
 
 
 def test_urgency_monotone_in_time_and_backlog():
@@ -102,7 +119,7 @@ def test_urgency_monotone_in_time_and_backlog():
     prev = -1.0
     for hours in range(0, 25):
         now = EXPIRES - timedelta(hours=24 - hours)
-        u = urgency(laxity_seconds(EXPIRES, now, remaining, cfg_rate), WINDOW_S)
+        u = urgency(laxity_seconds(EXPIRES, now, remaining, cfg_rate), HORIZON_S)
         assert u >= prev
         prev = u
     assert prev == 1.0
@@ -111,7 +128,7 @@ def test_urgency_monotone_in_time_and_backlog():
     now = T0 + timedelta(hours=6)
     prev = -1.0
     for backlog in (0, 10, 100, 1_000, 10_000, 100_000, 1_000_000):
-        u = urgency(laxity_seconds(EXPIRES, now, backlog, cfg_rate), WINDOW_S)
+        u = urgency(laxity_seconds(EXPIRES, now, backlog, cfg_rate), HORIZON_S)
         assert u >= prev
         prev = u
     assert prev == 1.0
@@ -122,21 +139,36 @@ def test_urgency_monotone_in_time_and_backlog():
 
 def test_on_track_batch_stays_at_100():
     cfg = TidalConfig()
-    # a minute into a 24h window, 10 items left, healthy rate → laxity ≈ window
-    now = T0 + timedelta(minutes=1)
-    lax = laxity_seconds(EXPIRES, now, 10, 1.0)
-    u = urgency(lax, WINDOW_S)
-    assert u < 0.01
-    assert priority_for(u, cfg) == cfg.batch_priority_max == 100
+    horizon = cfg.escalation_horizon_s
+
+    # a minute into a 24h window, 10 items left, healthy rate → laxity ≫ horizon
+    lax = laxity_seconds(EXPIRES, T0 + timedelta(minutes=1), 10, 1.0)
+    assert priority_for(urgency(lax, horizon), cfg) == cfg.batch_priority_max == 100
+
+    # Hour 12 of the window — half the SLA gone, but the batch has ~12h of slack
+    # against a trivial backlog. "On-track batches never escalate" means this is
+    # still priority 100, not the 51 a window-wide ramp would produce.
+    midway = laxity_seconds(EXPIRES, T0 + timedelta(hours=12), 10, 1.0)
+    assert urgency(midway, horizon) == 0.0
+    assert priority_for(urgency(midway, horizon), cfg) == 100
+
+    # Hour 18 is the first moment this batch's slack enters the horizon; before
+    # then it is flat at 100, after it ramps monotonically but is not yet pinned.
+    edge = laxity_seconds(EXPIRES, T0 + timedelta(hours=18), 10, 1.0)
+    assert priority_for(urgency(edge, horizon), cfg) == 100
+    late = laxity_seconds(EXPIRES, T0 + timedelta(hours=23), 10, 1.0)
+    assert cfg.batch_priority_min < priority_for(urgency(late, horizon), cfg) < 100
 
 
 def test_at_risk_batch_escalates_early():
     cfg = TidalConfig()
-    # 2h in, 100k items left, crawling at 0.05 items/s → 23 days of work in 22h
-    now = T0 + timedelta(hours=2)
-    u = urgency(laxity_seconds(EXPIRES, now, 100_000, 0.05), WINDOW_S)
-    assert u == 1.0
-    assert priority_for(u, cfg) == cfg.batch_priority_min == 1
+    # 2h in, 100k items left, crawling at 0.05 items/s → 23 days of work in 22h.
+    # Laxity is deeply negative, so urgency is 1 no matter where the clock is.
+    for hours in (0, 2, 12, 23):
+        now = T0 + timedelta(hours=hours)
+        u = urgency(laxity_seconds(EXPIRES, now, 100_000, 0.05), cfg.escalation_horizon_s)
+        assert u == 1.0
+        assert priority_for(u, cfg) == cfg.batch_priority_min == 1
 
 
 def test_priority_capped_at_1_unless_strict():
