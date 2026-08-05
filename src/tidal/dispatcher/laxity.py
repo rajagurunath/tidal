@@ -213,7 +213,7 @@ class TokenBucket:
             self._last = now
             return
         elapsed = now - self._last
-        if elapsed <= 0:                      # clock went backwards: mint nothing
+        if elapsed <= 0:  # clock went backwards: mint nothing
             return
         self._last = now
         self._tokens = min(float(self.burst), self._tokens + elapsed * self.rate_items_per_s)

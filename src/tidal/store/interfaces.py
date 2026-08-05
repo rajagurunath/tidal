@@ -49,23 +49,23 @@ class IllegalTransition(Exception):
 
 @dataclass
 class FileRecord:
-    id: str                      # "file-<uuid>"
-    purpose: str                 # "batch" | "batch_output" | "batch_error"
+    id: str  # "file-<uuid>"
+    purpose: str  # "batch" | "batch_output" | "batch_error"
     filename: str
     size_bytes: int
     sha256: str
     created_at: datetime
-    blob_path: str               # filesystem path of the raw JSONL bytes
+    blob_path: str  # filesystem path of the raw JSONL bytes
 
 
 @dataclass
 class BatchRecord:
-    id: str                      # "batch-<uuid>"
+    id: str  # "batch-<uuid>"
     input_file_id: str
-    endpoint: str                # "/v1/chat/completions" | "/v1/completions"
+    endpoint: str  # "/v1/chat/completions" | "/v1/completions"
     status: BatchStatus
     created_at: datetime
-    expires_at: datetime         # created_at + completion window (24h)
+    expires_at: datetime  # created_at + completion window (24h)
     counts_total: int
     counts_completed: int
     counts_failed: int
@@ -74,17 +74,17 @@ class BatchRecord:
     error_file_id: str | None = None
     cancelled_at: datetime | None = None
     completed_at: datetime | None = None
-    in_progress_at: datetime | None = None   # set on first transition to IN_PROGRESS
+    in_progress_at: datetime | None = None  # set on first transition to IN_PROGRESS
 
 
 @dataclass
 class ItemRecord:
-    id: str                      # "item-<uuid>"
+    id: str  # "item-<uuid>"
     batch_id: str
-    custom_id: str               # unique within batch
+    custom_id: str  # unique within batch
     line_no: int
-    prefix_group: int            # bucket for prefix-affinity ordering
-    request_json: dict           # the OpenAI request body from the JSONL line
+    prefix_group: int  # bucket for prefix-affinity ordering
+    request_json: dict  # the OpenAI request body from the JSONL line
     state: ItemState
     attempts: int = 0
     last_error: str | None = None
@@ -120,8 +120,12 @@ class Repository(Protocol):
 
     # -- batches --
     def create_batch(
-        self, input_file_id: str, endpoint: str, window_hours: int,
-        metadata: dict[str, str], items: list[tuple[str, int, int, dict]],
+        self,
+        input_file_id: str,
+        endpoint: str,
+        window_hours: int,
+        metadata: dict[str, str],
+        items: list[tuple[str, int, int, dict]],
         # items: (custom_id, line_no, prefix_group, request_json)
     ) -> BatchRecord: ...
     def get_batch(self, batch_id: str) -> BatchRecord | None: ...
@@ -129,8 +133,11 @@ class Repository(Protocol):
     def find_batches_by_metadata(self, key: str, value: str) -> list[BatchRecord]: ...
     def set_batch_status(self, batch_id: str, status: BatchStatus) -> BatchRecord: ...
     def finalize_batch(
-        self, batch_id: str, status: BatchStatus,
-        output_file_id: str | None, error_file_id: str | None,
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        output_file_id: str | None,
+        error_file_id: str | None,
     ) -> BatchRecord: ...
 
     # -- items --
@@ -139,44 +146,57 @@ class Repository(Protocol):
         them. Ordering 'edf_prefix': earliest batch expires_at, then
         prefix_group, then line_no. Ordering 'fifo': line_no only."""
         ...
+
     def record_item_success(
-        self, item_id: str, result_json: dict,
-        prompt_tokens: int, completion_tokens: int, vllm_request_id: str | None,
+        self,
+        item_id: str,
+        result_json: dict,
+        prompt_tokens: int,
+        completion_tokens: int,
+        vllm_request_id: str | None,
     ) -> ItemRecord: ...
     def record_item_failure(self, item_id: str, error: str, *, retryable: bool) -> ItemRecord:
         """retryable=True and attempts < max → back to PENDING (attempts+1);
         otherwise → FAILED."""
         ...
+
     def requeue_inflight(self) -> int:
         """Crash recovery: all INFLIGHT items without result → PENDING.
         Returns count requeued."""
         ...
+
     def expire_batch(self, batch_id: str) -> BatchRecord:
         """PENDING/INFLIGHT items → EXPIRED; batch → EXPIRED."""
         ...
+
     def cancel_batch(self, batch_id: str) -> BatchRecord:
         """PENDING/INFLIGHT → CANCELLED; batch → CANCELLING (caller flips to
         CANCELLED after in-flight aborts complete)."""
         ...
+
     def batch_progress(self, batch_id: str) -> tuple[int, int, int]:
         """(total, completed, failed) live counts."""
         ...
+
     def pending_and_inflight(self, batch_id: str) -> tuple[int, int]: ...
     # added A7 — result assembly needs to enumerate a batch's items by state.
-    def list_items(
-        self, batch_id: str, states: list[ItemState] | None = None
-    ) -> list[ItemRecord]:
+    def list_items(self, batch_id: str, states: list[ItemState] | None = None) -> list[ItemRecord]:
         """Items of a batch in ``line_no`` order, optionally filtered by state."""
         ...
 
     # -- metering --
     def record_usage(
-        self, item_id: str, model: str,
-        prompt_tokens: int, completion_tokens: int, cost_usd: float,
+        self,
+        item_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost_usd: float,
     ) -> None: ...
     def usage_summary(self, since: datetime | None) -> list[dict]:
         """Rows: {model, prompt_tokens, completion_tokens, cost_usd, items}."""
         ...
+
     def set_price(self, model: str, input_per_mtok: float, output_per_mtok: float) -> None: ...
     def price_table(self) -> dict[str, tuple[float, float]]:
         """{model: (input_per_mtok, output_per_mtok)} — online list prices."""
@@ -190,4 +210,5 @@ def make_repository(dsn: str, blob_dir: str) -> Repository:
     'postgresql+psycopg://...'.
     """
     from tidal.store.repo import SqlRepository
+
     return SqlRepository(dsn, blob_dir)

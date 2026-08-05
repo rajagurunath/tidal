@@ -235,9 +235,7 @@ class FakeRepository:
     def batch_progress(self, batch_id: str) -> tuple[int, int, int]:
         items = self.items.get(batch_id, [])
         completed = sum(1 for i in items if i.state is ItemState.SUCCEEDED)
-        failed = sum(
-            1 for i in items if i.state in (ItemState.FAILED, ItemState.EXPIRED)
-        )
+        failed = sum(1 for i in items if i.state in (ItemState.FAILED, ItemState.EXPIRED))
         return len(items), completed, failed
 
     def pending_and_inflight(self, batch_id: str) -> tuple[int, int]:

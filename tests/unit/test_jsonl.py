@@ -22,9 +22,7 @@ def chat_line(custom_id: str, content: str = "hello", **body_extra: object) -> s
 def completion_line(custom_id: str, prompt: str = "hello", **body_extra: object) -> str:
     body = {"model": "m", "prompt": prompt}
     body.update(body_extra)
-    return json.dumps(
-        {"custom_id": custom_id, "method": "POST", "url": COMPLETIONS, "body": body}
-    )
+    return json.dumps({"custom_id": custom_id, "method": "POST", "url": COMPLETIONS, "body": body})
 
 
 def blob(*lines: str) -> bytes:
@@ -153,18 +151,14 @@ def test_n_greater_than_one_is_rejected():
 
 
 def test_missing_model_is_rejected():
-    raw = json.dumps(
-        {"custom_id": "a", "method": "POST", "url": CHAT, "body": {"messages": []}}
-    )
+    raw = json.dumps({"custom_id": "a", "method": "POST", "url": CHAT, "body": {"messages": []}})
     with pytest.raises(BatchInputError) as exc:
         parse_batch_input(blob(raw), CHAT)
     assert "model" in exc.value.reason
 
 
 def test_chat_body_without_messages_is_rejected():
-    raw = json.dumps(
-        {"custom_id": "a", "method": "POST", "url": CHAT, "body": {"model": "m"}}
-    )
+    raw = json.dumps({"custom_id": "a", "method": "POST", "url": CHAT, "body": {"model": "m"}})
     with pytest.raises(BatchInputError) as exc:
         parse_batch_input(blob(raw), CHAT)
     assert "messages" in exc.value.reason
@@ -237,8 +231,10 @@ def test_grouping_uses_only_the_first_message():
             "url": CHAT,
             "body": {
                 "model": "m",
-                "messages": [{"role": "system", "content": "shared"},
-                             {"role": "user", "content": "q1"}],
+                "messages": [
+                    {"role": "system", "content": "shared"},
+                    {"role": "user", "content": "q1"},
+                ],
             },
         }
     )
@@ -249,8 +245,10 @@ def test_grouping_uses_only_the_first_message():
             "url": CHAT,
             "body": {
                 "model": "m",
-                "messages": [{"role": "system", "content": "shared"},
-                             {"role": "user", "content": "q2"}],
+                "messages": [
+                    {"role": "system", "content": "shared"},
+                    {"role": "user", "content": "q2"},
+                ],
             },
         }
     )

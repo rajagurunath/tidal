@@ -87,9 +87,7 @@ def _load_json(raw: str, line_no: int) -> dict:
     return obj
 
 
-def _validate_envelope(
-    envelope: dict, line_no: int, endpoint: str, seen_ids: set[str]
-) -> str:
+def _validate_envelope(envelope: dict, line_no: int, endpoint: str, seen_ids: set[str]) -> str:
     custom_id = envelope.get("custom_id")
     if not isinstance(custom_id, str) or not custom_id:
         raise BatchInputError(line_no, "missing or empty custom_id")

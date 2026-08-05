@@ -155,8 +155,7 @@ def _v1_router(cfg: TidalConfig, repo: Repository) -> APIRouter:
         if body.completion_window != COMPLETION_WINDOW:
             raise ApiError(
                 400,
-                f"completion_window must be '{COMPLETION_WINDOW}', "
-                f"got {body.completion_window!r}.",
+                f"completion_window must be '{COMPLETION_WINDOW}', got {body.completion_window!r}.",
                 param="completion_window",
             )
         if body.endpoint not in SUPPORTED_ENDPOINTS:

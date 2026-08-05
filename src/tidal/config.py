@@ -15,7 +15,7 @@ class TidalConfig:
     vllm_metrics_url: str = "http://127.0.0.1:8000/metrics"
     dsn: str = "sqlite:///tidal.db"
     blob_dir: str = "tidal_blobs"
-    api_key: str = "tidal-dev-key"          # static bearer token for the Batch API
+    api_key: str = "tidal-dev-key"  # static bearer token for the Batch API
     host: str = "127.0.0.1"
     port: int = 8080
 
@@ -29,20 +29,20 @@ class TidalConfig:
     ewma_alpha: float = 0.5
     kv_high: float = 0.85
     kv_low: float = 0.70
-    max_inflight: int = 4                    # 64 on GPU; 4 for Mac CPU dev
+    max_inflight: int = 4  # 64 on GPU; 4 for Mac CPU dev
     online_waiting_tolerance: int = 0
 
     # -- laxity escalation (both techniques) --
-    batch_priority_max: int = 100            # fully safe
-    batch_priority_min: int = 1              # most urgent, still below online (0)
-    sla_strict: bool = False                 # True → urgency 1.0 may reach priority 0
-    floor_urgency: float = 0.9               # token-bucket floor kicks in above this
+    batch_priority_max: int = 100  # fully safe
+    batch_priority_min: int = 1  # most urgent, still below online (0)
+    sla_strict: bool = False  # True → urgency 1.0 may reach priority 0
+    floor_urgency: float = 0.9  # token-bucket floor kicks in above this
     floor_items_per_s: float = 0.2
 
     # -- engine (technique B: TidalScheduler) --
     tbt_slo_ms: float = 200.0
-    interference_guard: float = 0.2          # fraction of TBT SLO held back
-    cold_start_batch_frac: float = 0.25      # static cap until T̂ fit converges
+    interference_guard: float = 0.2  # fraction of TBT SLO held back
+    cold_start_batch_frac: float = 0.25  # static cap until T̂ fit converges
     fit_window_steps: int = 4000
     fit_r2_gate: float = 0.85
     kv_guardband_min: float = 0.05

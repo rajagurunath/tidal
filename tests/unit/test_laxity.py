@@ -154,9 +154,9 @@ def test_priority_capped_at_1_unless_strict():
 def test_priority_is_linear_and_rounds_half_up_at_band_edges():
     cfg = TidalConfig()  # 100 → 1 over 99 points
     assert priority_for(0.0, cfg) == 100
-    assert priority_for(0.5, cfg) == 51        # 100 - 49.5 = 50.5 → 51 (half-up, not banker's)
-    assert priority_for(0.25, cfg) == 75       # 100 - 24.75 = 75.25 → 75
-    assert priority_for(0.99, cfg) == 2        # 100 - 98.01 = 1.99 → 2
+    assert priority_for(0.5, cfg) == 51  # 100 - 49.5 = 50.5 → 51 (half-up, not banker's)
+    assert priority_for(0.25, cfg) == 75  # 100 - 24.75 = 75.25 → 75
+    assert priority_for(0.99, cfg) == 2  # 100 - 98.01 = 1.99 → 2
     assert priority_for(1.0, cfg) == 1
 
 
@@ -206,9 +206,9 @@ def test_observed_rate_span_is_floored_so_a_burst_does_not_explode_the_rate():
     clock = FakeClock()
     r = ObservedRate(window_s=60.0, now=clock, min_span_s=1.0)
     for _ in range(5):
-        r.record()          # five completions at t=0
+        r.record()  # five completions at t=0
     clock.advance(0.001)
-    assert r.rate() == pytest.approx(5.0)   # 5 / min_span, not 5 / 0.001
+    assert r.rate() == pytest.approx(5.0)  # 5 / min_span, not 5 / 0.001
 
 
 def test_observed_rate_evicts_samples_outside_the_window():
@@ -218,7 +218,7 @@ def test_observed_rate_evicts_samples_outside_the_window():
         clock.advance(1.0)
         r.record()
     assert r.rate() == pytest.approx(1.0, rel=0.2)
-    clock.advance(100.0)                    # everything ages out
+    clock.advance(100.0)  # everything ages out
     assert r.rate() == RATE_EPSILON
 
 
@@ -229,7 +229,7 @@ def test_observed_rate_decays_as_the_window_slides():
         clock.advance(1.0)
         r.record()
     busy = r.rate()
-    clock.advance(5.0)                      # half the window now empty
+    clock.advance(5.0)  # half the window now empty
     assert r.rate() < busy
 
 
@@ -259,7 +259,7 @@ def test_token_bucket_starts_full_and_drains():
 
 
 def test_token_bucket_refills_at_the_configured_rate():
-    b = TokenBucket(rate_items_per_s=0.2, burst=2)   # one token per 5s
+    b = TokenBucket(rate_items_per_s=0.2, burst=2)  # one token per 5s
     assert b.try_take(0.0) and b.try_take(0.0)
     assert b.try_take(4.9) is False
     assert b.try_take(5.0) is True
@@ -288,9 +288,9 @@ def test_token_bucket_with_zero_rate_never_refills():
 
 def test_token_bucket_ignores_clock_going_backwards():
     b = TokenBucket(rate_items_per_s=1.0, burst=1, initial_tokens=0.0)
-    assert b.try_take(0.0) is False         # first call establishes the epoch
-    assert b.try_take(10.0) is True         # 10s of refill, capped at burst=1
-    assert b.try_take(5.0) is False         # backwards clock must not mint tokens
+    assert b.try_take(0.0) is False  # first call establishes the epoch
+    assert b.try_take(10.0) is True  # 10s of refill, capped at burst=1
+    assert b.try_take(5.0) is False  # backwards clock must not mint tokens
     assert b.try_take(11.0) is True
 
 

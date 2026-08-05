@@ -171,9 +171,9 @@ def test_usage_report_aggregates_and_shows_savings(repo, cfg):
     out = usage_report(repo, None)
 
     assert "m" in out
-    assert "2" in out                 # items
-    assert "0.002000" in out          # batch cost, 2 x $0.001
-    assert "0.004000" in out          # would-be online cost
+    assert "2" in out  # items
+    assert "0.002000" in out  # batch cost, 2 x $0.001
+    assert "0.004000" in out  # would-be online cost
     assert "TOTAL" in out
 
 
@@ -202,9 +202,9 @@ def test_usage_report_honours_since(repo, cfg):
     recent = usage_report(repo, datetime.now(UTC) - timedelta(hours=1))
     everything = usage_report(repo, None)
 
-    assert "4.501000" in everything      # both ledger rows aggregated
+    assert "4.501000" in everything  # both ledger rows aggregated
     assert "4.501000" not in recent
-    assert "0.001000" in recent          # only the row inside the window
+    assert "0.001000" in recent  # only the row inside the window
 
 
 def test_usage_report_is_readable_when_empty(repo):

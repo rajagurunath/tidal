@@ -7,9 +7,9 @@ import pytest
 from tidal.config import TidalConfig
 from tidal.dispatcher.aimd import AimdController
 
-CALM_KV = 0.10      # < kv_low   → additive increase
-STEADY_KV = 0.75    # between kv_low and kv_high → hold
-HOT_KV = 0.95       # > kv_high  → multiplicative decrease
+CALM_KV = 0.10  # < kv_low   → additive increase
+STEADY_KV = 0.75  # between kv_low and kv_high → hold
+HOT_KV = 0.95  # > kv_high  → multiplicative decrease
 
 
 def grow_to(ctl: AimdController, n: int) -> int:
@@ -74,8 +74,8 @@ def test_tolerance_allows_some_online_queueing_before_backing_off():
     cfg = TidalConfig(max_inflight=64, online_waiting_tolerance=2)
     ctl = AimdController(cfg)
     grow_to(ctl, 8)
-    assert ctl.update(CALM_KV, waiting=10, inflight=8) == 9      # lb == 2, not > 2
-    assert ctl.update(CALM_KV, waiting=13, inflight=9) == 4      # lb == 4 > 2 → halve
+    assert ctl.update(CALM_KV, waiting=10, inflight=8) == 9  # lb == 2, not > 2
+    assert ctl.update(CALM_KV, waiting=13, inflight=9) == 4  # lb == 4 > 2 → halve
 
 
 def test_aimd_never_exceeds_max_inflight():
@@ -90,8 +90,8 @@ def test_aimd_never_below_floor():
     cfg = TidalConfig(max_inflight=64)
     ctl = AimdController(cfg)
     grow_to(ctl, 32)
-    ctl.set_floor(3)                       # a batch crossed floor_urgency
-    for _ in range(20):                    # sustained overload
+    ctl.set_floor(3)  # a batch crossed floor_urgency
+    for _ in range(20):  # sustained overload
         ctl.update(HOT_KV, waiting=999, inflight=1)
         assert ctl.target >= 3
     assert ctl.target == 3
@@ -112,7 +112,7 @@ def test_set_floor_raises_the_target_immediately():
     assert ctl.target == 0
     ctl.set_floor(2)
     assert ctl.target == 2
-    ctl.set_floor(0)                       # lowering the floor does not drop the target
+    ctl.set_floor(0)  # lowering the floor does not drop the target
     assert ctl.target == 2
     assert ctl.floor == 0
 
@@ -131,7 +131,7 @@ def test_halving_rounds_down_but_stops_at_one_then_zero():
     cfg = TidalConfig(max_inflight=64)
     ctl = AimdController(cfg)
     grow_to(ctl, 5)
-    assert ctl.update(HOT_KV, waiting=0, inflight=5) == 2       # 5 // 2
+    assert ctl.update(HOT_KV, waiting=0, inflight=5) == 2  # 5 // 2
     assert ctl.update(HOT_KV, waiting=0, inflight=2) == 1
     assert ctl.update(HOT_KV, waiting=0, inflight=1) == 0
     assert ctl.update(HOT_KV, waiting=0, inflight=0) == 0

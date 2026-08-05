@@ -77,7 +77,7 @@ class AimdController:
         online_waiting_lb = max(0, int(waiting) - int(inflight))
         cfg = self.cfg
         if online_waiting_lb > cfg.online_waiting_tolerance or kv_usage > cfg.kv_high:
-            self._target = max(self._floor, self._target // 2)      # multiplicative decrease
+            self._target = max(self._floor, self._target // 2)  # multiplicative decrease
         elif kv_usage < cfg.kv_low:
             self._target = min(cfg.max_inflight, self._target + 1)  # additive increase
         self._target = self._clamp(self._target)
