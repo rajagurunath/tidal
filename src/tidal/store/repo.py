@@ -24,9 +24,11 @@ import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 from sqlalchemy import (
     JSON,
+    CursorResult,
     DateTime,
     Float,
     ForeignKey,
@@ -475,16 +477,20 @@ class SqlRepository:
             if output_file_id is not None or error_file_id is not None:
                 # Conditional UPDATE, so the claim is atomic on any backend
                 # rather than a read-then-write with a window in the middle.
-                claimed = session.execute(
-                    update(BatchRow)
-                    .where(
-                        BatchRow.id == batch_id,
-                        BatchRow.output_file_id.is_(None),
-                        BatchRow.error_file_id.is_(None),
-                    )
-                    .values(output_file_id=output_file_id, error_file_id=error_file_id)
-                    .execution_options(synchronize_session=False)
-                ).rowcount
+                claim = cast(
+                    "CursorResult",
+                    session.execute(
+                        update(BatchRow)
+                        .where(
+                            BatchRow.id == batch_id,
+                            BatchRow.output_file_id.is_(None),
+                            BatchRow.error_file_id.is_(None),
+                        )
+                        .values(output_file_id=output_file_id, error_file_id=error_file_id)
+                        .execution_options(synchronize_session=False)
+                    ),
+                )
+                claimed = claim.rowcount
                 session.expire(row)  # re-read what actually landed
                 if not claimed:
                     return _batch_record(row)

@@ -311,11 +311,11 @@ class Dispatcher:
         missing = sorted({item.batch_id for item in claimed} - batches.keys())
         resolved: list[BatchRecord] = []
         if missing:
-            for batch, pending, inflight in await asyncio.to_thread(self._resolve, missing):
-                batches[batch.id] = batch
-                resolved.append(batch)
+            for found, pending, inflight in await asyncio.to_thread(self._resolve, missing):
+                batches[found.id] = found
+                resolved.append(found)
                 priorities.setdefault(
-                    batch.id, self._priority_for(batch, pending + inflight, now)[0]
+                    found.id, self._priority_for(found, pending + inflight, now)[0]
                 )
 
         started: list[str] = []
