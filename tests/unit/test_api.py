@@ -156,6 +156,7 @@ async def test_sdk_drives_upload_create_retrieve_cancel(sdk, repo):
     fetched = await sdk.batches.retrieve(batch.id)
     assert fetched.id == batch.id
     assert fetched.status == "validating"
+    assert fetched.in_progress_at is None  # nothing has been dispatched yet
 
     # Every item is still PENDING, so the cancel has nothing to wait for: it
     # lands in CANCELLED on the spot rather than parking in CANCELLING.
@@ -187,6 +188,7 @@ async def test_sdk_reads_output_file_of_a_finished_batch(sdk, repo):
     assert fetched.status == "completed"
     assert fetched.output_file_id == out_file.id
     assert fetched.completed_at is not None
+    assert fetched.in_progress_at is not None  # stamped when it started
 
     meta = await sdk.files.retrieve(out_file.id)
     assert meta.purpose == "batch_output"

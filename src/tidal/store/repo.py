@@ -178,6 +178,7 @@ class BatchRow(Base):
     batch_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     output_file_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_file_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    in_progress_at: Mapped[datetime | None] = mapped_column(_UtcDateTime, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(_UtcDateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(_UtcDateTime, nullable=True)
 
@@ -257,6 +258,7 @@ def _batch_record(row: BatchRow) -> BatchRecord:
         error_file_id=row.error_file_id,
         cancelled_at=row.cancelled_at,
         completed_at=row.completed_at,
+        in_progress_at=row.in_progress_at,
     )
 
 
@@ -796,7 +798,12 @@ class SqlRepository:
     def _apply_batch_status(row: BatchRow, status: BatchStatus, timestamp: datetime) -> None:
         _check("batch", row.id, row.status, status, _BATCH_TRANSITIONS)
         row.status = status
-        if status is BatchStatus.COMPLETED:
+        if status is BatchStatus.IN_PROGRESS and row.in_progress_at is None:
+            # Stamped on the *first* transition only: the dispatcher re-asserts
+            # IN_PROGRESS on later ticks and OpenAI's in_progress_at means "when
+            # the batch started", not "when it was last touched".
+            row.in_progress_at = timestamp
+        elif status is BatchStatus.COMPLETED:
             row.completed_at = timestamp
         elif status is BatchStatus.CANCELLED:
             row.cancelled_at = timestamp

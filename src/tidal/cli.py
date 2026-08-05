@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -27,6 +28,12 @@ from tidal.config import TidalConfig
 from tidal.metering.ledger import Meter
 from tidal.metering.report import usage_report
 from tidal.store.interfaces import Repository, make_repository
+
+log = logging.getLogger("tidal.cli")
+
+#: Shipped placeholder bearer token — fine on loopback, never on a public bind.
+DEFAULT_API_KEY = "tidal-dev-key"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 app = typer.Typer(
     add_completion=False,
@@ -59,7 +66,8 @@ def serve(
     from tidal.dispatcher.vllm_client import VllmClient
 
     cfg = _config(dsn=dsn, blob_dir=blob_dir, host=host, port=port)
-    repo = make_repository(cfg.dsn, cfg.blob_dir)
+    _warn_on_default_key(cfg)
+    repo = make_repository(cfg.dsn, cfg.blob_dir, cfg.max_item_attempts)
     seed_prices(repo, cfg)
 
     meter = Meter(repo, cfg)
@@ -89,9 +97,26 @@ def report(
 ) -> None:
     """Print token usage, batch cost, and savings against online list prices."""
     cfg = _config(dsn=dsn, blob_dir=blob_dir)
-    repo = make_repository(cfg.dsn, cfg.blob_dir)
+    repo = make_repository(cfg.dsn, cfg.blob_dir, cfg.max_item_attempts)
     since = datetime.now(UTC) - timedelta(hours=since_hours) if since_hours else None
     typer.echo(usage_report(repo, since))
+
+
+def _warn_on_default_key(cfg: TidalConfig) -> None:
+    """Shout if the shipped bearer token is about to be exposed off-box.
+
+    ``cfg.api_key`` is the only thing between the internet and a queue that
+    spends GPU time, and the default is printed in the README.
+    """
+    if cfg.api_key != DEFAULT_API_KEY or cfg.host in LOOPBACK_HOSTS:
+        return
+    message = (
+        f"SECURITY: serving on {cfg.host}:{cfg.port} with the default API key "
+        f"{DEFAULT_API_KEY!r}. Anyone who can reach this port can submit batch "
+        "work and read every batch's results. Set TIDAL_API_KEY to a secret."
+    )
+    log.warning(message)
+    typer.secho(f"WARNING  {message}", fg=typer.colors.RED, bold=True, err=True)
 
 
 def seed_prices(repo: Repository, cfg: TidalConfig) -> None:

@@ -137,6 +137,7 @@ class BatchObject(BaseModel):
             output_file_id=rec.output_file_id,
             error_file_id=rec.error_file_id,
             created_at=unix(rec.created_at) or 0,
+            in_progress_at=unix(rec.in_progress_at),
             expires_at=unix(rec.expires_at),
             completed_at=finished if status == "completed" else None,
             failed_at=finished if status == "failed" else None,

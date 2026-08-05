@@ -238,3 +238,59 @@ def test_cli_exposes_serve_and_report():
 
     names = {cmd.name or cmd.callback.__name__ for cmd in app.registered_commands}
     assert {"serve", "report"} <= names
+
+
+def _run_serve(tmp_path, monkeypatch, **env_overrides):
+    """Invoke ``tidal serve`` with uvicorn stubbed out, returning (result, spy)."""
+    pytest.importorskip("tidal.dispatcher.loop")
+    import uvicorn
+
+    from tidal import cli as cli_module
+
+    built: dict = {}
+    real = cli_module.make_repository
+
+    def spy(dsn: str, blob_dir: str, max_attempts: int = 3):
+        built["max_attempts"] = max_attempts
+        built["repo"] = real(dsn, blob_dir, max_attempts)
+        return built["repo"]
+
+    monkeypatch.setattr(cli_module, "make_repository", spy)
+    monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
+
+    env = {
+        "TIDAL_DSN": f"sqlite:///{tmp_path / 'tidal.db'}",
+        "TIDAL_BLOB_DIR": str(tmp_path / "blobs"),
+        **env_overrides,
+    }
+    return CliRunner().invoke(cli_module.app, ["serve"], env=env), built
+
+
+def test_cli_serve_passes_max_item_attempts_to_the_repository(tmp_path, monkeypatch):
+    """TIDAL_MAX_ITEM_ATTEMPTS was configurable but never reached the store."""
+    result, built = _run_serve(tmp_path, monkeypatch, TIDAL_MAX_ITEM_ATTEMPTS="1")
+
+    assert result.exit_code == 0, result.output
+    assert built["max_attempts"] == 1
+    assert built["repo"].max_attempts == 1
+
+
+def test_cli_serve_warns_when_the_default_key_is_bound_publicly(tmp_path, monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="tidal.cli"):
+        result, _built = _run_serve(tmp_path, monkeypatch, TIDAL_HOST="0.0.0.0")
+    assert result.exit_code == 0, result.output
+    assert "tidal-dev-key" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="tidal.cli"):
+        result, _built = _run_serve(
+            tmp_path, monkeypatch, TIDAL_HOST="0.0.0.0", TIDAL_API_KEY="a-real-secret"
+        )
+    assert result.exit_code == 0, result.output
+    assert caplog.text == ""
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="tidal.cli"):
+        result, _built = _run_serve(tmp_path, monkeypatch)  # loopback default
+    assert result.exit_code == 0, result.output
+    assert caplog.text == ""

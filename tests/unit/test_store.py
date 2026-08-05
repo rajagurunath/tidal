@@ -354,6 +354,22 @@ def test_cancel_flow_and_illegal_transition_raises(repo):
         repo.set_batch_status(completed.id, BatchStatus.IN_PROGRESS)
 
 
+def test_in_progress_at_is_stamped_once_and_persisted(repo):
+    """OpenAI's batch object exposes in_progress_at; it has to survive a read."""
+    b = _batch(repo, items=[("a", 1, 0, _body())], now=T0)
+    assert repo.get_batch(b.id).in_progress_at is None
+
+    started = repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0)
+    assert started.in_progress_at == T0
+    assert repo.get_batch(b.id).in_progress_at == T0
+
+    # The dispatcher re-asserts IN_PROGRESS on later ticks: the stamp is when
+    # the batch *first* started, not when it was last touched.
+    again = repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0 + timedelta(hours=1))
+    assert again.in_progress_at == T0
+    assert repo.get_batch(b.id).in_progress_at == T0
+
+
 def test_finalize_batch_attaches_output_files(repo):
     b = _batch(repo, items=[("a", 1, 0, _body())], now=T0)
     out_f = repo.create_file("batch_output", "out.jsonl", b"{}\n", now=T0)

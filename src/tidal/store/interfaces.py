@@ -203,12 +203,14 @@ class Repository(Protocol):
         ...
 
 
-def make_repository(dsn: str, blob_dir: str) -> Repository:
+def make_repository(dsn: str, blob_dir: str, max_attempts: int = 3) -> Repository:
     """Factory implemented in tidal.store.repo (SQLAlchemy).
 
     dsn examples: 'sqlite:///tidal.db' (WAL enabled automatically),
-    'postgresql+psycopg://...'.
+    'postgresql+psycopg://...'. ``max_attempts`` is the per-item retry budget
+    (``TidalConfig.max_item_attempts``); the store keeps no config import of
+    its own, so callers must pass it through.
     """
     from tidal.store.repo import SqlRepository
 
-    return SqlRepository(dsn, blob_dir)
+    return SqlRepository(dsn, blob_dir, max_attempts)

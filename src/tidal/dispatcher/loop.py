@@ -23,6 +23,18 @@ The dispatcher is deliberately decoupled from metering (A6) and result
 assembly (A7): both arrive as plain callables (``on_success``, ``finalize``),
 so this module imports neither. Hook exceptions are logged, never fatal.
 
+**One dispatcher, by assumption.** There is no ownership lease: nothing stops a
+second Tidal process from pointing at the same store and running its own tick
+loop. The store keeps that from corrupting anything — the claim is a single
+``UPDATE ... WHERE state='pending' ... RETURNING``, so two dispatchers can
+never claim the same item; terminal item transitions are idempotent, so a
+duplicate or late result cannot drift ``request_counts``; and attaching result
+files is a first-writer-wins claim, so two finalizers cannot produce two output
+files. What is *not* covered is duplicated work and double metering: two
+dispatchers would each submit items and each meter their own successes, and the
+AIMD controllers would fight for the same GPU with independent targets. Run
+exactly one dispatcher per store until a lease exists.
+
 **Cold-start rate.** ``laxity = slack - remaining/rate`` needs an observed
 completion rate, and a batch that has just been created has none — taken
 literally (rate = ε) *every* new batch would be maximally urgent, pinning the
