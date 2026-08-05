@@ -1,0 +1,44 @@
+# Tidal 🌊
+
+**Batch + online co-serving for vLLM** — an OpenAI-compatible Batch API (`/v1/batches`, 24h SLA, half price) that runs on the *same* GPU as your online traffic, filling every iteration's spare token budget with batch work.
+
+> Your GPU's decode iterations use ~1% of their token budget. Tidal sells the other 99%.
+
+## Two techniques, one repo
+
+| | Technique A — Gateway | Technique B — TidalScheduler |
+|---|---|---|
+| Where policy lives | Sidecar process (external control) | Inside the engine (`--scheduler-cls`) |
+| vLLM requirement | Stock, `--scheduling-policy priority` | Latest main, plugin subclass |
+| Batch admission | AIMD watermarks on `/metrics` (1 Hz) | Per-iteration token-budget packing with a self-calibrating interference model |
+| 24h SLA | Laxity-driven priority escalation (LLF) | Same, plus KV guardband + cheap-victim preemption |
+
+Both give you: durable OpenAI-wire `/v1/files` + `/v1/batches`, crash-safe SQLite/Postgres storage, laxity-based deadline guarantees, and metering at a 50% batch discount. The [paper](docs/paper/) compares them head-to-head.
+
+## Quickstart
+
+```bash
+uv venv && uv pip install -e ".[dev]"
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --scheduling-policy priority   # terminal 1
+tidal serve                                                          # terminal 2
+```
+
+Then use any OpenAI SDK against the gateway:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="tidal-dev-key")
+f = client.files.create(file=open("requests.jsonl", "rb"), purpose="batch")
+b = client.batches.create(input_file_id=f.id, endpoint="/v1/chat/completions",
+                          completion_window="24h")
+```
+
+Technique B: add `--scheduler-cls tidal.engine.scheduler.TidalScheduler` to `vllm serve`.
+
+## Status
+
+Alpha, under active development. Design docs in [`docs/plans/`](docs/plans/); research paper draft in [`docs/paper/`](docs/paper/).
+
+## License
+
+Apache-2.0.

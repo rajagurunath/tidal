@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install -e ".[dev]"
+      - name: Lint
+        run: |
+          .venv/bin/ruff check src tests
+          .venv/bin/ruff format --check src tests
+      - name: Unit tests
+        run: .venv/bin/pytest tests/unit -q
+      # Integration tests need a live vLLM engine; they run locally / on
+      # self-hosted GPU runners, marked with "-m integration".

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tidal.db*
+tidal_blobs/
+results/
+*.png
+!docs/**/*.png
+.DS_Store
