@@ -236,5 +236,5 @@ def test_cli_exposes_serve_and_report():
     pytest.importorskip("tidal.dispatcher.loop")
     from tidal.cli import app
 
-    names = {cmd.name for cmd in app.registered_commands}
+    names = {cmd.name or cmd.callback.__name__ for cmd in app.registered_commands}
     assert {"serve", "report"} <= names
