@@ -82,11 +82,35 @@ def _waiting_ids(scheduler) -> set[str]:
 # -- classification & construction ----------------------------------------
 
 
-def test_classify_splits_at_priority_ten():
-    online, boundary, batch = create_requests(3, priorities=[9, 10, 100])
+def test_classify_splits_at_priority_one():
+    """Online is priority 0 and nothing else; every batch band is >= 1.
+
+    The gateway emits 100..1 for batch work, so an *escalated* batch item sits
+    at priority 1..9 — it must still be classified as batch (capped,
+    guardbanded, counted in batch telemetry) rather than smuggled into the
+    online partition by its own urgency.
+    """
+    online, escalated, mid, boundary, batch = create_requests(5, priorities=[0, 1, 9, 10, 100])
     assert not TidalScheduler.classify(online)
+    assert TidalScheduler.classify(escalated)
+    assert TidalScheduler.classify(mid)
     assert TidalScheduler.classify(boundary)
     assert TidalScheduler.classify(batch)
+
+
+def test_escalated_batch_request_is_still_capped_as_batch():
+    """A priority-1 item is subject to the batch token cap, not exempt from it."""
+    scheduler = create_scheduler(TidalScheduler, max_num_batched_tokens=256)
+    scheduler.latency_model = _ModelStub(cap=0)
+
+    for request in create_requests(3, priorities=[ONLINE, 1, 1], num_tokens=64):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"0": 64}  # the online request only
+    assert scheduler.tidal_stats.held_count == 2
+    assert scheduler.tidal_stats.batch_tokens == 0
 
 
 def test_construction_requires_the_priority_policy():
@@ -211,6 +235,41 @@ def test_proactive_eviction_picks_cheapest_batch_victim():
     assert expensive in scheduler.running
     # The victim is parked in the waiting queue, not dropped.
     assert cheap.request_id in _waiting_ids(scheduler)
+
+
+def test_failed_eviction_puts_the_victim_back_in_running(monkeypatch, caplog):
+    """If ``_preempt_request`` raises, the victim must not fall out of the world.
+
+    It has already been popped from ``running`` at that point; leaving it there
+    would strand a request that still holds KV blocks and is still in
+    ``self.requests`` — it would never be scheduled or freed again.
+    """
+    scheduler = create_scheduler(TidalScheduler, max_num_batched_tokens=256)
+    cheap = create_requests(1, priorities=[BATCH], num_tokens=32)[0]
+    expensive = create_requests(1, priorities=[BATCH], num_tokens=160, starting_idx=9)[0]
+    for request in (cheap, expensive):
+        scheduler.add_request(request)
+    scheduler.schedule()  # offline mode admits both
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("preemption exploded")
+
+    monkeypatch.setattr(scheduler, "_preempt_request", boom)
+    scheduler.guardband = _GuardbandStub(admit=False, evict=True)
+
+    with caplog.at_level("ERROR", logger="tidal.engine.scheduler"):
+        scheduler.schedule()
+
+    assert scheduler.tidal_stats.evicted == 0
+    assert cheap in scheduler.running
+    assert expensive in scheduler.running
+    assert cheap.status == RequestStatus.RUNNING
+    assert "eviction" in caplog.text
+    # ...and the next step still runs, with the victim intact and schedulable.
+    scheduler.guardband = _GuardbandStub(admit=True, evict=False)
+    scheduler.schedule()
+    assert cheap in scheduler.running
+    assert cheap.request_id in scheduler.requests
 
 
 def test_exception_in_super_restores_held_requests(monkeypatch):

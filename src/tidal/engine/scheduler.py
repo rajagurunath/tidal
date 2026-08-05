@@ -5,8 +5,8 @@ A `scheduler_cls` plugin for vLLM V1. It does **not** reimplement upstream's
 
     schedule()  ==  pre-gate  ->  super().schedule()  ->  post-telemetry
 
-**Pre-gate.** Requests with ``priority >= 10`` are *batch* (best-effort);
-``0..9`` are *online* (guaranteed). Each step we compute a token cap ``X`` for
+**Pre-gate.** Requests with ``priority >= 1`` are *batch* (best-effort);
+priority ``0`` is *online* (guaranteed). Each step we compute a token cap ``X`` for
 batch work from the self-calibrating latency model (:mod:`tidal.engine.latency_model`)
 and hide every waiting batch request that does not fit under it, so the stock
 scheduler simply never sees them. Held requests are removed from the waiting
@@ -65,8 +65,8 @@ __all__ = ["BATCH_PRIORITY_THRESHOLD", "TickStats", "TidalScheduler"]
 
 logger = logging.getLogger("tidal.engine.scheduler")
 
-#: Gateway SLA ladder emits bands 100/50/10/1 for batch; online is 0..9.
-BATCH_PRIORITY_THRESHOLD = 10
+#: Online is priority 0 and nothing else; every batch band (100..1) is >= 1.
+BATCH_PRIORITY_THRESHOLD = 1
 #: Throttle for the "something in the hook blew up" log.
 ERROR_LOG_INTERVAL_S = 60.0
 #: Cadence of the compact INFO telemetry line.
@@ -95,9 +95,9 @@ class TickStats:
     ``TidalScheduler.tidal_stats``; the eval harness scrapes it."""
 
     step: int = 0
-    #: Tokens scheduled this step for requests with ``priority < 10``.
+    #: Tokens scheduled this step for requests with ``priority == 0``.
     online_tokens: int = 0
-    #: Tokens scheduled this step for requests with ``priority >= 10``.
+    #: Tokens scheduled this step for requests with ``priority >= 1``.
     batch_tokens: int = 0
     #: Waiting batch requests hidden from the stock scheduler this step.
     held_count: int = 0
@@ -220,10 +220,19 @@ class TidalScheduler(_UpstreamScheduler):  # type: ignore[misc,valid-type]
     def classify(request: Request) -> bool:
         """True if ``request`` is *batch* (best-effort) work.
 
-        The gateway's SLA ladder emits priority bands 100/50/10/1; online
-        traffic is 0. Band 1 (maximum escalation) still counts as batch for
-        capping purposes but sorts ahead of every other batch item in the stock
-        heap — intended.
+        Online traffic in this system is priority **0 and only 0**; the
+        gateway's laxity ladder emits 100 down to 1 for batch work. So the
+        split is ``>= 1``, not ``>= 10``: an item that escalated to priority
+        1..9 because its deadline is close is still batch work and must stay
+        capped, guardbanded and counted as batch in the telemetry. Its urgency
+        buys it head-of-heap position among batch requests, never an exemption
+        from the interference budget that protects online latency.
+
+        The one deliberate exception is ``cfg.sla_strict``: there the gateway
+        may stamp an about-to-miss batch item with priority 0, and this
+        classifier then counts it as online. That is exactly what sla_strict
+        means — *parity* with online traffic, uncapped, as the last resort for
+        holding the 24h SLA.
         """
         return int(getattr(request, "priority", 0) or 0) >= BATCH_PRIORITY_THRESHOLD
 
@@ -383,17 +392,28 @@ class TidalScheduler(_UpstreamScheduler):  # type: ignore[misc,valid-type]
         if not candidates:
             return 0
         victim = min(candidates, key=self._unrecoverable_work)
+        # The victim is out of `running` but not yet preempted for the duration
+        # of this block, which is the one window where an exception could strand
+        # it: still in `self.requests`, still holding KV blocks, in no queue.
+        # So the whole hand-off is atomic-or-undone — on any failure we put it
+        # back and skip eviction for this step (the stock inline preemption path
+        # remains the backstop).
+        removed = False
         try:
             self.running.remove(victim)
-        except ValueError:  # pragma: no cover - defensive
+            removed = True
+            # Upstream contract: pop from `running` outside, then call this. It
+            # frees blocks, resets num_computed_tokens and prepends to `waiting`.
+            self._preempt_request(
+                victim,
+                time.monotonic(),
+                drop_stale_output=bool(getattr(self, "requires_kv_delivery", False)),
+            )
+        except Exception:
+            if removed:
+                self.running.append(victim)
+            self._log_hook_failure("tidal: proactive eviction failed, victim restored to running")
             return 0
-        # Upstream contract: pop from `running` outside, then call this. It
-        # frees blocks, resets num_computed_tokens and prepends to `waiting`.
-        self._preempt_request(
-            victim,
-            time.monotonic(),
-            drop_stale_output=bool(getattr(self, "requires_kv_delivery", False)),
-        )
         logger.debug(
             "tidal: evicted batch request %s (lost %d tokens, kv=%.3f)",
             getattr(victim, "request_id", "?"),
