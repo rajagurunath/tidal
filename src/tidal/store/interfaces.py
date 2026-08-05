@@ -74,6 +74,7 @@ class BatchRecord:
     error_file_id: str | None = None
     cancelled_at: datetime | None = None
     completed_at: datetime | None = None
+    in_progress_at: datetime | None = None   # set on first transition to IN_PROGRESS
 
 
 @dataclass
@@ -98,7 +99,19 @@ class ItemRecord:
 class Repository(Protocol):
     """Single data-access surface. All methods are synchronous; the API and
     dispatcher call them via ``asyncio.to_thread`` (SQLite is fast enough,
-    and this keeps the ORM session model trivial)."""
+    and this keeps the ORM session model trivial).
+
+    Conventions (pinned after A1 implementation review):
+    - Every mutating method accepts keyword-only ``now: datetime | None = None``
+      (UTC-aware) for deterministic tests; implementations default to
+      ``datetime.now(UTC)`` and must reject naive datetimes.
+    - Unknown ids: getters return None; mutators raise KeyError;
+      ``read_file_content`` raises FileNotFoundError.
+    - ``list_batches`` with an unknown ``after`` cursor returns an empty page.
+    - ``batch_progress`` counts completed=SUCCEEDED, failed=FAILED only;
+      EXPIRED/CANCELLED items count as neither, so completed+failed may be
+      < total for expired/cancelled batches (OpenAI request_counts semantics).
+    """
 
     # -- files --
     def create_file(self, purpose: str, filename: str, content: bytes) -> FileRecord: ...
@@ -157,6 +170,10 @@ class Repository(Protocol):
     ) -> None: ...
     def usage_summary(self, since: datetime | None) -> list[dict]:
         """Rows: {model, prompt_tokens, completion_tokens, cost_usd, items}."""
+        ...
+    def set_price(self, model: str, input_per_mtok: float, output_per_mtok: float) -> None: ...
+    def price_table(self) -> dict[str, tuple[float, float]]:
+        """{model: (input_per_mtok, output_per_mtok)} — online list prices."""
         ...
 
 
