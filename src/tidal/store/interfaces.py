@@ -162,6 +162,12 @@ class Repository(Protocol):
         """(total, completed, failed) live counts."""
         ...
     def pending_and_inflight(self, batch_id: str) -> tuple[int, int]: ...
+    # added A7 — result assembly needs to enumerate a batch's items by state.
+    def list_items(
+        self, batch_id: str, states: list[ItemState] | None = None
+    ) -> list[ItemRecord]:
+        """Items of a batch in ``line_no`` order, optionally filtered by state."""
+        ...
 
     # -- metering --
     def record_usage(

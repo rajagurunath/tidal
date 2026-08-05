@@ -621,6 +621,21 @@ class SqlRepository:
                 self._count_items(session, batch_id, ItemState.INFLIGHT),
             )
 
+    def list_items(self, batch_id: str, states: list[ItemState] | None = None) -> list[ItemRecord]:
+        """Return a batch's items in ``line_no`` order (added for A7).
+
+        Args:
+            states: keep only items in these states; ``None`` returns all of
+                them. An unknown ``batch_id`` yields an empty list — result
+                assembly polls this and must not care about races.
+        """
+        with self._session() as session:
+            stmt = select(ItemRow).where(ItemRow.batch_id == batch_id)
+            if states:
+                stmt = stmt.where(ItemRow.state.in_(list(states)))
+            stmt = stmt.order_by(ItemRow.line_no, ItemRow.seq)
+            return [_item_record(r) for r in session.execute(stmt).scalars()]
+
     # -- metering --
 
     def record_usage(
