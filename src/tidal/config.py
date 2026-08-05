@@ -20,7 +20,7 @@ class TidalConfig:
     port: int = 8080
 
     # -- batch semantics --
-    completion_window_hours: int = 24
+    completion_window_hours: float = 24.0
     max_item_attempts: int = 3
     served_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
 
