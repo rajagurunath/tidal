@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -185,6 +186,69 @@ def test_record_item_success_stores_result_and_bumps_counts(repo):
     assert repo.get_batch(b.id).counts_completed == 1
 
 
+def test_record_item_success_twice_does_not_drift_counts(repo):
+    """A second success for the same item is a no-op, not a double count.
+
+    There is no ownership lease on the dispatcher, so a duplicate submission
+    (or a retried hook) must not be able to inflate ``counts_completed`` past
+    the number of items that actually succeeded.
+    """
+    b = _batch(repo, items=[("a", 1, 0, _body())], now=T0)
+    (item,) = repo.claim_pending_items(limit=1, now=T0)
+    first = repo.record_item_success(item.id, {"choices": ["one"]}, 11, 7, "req-1", now=T0)
+
+    again = repo.record_item_success(
+        item.id, {"choices": ["two"]}, 999, 999, "req-2", now=T0 + timedelta(minutes=1)
+    )
+
+    assert again.state is ItemState.SUCCEEDED
+    assert again.result_json == {"choices": ["one"]}  # the first result stands
+    assert (again.usage_prompt_tokens, again.usage_completion_tokens) == (11, 7)
+    assert again.vllm_request_id == "req-1"
+    assert again.finished_at == first.finished_at
+    assert repo.get_batch(b.id).counts_completed == 1
+    assert repo.batch_progress(b.id) == (1, 1, 0)
+
+
+def test_late_success_for_an_expired_item_is_ignored(repo):
+    """The sweep already closed this item; the engine's answer arrives after."""
+    b = _batch(repo, window_hours=1, items=[("a", 1, 0, _body())], now=T0)
+    (item,) = repo.claim_pending_items(limit=1, now=T0)
+    repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0)
+    repo.expire_batch(b.id, now=T0 + timedelta(hours=2))
+
+    late = repo.record_item_success(
+        item.id, {"choices": []}, 5, 5, "req-late", now=T0 + timedelta(hours=2)
+    )
+
+    assert late.state is ItemState.EXPIRED
+    assert late.result_json is None
+    assert repo.get_batch(b.id).counts_completed == 0
+    assert repo.batch_progress(b.id) == (1, 0, 0)
+
+
+def test_record_item_failure_on_a_terminal_item_is_ignored(repo):
+    b = _batch(repo, items=[("a", 1, 0, _body()), ("b", 2, 0, _body())], now=T0)
+    failed, cancelled = repo.claim_pending_items(limit=2, now=T0)
+    repo.record_item_failure(failed.id, "boom", retryable=False, now=T0)
+    assert repo.get_batch(b.id).counts_failed == 1
+
+    again = repo.record_item_failure(failed.id, "boom again", retryable=False, now=T0)
+    assert again.state is ItemState.FAILED
+    assert again.attempts == 1
+    assert again.last_error == "boom"
+    assert repo.get_batch(b.id).counts_failed == 1
+
+    # A cancelled item is terminal too: a late failure must not turn it into a
+    # FAILED item and must not count towards request_counts.failed.
+    repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0)
+    repo.cancel_batch(b.id, now=T0)
+    late = repo.record_item_failure(cancelled.id, "engine 500", retryable=True, now=T0)
+    assert late.state is ItemState.CANCELLED
+    assert late.attempts == 0
+    assert repo.get_batch(b.id).counts_failed == 1
+
+
 def test_retryable_failure_requeues_until_max_attempts(repo):
     _batch(repo, items=[("a", 1, 0, _body())], now=T0)
 
@@ -277,8 +341,11 @@ def test_cancel_flow_and_illegal_transition_raises(repo):
     with pytest.raises(IllegalTransition):
         repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS)
 
-    with pytest.raises(IllegalTransition):
-        repo.record_item_success(a.id, {"choices": []}, 1, 1, None, now=T0)
+    # A result that lands after the cancel sweep is dropped, not an error: the
+    # item is already terminal and its counts are already final.
+    stale = repo.record_item_success(a.id, {"choices": []}, 1, 1, None, now=T0)
+    assert stale.state is ItemState.CANCELLED
+    assert repo.get_batch(b.id).counts_completed == 0
 
     completed = _batch(repo, items=[("z", 1, 0, _body())], now=T0)
     repo.set_batch_status(completed.id, BatchStatus.IN_PROGRESS, now=T0)
@@ -301,6 +368,69 @@ def test_finalize_batch_attaches_output_files(repo):
     assert done.output_file_id == out_f.id
     assert done.error_file_id == err_f.id
     assert done.completed_at == T0 + timedelta(minutes=5)
+
+
+def test_finalize_batch_does_not_overwrite_an_existing_claim(repo):
+    """Attaching result files is a claim: first writer wins, rest are no-ops."""
+    b = _batch(repo, items=[("a", 1, 0, _body())], now=T0)
+    first_out = repo.create_file("batch_output", "out.jsonl", b"{}\n", now=T0)
+    second_out = repo.create_file("batch_output", "out2.jsonl", b"{}\n", now=T0)
+    second_err = repo.create_file("batch_error", "err2.jsonl", b"{}\n", now=T0)
+    repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0)
+
+    won = repo.finalize_batch(b.id, BatchStatus.COMPLETED, first_out.id, None, now=T0)
+    lost = repo.finalize_batch(
+        b.id,
+        BatchStatus.COMPLETED,
+        second_out.id,
+        second_err.id,
+        now=T0 + timedelta(minutes=1),
+    )
+
+    assert won.output_file_id == first_out.id
+    assert lost.output_file_id == first_out.id
+    assert lost.error_file_id is None
+    assert lost.completed_at == won.completed_at
+    stored = repo.get_batch(b.id)
+    assert (stored.output_file_id, stored.error_file_id) == (first_out.id, None)
+
+
+def test_concurrent_finalize_writes_one_set_of_file_ids(repo):
+    """Two threads racing to finalize must not interleave their file ids."""
+    b = _batch(repo, items=[("a", 1, 0, _body())], now=T0)
+    repo.set_batch_status(b.id, BatchStatus.IN_PROGRESS, now=T0)
+    pairs = [
+        (
+            repo.create_file("batch_output", f"out{i}.jsonl", b"{}\n", now=T0).id,
+            repo.create_file("batch_error", f"err{i}.jsonl", b"{}\n", now=T0).id,
+        )
+        for i in range(2)
+    ]
+
+    barrier = threading.Barrier(len(pairs))
+    winners: list[tuple[str | None, str | None]] = []
+    errors: list[Exception] = []
+
+    def finalize(out_id: str, err_id: str) -> None:
+        barrier.wait(timeout=5)
+        try:
+            rec = repo.finalize_batch(b.id, BatchStatus.COMPLETED, out_id, err_id, now=T0)
+            winners.append((rec.output_file_id, rec.error_file_id))
+        except Exception as exc:  # a losing writer may hit the store's lock
+            errors.append(exc)
+
+    threads = [threading.Thread(target=finalize, args=pair) for pair in pairs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    stored = repo.get_batch(b.id)
+    assert (stored.output_file_id, stored.error_file_id) in pairs
+    assert winners, f"both writers failed: {errors}"
+    # Whoever returned did so with the *stored* pair — never a mix of the two.
+    assert set(winners) == {(stored.output_file_id, stored.error_file_id)}
+    assert stored.status is BatchStatus.COMPLETED
 
 
 def test_progress_counts_live(repo):

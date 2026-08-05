@@ -157,9 +157,11 @@ async def test_sdk_drives_upload_create_retrieve_cancel(sdk, repo):
     assert fetched.id == batch.id
     assert fetched.status == "validating"
 
+    # Every item is still PENDING, so the cancel has nothing to wait for: it
+    # lands in CANCELLED on the spot rather than parking in CANCELLING.
     cancelled = await sdk.batches.cancel(batch.id)
-    assert cancelled.status in ("cancelling", "cancelled")
-    assert cancelled.cancelling_at is not None
+    assert cancelled.status == "cancelled"
+    assert cancelled.cancelled_at is not None
     assert all(i.state is ItemState.CANCELLED for i in repo.all_items(batch.id))
 
 
@@ -328,6 +330,31 @@ async def test_unknown_batch_and_file_are_404(sdk):
         await sdk.files.content("file-missing")
     with pytest.raises(openai.NotFoundError):
         await sdk.batches.cancel("batch-missing")
+
+
+async def test_cancel_with_no_open_items_finalizes_immediately(sdk, repo):
+    """A cancel that has nothing in flight must not wedge the batch.
+
+    ``cancel_batch`` only moves the batch to CANCELLING — the dispatcher's
+    finalize hook normally closes it once the last in-flight item settles. With
+    no open items there is no such event, so the route finalizes inline;
+    otherwise the batch would sit in CANCELLING until something else happened
+    to touch it.
+    """
+    source = repo.create_file("batch", "in.jsonl", GOOD_INPUT)
+    batch = repo.create_batch(source.id, CHAT, 24, {}, [("a", 1, 0, {"model": "m"})])
+    (item,) = repo.claim_pending_items(1)
+    repo.record_item_success(item.id, {"choices": [{"message": {"content": "hi"}}]}, 3, 4, "req-1")
+
+    cancelled = await sdk.batches.cancel(batch.id)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.cancelled_at is not None
+    assert repo.get_batch(batch.id).status is BatchStatus.CANCELLED
+    # The work that did finish before the cancel is still delivered.
+    assert cancelled.output_file_id is not None
+    lines = repo.read_file_content(cancelled.output_file_id).decode().splitlines()
+    assert json.loads(lines[0])["custom_id"] == "a"
 
 
 async def test_cancelling_a_terminal_batch_is_409(sdk, repo, http, auth):

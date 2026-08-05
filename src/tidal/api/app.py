@@ -17,6 +17,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 
+from tidal.api.assembler import finalize_if_done
 from tidal.api.jsonl import BatchInputError, parse_batch_input
 from tidal.api.schemas import (
     COMPLETION_WINDOW,
@@ -222,7 +223,13 @@ def _v1_router(cfg: TidalConfig, repo: Repository) -> APIRouter:
                 param="batch_id",
                 code="invalid_state",
             ) from exc
-        return await render_batch(rec)
+        # ``cancel_batch`` only reaches CANCELLING; the dispatcher's finalize
+        # hook closes the batch when its last in-flight item settles. A batch
+        # with nothing open produces no such event, so probe finalization here
+        # or the cancel would wedge in CANCELLING indefinitely. The assembler
+        # is idempotent and cheap, and returns None when items are still open.
+        closed = await call(finalize_if_done, repo, batch_id)
+        return await render_batch(closed or rec)
 
     return router
 

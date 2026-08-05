@@ -52,6 +52,9 @@ _LEGAL_BATCH: dict[BatchStatus, frozenset[BatchStatus]] = {
 }
 
 _OPEN_ITEM = (ItemState.PENDING, ItemState.INFLIGHT)
+_TERMINAL_ITEM = frozenset(
+    {ItemState.SUCCEEDED, ItemState.FAILED, ItemState.EXPIRED, ItemState.CANCELLED}
+)
 
 
 # --------------------------------------------------------------------------
@@ -199,6 +202,8 @@ class FakeRepo:
         now: datetime | None = None,
     ) -> ItemRecord:
         item = self._item(item_id)
+        if item.state in _TERMINAL_ITEM:
+            return item  # already closed by a sweep: no mutation, no counts
         if item.state is not ItemState.INFLIGHT:
             raise IllegalTransition(f"{item.state.value} -> succeeded")
         item.state = ItemState.SUCCEEDED
@@ -214,6 +219,8 @@ class FakeRepo:
         self, item_id: str, error: str, *, retryable: bool, now: datetime | None = None
     ) -> ItemRecord:
         item = self._item(item_id)
+        if item.state in _TERMINAL_ITEM:
+            return item  # already closed by a sweep: no mutation, no counts
         if item.state is not ItemState.INFLIGHT:
             raise IllegalTransition(f"{item.state.value} -> failed")
         item.attempts += 1
@@ -244,6 +251,13 @@ class FakeRepo:
                 item.state = ItemState.EXPIRED
                 item.finished_at = now
         return self.set_batch_status(batch_id, BatchStatus.EXPIRED, now=now)
+
+    def cancel_batch(self, batch_id: str, *, now: datetime | None = None) -> BatchRecord:
+        for item in self.items[batch_id]:
+            if item.state in _OPEN_ITEM:
+                item.state = ItemState.CANCELLED
+                item.finished_at = now
+        return self.set_batch_status(batch_id, BatchStatus.CANCELLING, now=now)
 
     def pending_and_inflight(self, batch_id: str) -> tuple[int, int]:
         items = self.items.get(batch_id, [])
@@ -312,6 +326,10 @@ class FakeFinalizer:
         pending, inflight = repo.pending_and_inflight(batch_id)
         if pending or inflight:
             return None
+        if batch.status is BatchStatus.CANCELLING:
+            rec = repo.finalize_batch(batch_id, BatchStatus.CANCELLED, "file-out", None)
+            self.finalized.append(batch_id)
+            return rec
         if batch.status is BatchStatus.EXPIRED:
             batch.output_file_id = "file-out"
             self.finalized.append(batch_id)
@@ -527,6 +545,35 @@ async def test_finalize_hook_may_close_over_the_repository():
     await run_tick(disp, T0 + timedelta(seconds=1))
 
     assert seen == [batch.id]
+
+
+async def test_late_result_for_a_cancelled_item_is_not_metered_and_unwedges_the_batch():
+    """A result that lands after the cancel sweep must not be billed.
+
+    The store keeps the item CANCELLED and does not count it, so the meter must
+    not see it either — but finalize still has to run, or a batch cancelled
+    while its last item was in the engine would sit in CANCELLING forever.
+    """
+    repo, client = FakeRepo(), FakeClient(kv_usage=0.10)
+    batch = repo.add_batch(1)
+    client.gate = asyncio.Event()  # the submission hangs inside the engine
+    metered: list[ItemRecord] = []
+    finalizer = FakeFinalizer()
+    disp = make_dispatcher(repo, client, on_success=metered.append, finalize=finalizer)
+
+    await disp.tick(T0 + timedelta(seconds=1))
+    await asyncio.sleep(0)
+    assert repo.item_states(batch.id) == [ItemState.INFLIGHT]
+
+    repo.cancel_batch(batch.id, now=T0 + timedelta(seconds=2))  # user cancels
+    client.gate.set()
+    await disp.drain()
+
+    assert repo.item_states(batch.id) == [ItemState.CANCELLED]
+    assert metered == [], "a cancelled item is never billed"
+    assert repo.batches[batch.id].counts_completed == 0
+    assert finalizer.finalized == [batch.id]
+    assert repo.batches[batch.id].status is BatchStatus.CANCELLED
 
 
 async def test_retryable_upstream_requeues_and_fatal_upstream_fails_the_item():

@@ -374,9 +374,19 @@ class Dispatcher:
                 now=self._now,
             )
         except (KeyError, IllegalTransition):
-            # The batch was expired or cancelled while this request was in the
-            # engine — the item already has a terminal state; drop the result.
             log.warning("late result for item %s ignored", item.id, exc_info=True)
+            await self._call_finalize(item.batch_id)
+            return
+        if record.state is not ItemState.SUCCEEDED:
+            # The sweep expired or cancelled this item while the request was
+            # still in the engine. The store kept it terminal and counted
+            # nothing, so nothing may be metered here either — but finalize
+            # still has to run, or a batch cancelled while its last item was in
+            # flight would sit in CANCELLING forever.
+            log.warning(
+                "late result for item %s dropped (state=%s)", item.id, record.state.value
+            )
+            await self._call_finalize(item.batch_id)
             return
         self._rate(item.batch_id).record(now=self._now_ts)
         self._global_rate.record(now=self._now_ts)
@@ -394,6 +404,7 @@ class Dispatcher:
             )
         except (KeyError, IllegalTransition):
             log.warning("late failure for item %s ignored", item.id, exc_info=True)
+            await self._call_finalize(item.batch_id)
             return
         if record.state in _TERMINAL_ITEM_STATES:
             await self._call_finalize(item.batch_id)

@@ -455,12 +455,38 @@ class SqlRepository:
         *,
         now: datetime | None = None,
     ) -> BatchRecord:
-        """Attach the result files and move the batch to its terminal status."""
+        """Attach the result files and move the batch to its terminal status.
+
+        Attaching the files is a *claim*, and it is made inside the transaction:
+        a batch that already carries an ``output_file_id`` or an
+        ``error_file_id`` is returned exactly as it is. Assembly is idempotent
+        by design and can be entered twice (the dispatcher's finalize hook and
+        the API's cancel route both call it), so the second writer must not be
+        able to replace the result files a client may already have downloaded,
+        nor re-stamp ``completed_at``.
+        """
+        timestamp = _now(now)
         with self._session.begin() as session:
             row = self._batch_row(session, batch_id)
-            row.output_file_id = output_file_id
-            row.error_file_id = error_file_id
-            self._apply_batch_status(row, status, _now(now))
+            if row.output_file_id is not None or row.error_file_id is not None:
+                return _batch_record(row)
+            if output_file_id is not None or error_file_id is not None:
+                # Conditional UPDATE, so the claim is atomic on any backend
+                # rather than a read-then-write with a window in the middle.
+                claimed = session.execute(
+                    update(BatchRow)
+                    .where(
+                        BatchRow.id == batch_id,
+                        BatchRow.output_file_id.is_(None),
+                        BatchRow.error_file_id.is_(None),
+                    )
+                    .values(output_file_id=output_file_id, error_file_id=error_file_id)
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                session.expire(row)  # re-read what actually landed
+                if not claimed:
+                    return _batch_record(row)
+            self._apply_batch_status(row, status, timestamp)
             return _batch_record(row)
 
     # -- items --
@@ -519,9 +545,18 @@ class SqlRepository:
         *,
         now: datetime | None = None,
     ) -> ItemRecord:
-        """Mark an INFLIGHT item SUCCEEDED and bump the batch's completed count."""
+        """Mark an INFLIGHT item SUCCEEDED and bump the batch's completed count.
+
+        Only an INFLIGHT item is mutated. An item that is already terminal —
+        because the expiry/cancel sweep closed it while the request was still
+        in the engine, or because this result is a duplicate — is returned
+        unchanged, so ``counts_completed`` can never drift above the number of
+        items that actually succeeded.
+        """
         with self._session.begin() as session:
             row = self._item_row(session, item_id)
+            if row.state in _TERMINAL_ITEM_STATES:
+                return _item_record(row)
             _check("item", item_id, row.state, ItemState.SUCCEEDED, _ITEM_TRANSITIONS)
             row.state = ItemState.SUCCEEDED
             row.result_json = result_json
@@ -540,9 +575,15 @@ class SqlRepository:
         ``retryable=True`` and ``attempts < max_attempts`` sends the item back
         to PENDING; otherwise it becomes FAILED and the batch's failed count
         is incremented.
+
+        Only PENDING/INFLIGHT items are mutated: a late failure for an item the
+        sweep already expired or cancelled is returned unchanged rather than
+        re-stating it and bumping ``counts_failed`` a second time.
         """
         with self._session.begin() as session:
             row = self._item_row(session, item_id)
+            if row.state in _TERMINAL_ITEM_STATES:
+                return _item_record(row)
             attempts = row.attempts + 1
             target = (
                 ItemState.PENDING

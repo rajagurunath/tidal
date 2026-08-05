@@ -66,7 +66,9 @@ class FakeRepository:
 
     # -- files --------------------------------------------------------------
 
-    def create_file(self, purpose: str, filename: str, content: bytes) -> FileRecord:
+    def create_file(
+        self, purpose: str, filename: str, content: bytes, *, now: datetime | None = None
+    ) -> FileRecord:
         file_id = f"file-{uuid.uuid4().hex}"
         rec = FileRecord(
             id=file_id,
@@ -74,7 +76,7 @@ class FakeRepository:
             filename=filename,
             size_bytes=len(content),
             sha256=hashlib.sha256(content).hexdigest(),
-            created_at=_now(),
+            created_at=now or _now(),
             blob_path=f"memory://{file_id}",
         )
         self.files[file_id] = rec
@@ -98,8 +100,10 @@ class FakeRepository:
         window_hours: int,
         metadata: dict[str, str],
         items: list[tuple[str, int, int, dict]],
+        *,
+        now: datetime | None = None,
     ) -> BatchRecord:
-        created = _now()
+        created = now or _now()
         batch_id = f"batch-{uuid.uuid4().hex}"
         rec = BatchRecord(
             id=batch_id,
@@ -141,14 +145,19 @@ class FakeRepository:
     def find_batches_by_metadata(self, key: str, value: str) -> list[BatchRecord]:
         return [b for b in self.batches.values() if b.metadata.get(key) == value]
 
-    def set_batch_status(self, batch_id: str, status: BatchStatus) -> BatchRecord:
+    def set_batch_status(
+        self, batch_id: str, status: BatchStatus, *, now: datetime | None = None
+    ) -> BatchRecord:
         rec = self._batch(batch_id)
         self._guard(rec.status, status)
+        timestamp = now or _now()
         rec.status = status
+        if status is BatchStatus.IN_PROGRESS and rec.in_progress_at is None:
+            rec.in_progress_at = timestamp
         if status is BatchStatus.CANCELLED:
-            rec.cancelled_at = _now()
+            rec.cancelled_at = timestamp
         if status in (BatchStatus.COMPLETED, BatchStatus.FAILED, BatchStatus.EXPIRED):
-            rec.completed_at = _now()
+            rec.completed_at = timestamp
         return rec
 
     def finalize_batch(
@@ -157,15 +166,23 @@ class FakeRepository:
         status: BatchStatus,
         output_file_id: str | None,
         error_file_id: str | None,
+        *,
+        now: datetime | None = None,
     ) -> BatchRecord:
-        rec = self.set_batch_status(batch_id, status)
+        rec = self._batch(batch_id)
+        # Same claim semantics as SqlRepository: first writer wins.
+        if rec.output_file_id is not None or rec.error_file_id is not None:
+            return rec
+        rec = self.set_batch_status(batch_id, status, now=now)
         rec.output_file_id = output_file_id
         rec.error_file_id = error_file_id
         return rec
 
     # -- items --------------------------------------------------------------
 
-    def claim_pending_items(self, limit: int, order: str = "edf_prefix") -> list[ItemRecord]:
+    def claim_pending_items(
+        self, limit: int, order: str = "edf_prefix", *, now: datetime | None = None
+    ) -> list[ItemRecord]:
         candidates = [
             (self.batches[bid], item)
             for bid, items in self.items.items()
@@ -181,7 +198,7 @@ class FakeRepository:
         claimed = []
         for _batch, item in candidates[:limit]:
             item.state = ItemState.INFLIGHT
-            item.submitted_at = _now()
+            item.submitted_at = now or _now()
             claimed.append(item)
         return claimed
 
@@ -192,26 +209,34 @@ class FakeRepository:
         prompt_tokens: int,
         completion_tokens: int,
         vllm_request_id: str | None,
+        *,
+        now: datetime | None = None,
     ) -> ItemRecord:
         item = self._item(item_id)
+        if item.state in _TERMINAL_ITEM:
+            return item
         item.state = ItemState.SUCCEEDED
         item.result_json = result_json
         item.usage_prompt_tokens = prompt_tokens
         item.usage_completion_tokens = completion_tokens
         item.vllm_request_id = vllm_request_id
-        item.finished_at = _now()
+        item.finished_at = now or _now()
         self._recount(item.batch_id)
         return item
 
-    def record_item_failure(self, item_id: str, error: str, *, retryable: bool) -> ItemRecord:
+    def record_item_failure(
+        self, item_id: str, error: str, *, retryable: bool, now: datetime | None = None
+    ) -> ItemRecord:
         item = self._item(item_id)
+        if item.state in _TERMINAL_ITEM:
+            return item
         item.attempts += 1
         item.last_error = error
         if retryable and item.attempts < MAX_ITEM_ATTEMPTS:
             item.state = ItemState.PENDING
         else:
             item.state = ItemState.FAILED
-            item.finished_at = _now()
+            item.finished_at = now or _now()
         self._recount(item.batch_id)
         return item
 
@@ -224,13 +249,17 @@ class FakeRepository:
                     n += 1
         return n
 
-    def expire_batch(self, batch_id: str) -> BatchRecord:
-        self._sweep(batch_id, ItemState.EXPIRED)
-        return self.set_batch_status(batch_id, BatchStatus.EXPIRED)
+    def expire_batch(self, batch_id: str, *, now: datetime | None = None) -> BatchRecord:
+        self._sweep(batch_id, ItemState.EXPIRED, now=now)
+        return self.set_batch_status(batch_id, BatchStatus.EXPIRED, now=now)
 
-    def cancel_batch(self, batch_id: str) -> BatchRecord:
-        self._sweep(batch_id, ItemState.CANCELLED)
-        return self.set_batch_status(batch_id, BatchStatus.CANCELLING)
+    def cancel_batch(self, batch_id: str, *, now: datetime | None = None) -> BatchRecord:
+        self._sweep(batch_id, ItemState.CANCELLED, now=now)
+        return self.set_batch_status(batch_id, BatchStatus.CANCELLING, now=now)
+
+    def list_items(self, batch_id: str, states: list[ItemState] | None = None) -> list[ItemRecord]:
+        items = sorted(self.items.get(batch_id, []), key=lambda i: i.line_no)
+        return [i for i in items if states is None or i.state in states]
 
     def batch_progress(self, batch_id: str) -> tuple[int, int, int]:
         items = self.items.get(batch_id, [])
@@ -254,6 +283,8 @@ class FakeRepository:
         prompt_tokens: int,
         completion_tokens: int,
         cost_usd: float,
+        *,
+        now: datetime | None = None,
     ) -> None:
         self.usage.append(
             {
@@ -262,7 +293,7 @@ class FakeRepository:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "cost_usd": cost_usd,
-                "priced_at": _now(),
+                "priced_at": now or _now(),
             }
         )
 
@@ -306,11 +337,11 @@ class FakeRepository:
         if target not in _LEGAL_BATCH[current]:
             raise IllegalTransition(f"{current.value} → {target.value}")
 
-    def _sweep(self, batch_id: str, state: ItemState) -> None:
+    def _sweep(self, batch_id: str, state: ItemState, *, now: datetime | None = None) -> None:
         for item in self.items.get(batch_id, []):
             if item.state in (ItemState.PENDING, ItemState.INFLIGHT):
                 item.state = state
-                item.finished_at = _now()
+                item.finished_at = now or _now()
         self._recount(batch_id)
 
     def _recount(self, batch_id: str) -> None:
