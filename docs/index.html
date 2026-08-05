@@ -1,0 +1,1292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tidal — batch + online co-serving for vLLM</title>
+<meta name="description" content="An OpenAI-compatible Batch API that runs on the same GPU as your online traffic. Half price, 24h SLA, laxity-enforced. Two techniques: an external gateway and an in-engine scheduler.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#E7EDEE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#071219" media="(prefers-color-scheme: dark)">
+<style>
+/* ══ tokens ══════════════════════════════════════════════════════════════
+   Palette derived from a marigram — the paper strip a tide gauge draws on:
+   printed blue-grey ruling, red ink trace, teal water. Red = online tokens
+   (guaranteed, never displaced). Teal = batch tokens (reclaimable slack).
+   Amber = deadline risk and KV pressure, and nothing else.            */
+:root{
+  --paper:#E7EDEE; --panel:#F3F8F8; --sunk:#DEE8E9;
+  --ink:#0C1E27; --ink-2:#4A6672; --ink-3:#6E8894;
+  --rule:#C2D2D6; --rule-2:#AEC2C7;
+  --online:#C4301D; --online-t:#A5280F;
+  --batch:#0A8078;  --batch-t:#046158;
+  --risk:#A96C05;   --risk-t:#8A5804;
+  --shadow:0 1px 0 rgba(12,30,39,.06); --edge:rgba(12,30,39,.20);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --paper:#071219; --panel:#0D1E26; --sunk:#0A1922;
+    --ink:#DCE9EC; --ink-2:#8FAAB4; --ink-3:#6E8894;
+    --rule:#1C333D; --rule-2:#274652;
+    --online:#FF6E52; --online-t:#FF8064;
+    --batch:#2ED3C0;  --batch-t:#48DFCC;
+    --risk:#E8A93A;   --risk-t:#F0BA5B;
+    --shadow:none; --edge:rgba(0,0,0,.6);
+  }
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+:focus-visible{outline:2px solid var(--online); outline-offset:3px; border-radius:2px}
+
+/* ══ type ══ */
+h1,h2,h3{font-family:var(--mono); font-weight:600; margin:0}
+h1{font-size:clamp(1.35rem,5.6vw,3.15rem); line-height:1.08; letter-spacing:-.045em}
+h2{font-size:clamp(1.3rem,3.6vw,2rem); line-height:1.12; letter-spacing:-.035em}
+h3{font-size:1rem; letter-spacing:-.02em}
+p{margin:0 0 1rem}
+a{color:inherit; text-decoration-color:var(--rule-2); text-underline-offset:3px}
+a:hover{text-decoration-color:var(--online)}
+code,kbd{font-family:var(--mono); font-size:.88em}
+.eyebrow{
+  font-family:var(--mono); font-size:.66rem; font-weight:600;
+  letter-spacing:.2em; text-transform:uppercase; color:var(--ink-3);
+  margin:0 0 1rem;
+}
+.lede{font-size:clamp(1rem,1.9vw,1.12rem); color:var(--ink-2); max-width:62ch}
+.prose{max-width:64ch; color:var(--ink-2)}
+.prose strong{color:var(--ink); font-weight:600}
+.src{
+  font-family:var(--mono); font-size:.68rem; letter-spacing:.06em;
+  color:var(--ink-3); margin:.5rem 0 0;
+}
+.sr{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);
+  clip-path:inset(50%); white-space:nowrap}
+.skip{position:absolute; left:-9999px}
+.skip:focus{left:.75rem; top:.75rem; z-index:20; background:var(--panel);
+  padding:.5rem .8rem; border:1px solid var(--rule-2); font-family:var(--mono); font-size:.8rem}
+
+/* ══ shell ══ */
+.wrap{max-width:1120px; margin:0 auto; padding:0 clamp(1rem,4vw,2.5rem)}
+.topbar{
+  position:sticky; top:0; z-index:10; background:var(--paper);
+  border-bottom:1px solid var(--rule);
+}
+.topbar .wrap{display:flex; align-items:center; gap:1rem; height:52px}
+.brand{font-family:var(--mono); font-weight:600; letter-spacing:-.03em; font-size:.95rem}
+.brand .mark{color:var(--batch-t)}
+.topnav{margin-left:auto; display:flex; align-items:center; gap:clamp(.6rem,2vw,1.2rem)}
+.topnav a,.topnav button{
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.06em;
+  color:var(--ink-2); text-decoration:none; background:none; border:0;
+  padding:.3rem 0; cursor:pointer;
+}
+.topnav a:hover,.topnav button:hover{color:var(--ink)}
+#motion-toggle{border:1px solid var(--rule-2); padding:.28rem .55rem; border-radius:2px}
+@media (max-width:560px){ .topnav a{display:none} }
+
+/* ══ sections: the left gutter carries the technique letter (A / B) or a
+      spec section mark — both are real references, not ornament ══ */
+section{border-top:1px solid var(--rule); padding:clamp(2.75rem,7vw,4.5rem) 0}
+section:first-of-type{border-top:0}
+.sec{display:grid; gap:clamp(1.25rem,3vw,2rem)}
+.sec>*{min-width:0}          /* grid items must be allowed to shrink, or the wide
+                                figures push the whole page into horizontal scroll */
+@media (min-width:880px){ .sec{grid-template-columns:5.5rem 1fr} }
+.mark{
+  font-family:var(--mono); font-size:clamp(1.5rem,3vw,2.4rem); font-weight:600;
+  letter-spacing:-.05em; color:var(--ink-3); line-height:1;
+  border-top:2px solid var(--ink); padding-top:.5rem; align-self:start;
+}
+.mark small{display:block; font-size:.6rem; letter-spacing:.16em; font-weight:600;
+  text-transform:uppercase; color:var(--ink-3); margin-top:.45rem; line-height:1.4}
+.mark.a{border-top-color:var(--batch-t)}
+.mark.b{border-top-color:var(--online-t)}
+.sechead{margin-bottom:1.5rem}
+.sechead h2{margin-bottom:.55rem}
+
+/* ══ hero ══ */
+.hero{
+  padding-top:clamp(2.5rem,7vw,4.5rem); padding-bottom:clamp(2rem,5vw,3rem);
+  position:relative; overflow:hidden;
+}
+.hero::before{ /* chart ruling, 32px — the gauge paper */
+  content:""; position:absolute; inset:0; pointer-events:none; opacity:.55;
+  background:
+    repeating-linear-gradient(to right,var(--rule) 0 1px,transparent 1px 32px),
+    repeating-linear-gradient(to bottom,var(--rule) 0 1px,transparent 1px 32px);
+  -webkit-mask-image:linear-gradient(to bottom,rgba(0,0,0,.5),transparent 70%);
+  mask-image:linear-gradient(to bottom,rgba(0,0,0,.5),transparent 70%);
+}
+.hero .wrap{position:relative}
+h1 .qty{color:var(--online-t)}
+h1 .sell{color:var(--batch-t)}
+.hero .lede{margin-top:1.4rem}
+.facts{
+  list-style:none; margin:2rem 0 0; padding:0;
+  display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule);
+  grid-template-columns:1fr;
+}
+@media (min-width:640px){ .facts{grid-template-columns:repeat(3,1fr)} }
+.facts li{background:var(--paper); padding:.85rem 1rem}
+.facts b{display:block; font-family:var(--mono); font-size:1.15rem; letter-spacing:-.03em; font-weight:600}
+.facts span{font-family:var(--mono); font-size:.66rem; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--ink-3)}
+
+/* ══ figures ══ */
+figure{margin:0}
+.fig{
+  margin-top:1.75rem; border:1px solid var(--rule); background:var(--panel);
+  box-shadow:var(--shadow);
+}
+.fig-head{
+  display:flex; flex-wrap:wrap; gap:.5rem 1rem; align-items:baseline;
+  padding:.65rem .9rem; border-bottom:1px solid var(--rule);
+  font-family:var(--mono); font-size:.7rem; letter-spacing:.06em; color:var(--ink-2);
+}
+.fig-head .tag{
+  margin-left:auto; font-size:.6rem; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--ink-3); border:1px solid var(--rule-2); padding:.1rem .4rem; border-radius:2px;
+}
+/* horizontal scroll affordance: the inner shadows only appear on the edge that
+   still has content past it (background-attachment local vs scroll) */
+.scroller{
+  overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; min-width:0;
+  background:
+    linear-gradient(to right,var(--panel) 40%,rgba(0,0,0,0)) left/34px 100% no-repeat local,
+    linear-gradient(to left,var(--panel) 40%,rgba(0,0,0,0)) right/34px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%,var(--edge),rgba(0,0,0,0)) left/12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%,var(--edge),rgba(0,0,0,0)) right/12px 100% no-repeat scroll;
+}
+.scroller>svg{display:block; height:auto}
+.scroller.s-wide>svg{min-width:940px; width:100%}
+.scroller.s-mid>svg{min-width:560px; width:100%; max-width:880px}
+figcaption{
+  padding:.8rem .9rem; border-top:1px solid var(--rule);
+  font-size:.85rem; line-height:1.55; color:var(--ink-2);
+}
+figcaption b{color:var(--ink); font-weight:600}
+.legend{list-style:none; display:flex; flex-wrap:wrap; gap:.35rem 1.1rem;
+  margin:0 0 .6rem; padding:0; font-family:var(--mono); font-size:.68rem; color:var(--ink-2)}
+.legend li{display:flex; align-items:center; gap:.4rem}
+.sw{width:.7rem; height:.7rem; flex:none; border:1px solid var(--rule-2)}
+.sw.o{background:var(--online); border-color:var(--online)}
+.sw.b{background:var(--batch); border-color:var(--batch)}
+.sw.r{background:var(--risk); border-color:var(--risk)}
+.sw.e{background:transparent}
+
+/* ══ svg theming ══ */
+svg{color:var(--ink)}
+.svg-lab{font-family:var(--mono); font-size:11px; fill:var(--ink-2)}
+.svg-lab.sm{font-size:9.5px; letter-spacing:.05em}
+.svg-lab.hd{fill:var(--ink); font-size:12px; font-weight:600}
+.svg-lab.mut{fill:var(--ink-3)}
+.svg-lab.on{fill:var(--online-t)}
+.svg-lab.ba{fill:var(--batch-t)}
+.svg-lab.rk{fill:var(--risk-t)}
+.svg-rule{stroke:var(--rule); stroke-width:1; fill:none}
+.svg-rule2{stroke:var(--rule-2); stroke-width:1; fill:none}
+.svg-box{fill:var(--sunk); stroke:var(--rule-2); stroke-width:1}
+.svg-box.lift{fill:var(--panel)}
+.tok-o{fill:var(--online)}
+.tok-b{fill:var(--batch)}
+.slot{fill:none; stroke:var(--rule); stroke-width:1}
+.starve{fill:none; stroke:var(--risk); stroke-width:1; stroke-dasharray:2 2; opacity:.85}
+.cap{stroke:var(--risk); stroke-width:1.25; stroke-dasharray:3 2}
+.flow{fill:none; stroke:var(--rule-2); stroke-width:1.25}
+.flow.dash{stroke-dasharray:4 3}
+.dot-o{fill:var(--online)}
+.dot-b{fill:var(--batch)}
+.dot-m{fill:var(--ink-3)}
+.hidden{visibility:hidden}
+.ev-card{transition:opacity .25s ease, transform .25s ease}
+.ev-card.victim rect{stroke:var(--risk); stroke-width:2}
+.ev-card.gone{opacity:0; transform:translateY(-14px)}
+
+/* ══ table ══ */
+.tbl-wrap{margin-top:1.5rem; overflow-x:auto; border:1px solid var(--rule); background:var(--panel)}
+table{border-collapse:collapse; width:100%; min-width:680px; font-size:.86rem}
+caption{text-align:left; padding:.7rem .9rem; border-bottom:1px solid var(--rule);
+  font-family:var(--mono); font-size:.7rem; letter-spacing:.06em; color:var(--ink-2)}
+th,td{text-align:left; padding:.62rem .9rem; border-bottom:1px solid var(--rule); vertical-align:top}
+thead th{font-family:var(--mono); font-size:.72rem; letter-spacing:.02em; color:var(--ink);
+  border-bottom:1px solid var(--rule-2); white-space:nowrap}
+thead th:nth-child(2){color:var(--batch-t)}
+thead th:nth-child(3){color:var(--online-t)}
+tbody th{font-weight:400; color:var(--ink-3); font-family:var(--mono); font-size:.72rem;
+  letter-spacing:.03em; white-space:nowrap; width:1%}
+tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
+td code{color:var(--ink)}
+
+/* ══ code ══ */
+pre{
+  margin:1.25rem 0 0; padding:1rem 1.1rem; overflow-x:auto;
+  background:var(--panel); border:1px solid var(--rule);
+  font-family:var(--mono); font-size:.8rem; line-height:1.7; color:var(--ink);
+  tab-size:2;
+}
+pre .c{color:var(--ink-3)}
+pre .k{color:var(--batch-t)}
+pre .s{color:var(--online-t)}
+.step{font-family:var(--mono); font-size:.7rem; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--ink-3); margin:1.75rem 0 -.4rem}
+.step:first-of-type{margin-top:1.25rem}
+
+/* ══ links / footer ══ */
+.links{list-style:none; margin:1.5rem 0 0; padding:0; display:grid; gap:1px;
+  background:var(--rule); border:1px solid var(--rule)}
+@media (min-width:720px){ .links{grid-template-columns:repeat(3,1fr)} }
+.links a{display:block; background:var(--panel); padding:1rem 1.1rem; text-decoration:none; height:100%}
+.links a:hover{background:var(--sunk)}
+.links b{display:block; font-family:var(--mono); font-size:.9rem; letter-spacing:-.02em}
+.links span{display:block; font-size:.82rem; color:var(--ink-2); margin-top:.3rem}
+.links em{display:block; font-family:var(--mono); font-style:normal; font-size:.64rem;
+  letter-spacing:.12em; text-transform:uppercase; color:var(--ink-3); margin-top:.5rem}
+footer{border-top:1px solid var(--rule); padding:1.5rem 0 3rem; color:var(--ink-3);
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.04em}
+footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001ms !important; animation-iteration-count:1 !important;
+    transition-duration:.001ms !important; scroll-behavior:auto !important}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <span class="brand"><span class="mark">~</span>&nbsp;tidal</span>
+    <nav class="topnav" aria-label="Sections">
+      <a href="#gateway">A · gateway</a>
+      <a href="#engine">B · engine</a>
+      <a href="#sla">sla</a>
+      <a href="#run">run</a>
+      <button id="motion-toggle" type="button" aria-pressed="false">pause motion</button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ══════════════════════ HERO ══════════════════════ -->
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">batch + online co-serving for vLLM</p>
+    <h1>your GPU's decode iterations<br>use <span class="qty">~1%</span> of the token budget.<br>tidal sells the <span class="sell">other 99%</span>.</h1>
+    <p class="lede">An OpenAI-compatible Batch API — <code>/v1/files</code>, <code>/v1/batches</code>,
+      a 24&#8239;hour completion window, half the online price — served from the
+      <em>same</em> GPU as your live traffic. Batch work fills the slack in every engine
+      iteration and yields the instant online traffic needs the room.</p>
+
+    <ul class="facts">
+      <li><b>0.5&#215;</b><span>online price per token</span></li>
+      <li><b>24&#8239;h</b><span>SLA, laxity-enforced</span></li>
+      <li><b>no fork</b><span>stock vLLM, or one plugin class</span></li>
+    </ul>
+
+    <!-- FIGURE 1 — the tide gauge -->
+    <figure class="fig">
+      <div class="fig-head">
+        <span>fig. 1 &nbsp;one engine iteration, decode-only</span>
+        <span class="tag">schematic</span>
+      </div>
+      <div class="scroller s-mid" tabindex="0" role="region" aria-label="Token budget gauge, horizontally scrollable">
+        <svg viewBox="0 0 640 214" role="img" aria-labelledby="f1t f1d" preserveAspectRatio="xMinYMin meet">
+          <title id="f1t">A per-iteration token budget filling with batch work</title>
+          <desc id="f1d">A horizontal bar represents one vLLM iteration's compute budget of
+            2048 tokens. Twenty online chats decoding occupy a 20-token sliver at the far
+            left — about 1 percent. The remaining 2028 tokens are empty ruled space, which
+            repeatedly floods with teal batch tokens and then drains, like a tide.</desc>
+
+          <text class="svg-lab mut sm" x="46" y="30">&#964; = max_num_batched_tokens = 2048 tok</text>
+          <text class="svg-lab mut sm" x="606" y="30" text-anchor="end">1 step &#183; ~10&#8211;100 ms</text>
+
+          <!-- rail + ruling -->
+          <rect class="svg-box" x="46" y="78" width="560" height="60"/>
+          <g class="svg-rule">
+            <line x1="116" y1="78" x2="116" y2="138"/><line x1="186" y1="78" x2="186" y2="138"/>
+            <line x1="256" y1="78" x2="256" y2="138"/><line x1="326" y1="78" x2="326" y2="138"/>
+            <line x1="396" y1="78" x2="396" y2="138"/><line x1="466" y1="78" x2="466" y2="138"/>
+            <line x1="536" y1="78" x2="536" y2="138"/>
+          </g>
+
+          <!-- batch water -->
+          <rect id="f1-water" class="tok-b" x="51.5" y="78" width="388" height="60"/>
+          <line id="f1-edge" x1="439.5" y1="78" x2="439.5" y2="138"
+                stroke="var(--panel)" stroke-width="1.5" opacity=".8"/>
+          <!-- online sliver, drawn last so it always reads -->
+          <rect class="tok-o" x="46" y="78" width="5.5" height="60"/>
+
+          <!-- annotations -->
+          <g class="svg-rule2">
+            <path d="M48.8 78 L48.8 64 L86 64"/>
+            <path d="M330 138 L330 152"/>
+          </g>
+          <text class="svg-lab on sm" x="90" y="67">20 tok &#183; 20 online chats decoding &#183; 1.0% of &#964;</text>
+          <text class="svg-lab ba sm" x="330" y="166" text-anchor="middle">2,028 tok of slack &#183; 99.0% of &#964; &#8212; batch fills it</text>
+
+          <text class="svg-lab mut sm" x="46" y="196">decode is memory-bandwidth-bound: the weights are read from HBM either way</text>
+          <text id="f1-read" class="svg-lab hd" x="606" y="196" text-anchor="end">filled 1,412 / 2,048</text>
+        </svg>
+      </div>
+      <figcaption>
+        <ul class="legend">
+          <li><span class="sw o"></span>online tokens (priority 0)</li>
+          <li><span class="sw b"></span>batch tokens (priority 100&#8230;1)</li>
+          <li><span class="sw e"></span>unfilled budget</li>
+        </ul>
+        A decode step costs one token per running request. Twenty concurrent chats spend
+        20&nbsp;tokens of a 2,048-token budget; the weights are read from HBM regardless, so
+        tokens added to the same iteration ride along nearly free up to the compute knee.
+        <b>That slack is the product.</b>
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ══════════════════════ TECHNIQUE A ══════════════════════ -->
+<section id="gateway">
+  <div class="wrap sec">
+    <p class="mark a">A<small>gateway<br>technique</small></p>
+    <div>
+      <div class="sechead">
+        <h2>policy outside the engine</h2>
+        <p class="lede">A sidecar holds the durable Batch API and decides, once a second,
+          how many batch items are allowed in flight. vLLM stays stock. Online traffic never
+          touches the gateway.</p>
+        <p class="src">co-serving spec &#167;4, &#167;7 &#183; docs/plans/plan-A-gateway.md</p>
+      </div>
+
+      <!-- FIGURE 2 — dataflow -->
+      <figure class="fig">
+        <div class="fig-head">
+          <span>fig. 2 &nbsp;dataflow &amp; the AIMD control loop</span>
+          <span class="tag">schematic</span>
+        </div>
+        <div class="scroller s-wide" tabindex="0" role="region" aria-label="Gateway architecture diagram, horizontally scrollable">
+          <svg viewBox="0 0 940 400" role="img" aria-labelledby="f2t f2d" preserveAspectRatio="xMinYMin meet">
+            <title id="f2t">Technique A: gateway dataflow with an AIMD feedback loop</title>
+            <desc id="f2d">Batch clients POST files and batches to the Tidal gateway, which
+              stores them in SQLite and lets a dispatcher claim items and submit them to a
+              stock vLLM at priority 100 down to 1. Online clients connect straight to vLLM at
+              priority 0 and never pass through the gateway. The dispatcher scrapes vLLM's
+              /metrics once a second; when KV cache usage crosses 0.85 or any online request is
+              queued, it halves the allowed in-flight batch count, and the teal batch flow
+              thins to nothing. When KV usage drops below 0.70 the target grows by one per
+              second and batch flow resumes.</desc>
+
+            <defs>
+              <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+                <path d="M0 0 L8 4 L0 8 z" fill="var(--rule-2)"/>
+              </marker>
+            </defs>
+
+            <!-- paths (drawn first, so the boxes mask the segments that run through them) -->
+            <path id="f2p-batch" class="flow" marker-end="url(#ar)" d="M172 66 L336 66 L336 132 L612 132"/>
+            <path id="f2p-online" class="flow" marker-end="url(#ar)" d="M172 330 L790 330 L790 262"/>
+            <path id="f2p-metrics" class="flow dash" marker-end="url(#ar)" d="M612 210 L430 210 L430 184"/>
+
+            <!-- batch clients -->
+            <rect class="svg-box lift" x="22" y="48" width="150" height="48"/>
+            <text class="svg-lab hd" x="34" y="70">batch clients</text>
+            <text class="svg-lab mut sm" x="34" y="86">lazycode &#183; openai sdk</text>
+
+            <!-- gateway -->
+            <rect class="svg-box" x="206" y="26" width="286" height="152"/>
+            <text class="svg-lab hd" x="218" y="46">tidal gateway</text>
+            <text class="svg-lab mut sm" x="480" y="46" text-anchor="end">:8080 &#183; own process</text>
+            <rect class="svg-box lift" x="218" y="58" width="262" height="30"/>
+            <text class="svg-lab sm" x="230" y="77">POST /v1/files &#183; POST /v1/batches &#183; bearer auth</text>
+            <rect class="svg-box lift" x="218" y="106" width="130" height="44"/>
+            <text class="svg-lab" x="228" y="126">sqlite (wal)</text>
+            <text class="svg-lab mut sm" x="228" y="141">durable</text>
+            <rect class="svg-box lift" x="376" y="106" width="104" height="44"/>
+            <text class="svg-lab" x="386" y="126">dispatcher</text>
+            <text id="f2-target" class="svg-lab ba sm" x="386" y="141">target = 4 / 4</text>
+            <text class="svg-lab mut sm" x="218" y="168">claim order: EDF across batches &#215; prefix group within</text>
+
+            <!-- vllm -->
+            <rect class="svg-box" x="612" y="26" width="306" height="236"/>
+            <text class="svg-lab hd" x="624" y="46">vllm serve &#8212; stock</text>
+            <text class="svg-lab mut sm" x="624" y="62">--scheduling-policy priority &#183; V1 engine</text>
+            <line class="svg-rule" x1="612" y1="74" x2="918" y2="74"/>
+
+            <text class="svg-lab sm mut" x="624" y="96">waiting heap &#8212; min(priority, arrival)</text>
+            <g id="f2-heap">
+              <rect class="tok-o" x="624" y="104" width="16" height="16"/>
+              <rect class="tok-b" x="644" y="104" width="16" height="16" opacity=".9"/>
+              <rect class="tok-b" x="664" y="104" width="16" height="16" opacity=".55"/>
+              <rect class="tok-b" x="684" y="104" width="16" height="16" opacity=".25"/>
+            </g>
+            <text class="svg-lab sm mut" x="712" y="117">lower int = sooner</text>
+
+            <text class="svg-lab sm mut" x="624" y="150">running &#8212; batch preempted first</text>
+            <g id="f2-run">
+              <rect class="tok-o" x="624" y="158" width="16" height="16"/>
+              <rect class="tok-o" x="644" y="158" width="16" height="16"/>
+              <rect class="tok-b" x="664" y="158" width="16" height="16"/>
+              <rect class="tok-b" x="684" y="158" width="16" height="16"/>
+            </g>
+            <text id="f2-preempt" class="svg-lab rk sm hidden" x="712" y="171">&#8592; preempted (recompute-only)</text>
+
+            <line class="svg-rule" x1="624" y1="188" x2="906" y2="188"/>
+            <text class="svg-lab sm mut" x="624" y="206">/metrics</text>
+            <text id="f2-kv"   class="svg-lab sm" x="690" y="206">kv_cache_usage 0.61</text>
+            <text id="f2-wait" class="svg-lab sm" x="690" y="222">num_requests_waiting 0</text>
+            <text id="f2-mode" class="svg-lab ba sm" x="690" y="238">grow &#8212; kv &lt; kv_low 0.70</text>
+
+            <!-- online clients -->
+            <rect class="svg-box lift" x="22" y="306" width="150" height="48"/>
+            <text class="svg-lab hd" x="34" y="328">online clients</text>
+            <text class="svg-lab mut sm" x="34" y="344">your live traffic</text>
+
+            <!-- path labels -->
+            <text class="svg-lab ba sm" x="498" y="122">priority = 100&#8230;1</text>
+            <text class="svg-lab on sm" x="200" y="322">priority = 0 &#8212; direct to vLLM, never through the gateway</text>
+            <text class="svg-lab mut sm" x="446" y="228">GET /metrics @ 1 Hz</text>
+            <text class="svg-lab mut sm" x="446" y="242">&#8594; EWMA &#945;=0.5 &#8594; AIMD</text>
+
+            <!-- travelling dots -->
+            <g id="f2-dots">
+              <circle class="dot-b" r="3.5" cx="188" cy="72"/><circle class="dot-b" r="3.5" cx="283" cy="97"/>
+              <circle class="dot-b" r="3.5" cx="362" cy="128"/><circle class="dot-b" r="3.5" cx="530" cy="128"/>
+              <circle class="dot-b" r="3.5" cx="580" cy="128"/><circle class="dot-b" r="3.5" cx="470" cy="128"/>
+              <circle class="dot-o" r="3.5" cx="260" cy="330"/><circle class="dot-o" r="3.5" cx="420" cy="330"/>
+              <circle class="dot-o" r="3.5" cx="580" cy="330"/><circle class="dot-o" r="3.5" cx="740" cy="330"/>
+              <circle class="dot-o" r="3.5" cx="790" cy="290"/><circle class="dot-o" r="3.5" cx="340" cy="330"/>
+              <circle class="dot-m" r="2.5" cx="520" cy="210"/><circle class="dot-m" r="2.5" cx="430" cy="180"/>
+            </g>
+
+            <text class="svg-lab mut sm" x="22" y="386">kv_high 0.85 &#183; kv_low 0.70 &#183; online_waiting_tolerance 0 &#183; max_inflight 4 (mac cpu dev default; 64 on GPU)</text>
+          </svg>
+        </div>
+        <figcaption>
+          <ul class="legend">
+            <li><span class="sw b"></span>batch items</li>
+            <li><span class="sw o"></span>online requests</li>
+            <li><span class="sw e"></span>metrics scrape</li>
+          </ul>
+          Two levels of control. <b>The engine</b> is the mechanism: priority ordering admits
+          online first and preempts batch on KV exhaustion, at token granularity, for free.
+          <b>The gateway</b> is the policy: it halves the in-flight batch target the moment
+          KV usage passes 0.85 or an online request queues, and adds one per second once
+          usage falls below 0.70 — so batch work never bloats the waiting queue to begin with.
+          The 1&nbsp;Hz poll is deliberately slow; the engine covers the gap between ticks.
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════ TECHNIQUE B ══════════════════════ -->
+<section id="engine">
+  <div class="wrap sec">
+    <p class="mark b">B<small>tidal<br>scheduler</small></p>
+    <div>
+      <div class="sechead">
+        <h2>policy inside the engine</h2>
+        <p class="lede">A <code>--scheduler-cls</code> plugin gates around the stock
+          <code>schedule()</code>. Online tokens fill first; batch fills whatever the
+          interference model says is still free — every step, at token granularity.</p>
+        <p class="src">scheduler spec &#167;5.1&#8211;&#167;5.3 &#183; docs/plans/plan-B-engine.md</p>
+      </div>
+
+      <!-- FIGURE 3 — per-iteration ledger -->
+      <figure class="fig">
+        <div class="fig-head">
+          <span>fig. 3 &nbsp;per-iteration token-budget ledger &amp; the KV guardband</span>
+          <span class="tag">schematic</span>
+        </div>
+        <div class="scroller s-wide" tabindex="0" role="region" aria-label="Token budget ledger, horizontally scrollable">
+          <svg viewBox="0 0 940 424" role="img" aria-labelledby="f3t f3d" preserveAspectRatio="xMinYMin meet">
+            <title id="f3t">Technique B: the per-iteration token budget ledger</title>
+            <desc id="f3d">A strip of consecutive engine iterations. Each bar is one step's
+              2048-token compute budget. Online tokens fill from the bottom in red and are
+              never displaced; batch tokens stack on top in teal, capped by the amber line at
+              the largest count the latency model predicts still fits the time-between-tokens
+              budget. Under an online burst the red grows and the teal is squeezed. When the
+              batch queue runs dry the unfilled remainder is flagged as starved slack. A KV
+              meter on the right rises toward the guardband; at 1 minus H over 2 the scheduler
+              proactively evicts the resident batch request holding the least unrecoverable
+              work, KV usage drops, and batch fill recovers.</desc>
+
+            <text class="svg-lab hd" x="22" y="30">consecutive iterations &#8594;</text>
+            <text class="svg-lab mut sm" x="22" y="46">each bar = one step&#8217;s compute budget &#964;</text>
+
+            <!-- tau line -->
+            <line class="cap" x1="52" y1="70" x2="648" y2="70" opacity=".55"/>
+            <text class="svg-lab mut sm" x="648" y="64" text-anchor="end">&#964; = 2048</text>
+            <line class="svg-rule2" x1="52" y1="300" x2="648" y2="300"/>
+            <text class="svg-lab mut sm" x="52" y="316">0</text>
+
+            <g id="f3-bars">
+              <g class="bar"><rect class="slot" x="62" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="62" y="70.0" width="24" height="5.2" style="display:none"/><rect class="tok-b" x="62" y="75.2" width="24" height="222.4"/><rect class="tok-o" x="62" y="297.5" width="24" height="2.5"/><line class="cap" x1="60" y1="70.0" x2="88" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="91" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="91" y="70.0" width="24" height="4.4" style="display:none"/><rect class="tok-b" x="91" y="74.4" width="24" height="223.5"/><rect class="tok-o" x="91" y="297.9" width="24" height="2.1"/><line class="cap" x1="89" y1="70.0" x2="117" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="120" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="120" y="70.0" width="24" height="5.4" style="display:none"/><rect class="tok-b" x="120" y="75.4" width="24" height="221.8"/><rect class="tok-o" x="120" y="297.2" width="24" height="2.8"/><line class="cap" x1="118" y1="70.0" x2="146" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="149" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="149" y="70.0" width="24" height="4.7" style="display:none"/><rect class="tok-b" x="149" y="74.7" width="24" height="222.9"/><rect class="tok-o" x="149" y="297.6" width="24" height="2.4"/><line class="cap" x1="147" y1="70.0" x2="175" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="178" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="178" y="70.0" width="24" height="5.2" style="display:none"/><rect class="tok-b" x="178" y="75.2" width="24" height="222.1"/><rect class="tok-o" x="178" y="297.3" width="24" height="2.7"/><line class="cap" x1="176" y1="70.0" x2="204" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="207" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="207" y="70.0" width="24" height="4.5" style="display:none"/><rect class="tok-b" x="207" y="74.5" width="24" height="223.3"/><rect class="tok-o" x="207" y="297.8" width="24" height="2.2"/><line class="cap" x1="205" y1="70.0" x2="233" y2="70.0" style="display:none"/></g>
+              <g class="bar"><rect class="slot" x="236" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="236" y="196.7" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="236" y="196.7" width="24" height="42.7"/><rect class="tok-o" x="236" y="239.4" width="24" height="60.6"/><line class="cap" x1="234" y1="196.7" x2="262" y2="196.7"/></g>
+              <g class="bar"><rect class="slot" x="265" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="265" y="192.2" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="265" y="192.2" width="24" height="27.0"/><rect class="tok-o" x="265" y="219.1" width="24" height="80.9"/><line class="cap" x1="263" y1="192.2" x2="291" y2="192.2"/></g>
+              <g class="bar"><rect class="slot" x="294" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="294" y="192.2" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="294" y="192.2" width="24" height="33.7"/><rect class="tok-o" x="294" y="225.9" width="24" height="74.1"/><line class="cap" x1="292" y1="192.2" x2="320" y2="192.2"/></g>
+              <g class="bar"><rect class="slot" x="323" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="323" y="192.2" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="323" y="192.2" width="24" height="20.2"/><rect class="tok-o" x="323" y="212.4" width="24" height="87.6"/><line class="cap" x1="321" y1="192.2" x2="349" y2="192.2"/></g>
+              <g class="bar"><rect class="slot" x="352" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="352" y="193.3" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="352" y="193.3" width="24" height="38.2"/><rect class="tok-o" x="352" y="231.5" width="24" height="68.5"/><line class="cap" x1="350" y1="193.3" x2="378" y2="193.3"/></g>
+              <g class="bar"><rect class="slot" x="381" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="381" y="192.2" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="381" y="192.2" width="24" height="29.2"/><rect class="tok-o" x="381" y="221.4" width="24" height="78.6"/><line class="cap" x1="379" y1="192.2" x2="407" y2="192.2"/></g>
+              <g class="bar"><rect class="slot" x="410" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="410" y="165.2" width="24" height="53.9"/><rect class="tok-b" x="410" y="219.1" width="24" height="47.2"/><rect class="tok-o" x="410" y="266.3" width="24" height="33.7"/><line class="cap" x1="408" y1="165.2" x2="436" y2="165.2"/></g>
+              <g class="bar"><rect class="slot" x="439" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="439" y="164.1" width="24" height="64.0"/><rect class="tok-b" x="439" y="228.1" width="24" height="42.7"/><rect class="tok-o" x="439" y="270.8" width="24" height="29.2"/><line class="cap" x1="437" y1="164.1" x2="465" y2="164.1"/></g>
+              <g class="bar"><rect class="slot" x="468" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="468" y="165.2" width="24" height="58.4"/><rect class="tok-b" x="468" y="223.6" width="24" height="44.9"/><rect class="tok-o" x="468" y="268.6" width="24" height="31.4"/><line class="cap" x1="466" y1="165.2" x2="494" y2="165.2"/></g>
+              <g class="bar"><rect class="slot" x="497" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="497" y="266.3" width="24" height="0.0" style="display:none"/><rect class="tok-b" x="497" y="266.3" width="24" height="6.7"/><rect class="tok-o" x="497" y="273.0" width="24" height="27.0"/><line class="cap" x1="495" y1="266.3" x2="523" y2="266.3"/></g>
+              <g class="bar"><rect class="slot" x="526" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="526" y="118.1" width="24" height="67.4" style="display:none"/><rect class="tok-b" x="526" y="185.4" width="24" height="101.1"/><rect class="tok-o" x="526" y="286.5" width="24" height="13.5"/><line class="cap" x1="524" y1="118.1" x2="552" y2="118.1"/></g>
+              <g class="bar"><rect class="slot" x="555" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="555" y="91.1" width="24" height="44.9" style="display:none"/><rect class="tok-b" x="555" y="136.0" width="24" height="157.2"/><rect class="tok-o" x="555" y="293.3" width="24" height="6.7"/><line class="cap" x1="553" y1="91.1" x2="581" y2="91.1"/></g>
+              <g class="bar"><rect class="slot" x="584" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="584" y="74.3" width="24" height="20.2" style="display:none"/><rect class="tok-b" x="584" y="94.5" width="24" height="202.1"/><rect class="tok-o" x="584" y="296.6" width="24" height="3.4"/><line class="cap" x1="582" y1="74.3" x2="610" y2="74.3"/></g>
+              <g class="bar"><rect class="slot" x="613" y="70" width="24" height="230" opacity=".55"/><rect class="starve" x="613" y="71.6" width="24" height="6.7" style="display:none"/><rect class="tok-b" x="613" y="78.3" width="24" height="219.0"/><rect class="tok-o" x="613" y="297.3" width="24" height="2.7"/><line class="cap" x1="611" y1="71.6" x2="639" y2="71.6"/></g>
+            </g>
+
+            <!-- KV meter -->
+            <text class="svg-lab hd" x="686" y="30">kv pool</text>
+            <text class="svg-lab mut sm" x="686" y="46">block occupancy</text>
+            <rect class="svg-box" x="686" y="70" width="52" height="230"/>
+            <rect id="f3-kvfill" class="tok-b" x="687" y="219" width="50" height="80" opacity=".55"/>
+            <!-- guardband H = 12%: admit stop at 0.88 (y=97.6), evict at 0.94 (y=83.8) -->
+            <rect class="starve" x="686" y="70" width="52" height="27.6"/>
+            <line class="svg-rule2" x1="682" y1="97.6" x2="742" y2="97.6"/>
+            <line class="cap" x1="682" y1="83.8" x2="742" y2="83.8"/>
+            <text class="svg-lab mut sm" x="746" y="78">1.0</text>
+            <text class="svg-lab rk sm" x="746" y="87">evict &#183; 1&#8722;H/2 = 0.94</text>
+            <text class="svg-lab sm" x="746" y="101">admit stop &#183; 1&#8722;H = 0.88</text>
+            <text class="svg-lab mut sm" x="746" y="120">H = 12% &#8212; EWMA of online</text>
+            <text class="svg-lab mut sm" x="746" y="132">burst demand, clamped 5&#8211;30%</text>
+            <text id="f3-kvread" class="svg-lab hd" x="686" y="316">0.65</text>
+
+            <!-- resident batch requests / victim choice -->
+            <text class="svg-lab hd" x="746" y="160">resident batch reqs</text>
+            <text class="svg-lab mut sm" x="746" y="174">unrecoverable work =</text>
+            <text class="svg-lab mut sm" x="746" y="186">computed &#8722; prefix-cached</text>
+            <g id="f3-cards">
+              <g class="ev-card" data-cost="1920"><rect class="svg-box lift" x="746" y="196" width="166" height="26"/>
+                <text class="svg-lab sm" x="754" y="213">req b-8f21</text>
+                <text class="svg-lab ba sm" x="904" y="213" text-anchor="end">1,920 tok</text></g>
+              <g class="ev-card" data-cost="384"><rect class="svg-box lift" x="746" y="226" width="166" height="26"/>
+                <text class="svg-lab sm" x="754" y="243">req b-1c04</text>
+                <text class="svg-lab ba sm" x="904" y="243" text-anchor="end">384 tok</text></g>
+              <g class="ev-card" data-cost="2560"><rect class="svg-box lift" x="746" y="256" width="166" height="26"/>
+                <text class="svg-lab sm" x="754" y="273">req b-77ae</text>
+                <text class="svg-lab ba sm" x="904" y="273" text-anchor="end">2,560 tok</text></g>
+            </g>
+            <text id="f3-victim" class="svg-lab rk sm hidden" x="746" y="296">argmin &#8594; evict b-1c04</text>
+
+            <!-- readout -->
+            <line class="svg-rule" x1="22" y1="336" x2="918" y2="336"/>
+            <text class="svg-lab mut sm" x="22" y="356">mode</text>
+            <text id="f3-mode" class="svg-lab hd" x="22" y="372">online light</text>
+            <text class="svg-lab mut sm" x="210" y="356">P_on</text>
+            <text id="f3-pon" class="svg-lab on" x="210" y="372">24 tok</text>
+            <text class="svg-lab mut sm" x="286" y="356">X = max_batch_tokens</text>
+            <text id="f3-x" class="svg-lab ba" x="286" y="372">1,978 tok</text>
+            <text class="svg-lab mut sm" x="470" y="356">T&#770;(P_on+X, C)</text>
+            <text id="f3-that" class="svg-lab" x="470" y="372">148 ms</text>
+            <text class="svg-lab mut sm" x="600" y="356">budget = tbt_slo &#215; (1&#8722;guard)</text>
+            <text class="svg-lab" x="600" y="372">200 ms &#215; 0.8 = 160 ms</text>
+            <text class="svg-lab mut sm" x="800" y="356">slack_fill_ratio</text>
+            <text id="f3-fill" class="svg-lab ba" x="800" y="372">0.97</text>
+            <text class="svg-lab mut sm" x="22" y="400">T&#770;(P,C) = k&#8321;P + k&#8322;P(P+C) + k&#8324;(P+C) + k&#8325; &#8212; fitted online by least squares over a 4,000-step window.</text>
+            <text class="svg-lab mut sm" x="22" y="414">Below the R&#178; gate of 0.85 it falls back to a static cap of 25% of &#964; while online traffic is present.</text>
+          </svg>
+        </div>
+        <figcaption>
+          <ul class="legend">
+            <li><span class="sw o"></span>online tokens, scheduled first</li>
+            <li><span class="sw b"></span>batch tokens, filling the slack</li>
+            <li><span class="sw r"></span>cap / KV pressure / starved slack</li>
+          </ul>
+          Two budgets govern a step and they are not the same thing. <b>Compute</b> —
+          <code>max_num_batched_tokens</code> — bounds tokens processed; <b>KV memory</b>
+          bounds how many requests can be resident. Batch fill is capped by a latency model
+          rather than a fixed quota because interference is not linear in tokens: a 2,048-token
+          chunk costs far more against a long resident context than a fresh one. Admission
+          stops at <code>1&#8722;H</code>; above <code>1&#8722;H/2</code> the scheduler evicts the batch
+          request with the least unrecoverable work, since preemption is recompute-only and
+          the prefix cache survives.
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════ LAXITY ══════════════════════ -->
+<section id="sla">
+  <div class="wrap sec">
+    <p class="mark">&#167;<small>24 h<br>sla</small></p>
+    <div>
+      <div class="sechead">
+        <h2>laxity, not the clock</h2>
+        <p class="lede">Escalation is driven by deadline <em>risk</em>, not elapsed time.
+          A batch that is draining fast enough never moves, no matter how much of its window
+          has passed. A batch falling behind climbs on its own, early, without dragging
+          every other batch up with it.</p>
+        <p class="src">co-serving spec &#167;7 &#183; src/tidal/dispatcher/laxity.py</p>
+      </div>
+
+      <!-- FIGURE 4 — laxity escalation -->
+      <figure class="fig">
+        <div class="fig-head">
+          <span>fig. 4 &nbsp;least-laxity-first escalation, first 2 h of a 24 h window</span>
+          <span class="tag">schematic</span>
+        </div>
+        <div class="scroller s-wide" tabindex="0" role="region" aria-label="Laxity escalation chart, horizontally scrollable">
+          <svg viewBox="0 0 940 444" role="img" aria-labelledby="f4t f4d" preserveAspectRatio="xMinYMin meet">
+            <title id="f4t">Laxity-driven priority escalation for three batches</title>
+            <desc id="f4d">Priority is plotted on an inverted axis, so higher on the chart
+              means more urgent: 100 at the bottom, 1 at the top. Batch A1, five thousand items
+              draining at twelve per second, sits exactly at the 100 cap and completes after
+              seven minutes without ever escalating. Batch A2, eighty-six thousand items at the
+              same rate, sits perfectly flat at priority 92 for the full two hours — its laxity
+              is constant at twenty-two hours, so the clock alone never moves it. Batch B starts
+              at 94 and, as online load collapses its completion rate, climbs continuously to
+              the priority-1 cap at 59 minutes — only 4.1 percent of its 24-hour window. A dotted
+              line above the cap marks priority 0, online parity, which escalation reaches only
+              when sla_strict is enabled.</desc>
+
+            <defs>
+              <clipPath id="f4clip"><rect id="f4-clip" x="88" y="40" width="614" height="300"/></clipPath>
+            </defs>
+
+            <!-- axes -->
+            <text class="svg-lab hd" x="22" y="30">effective priority</text>
+            <text class="svg-lab mut sm" x="22" y="46">axis inverted &#8212; up = more urgent</text>
+
+            <line class="svg-rule2" x1="90" y1="60" x2="90" y2="320"/>
+            <line class="svg-rule2" x1="90" y1="320" x2="700" y2="320"/>
+            <g class="svg-rule">
+              <line x1="90" y1="259.4" x2="700" y2="259.4"/>
+              <line x1="90" y1="198.8" x2="700" y2="198.8"/>
+              <line x1="90" y1="138.2" x2="700" y2="138.2"/>
+            </g>
+            <g class="svg-lab mut sm">
+              <text x="84" y="323" text-anchor="end">100</text>
+              <text x="84" y="262" text-anchor="end">75</text>
+              <text x="84" y="202" text-anchor="end">50</text>
+              <text x="84" y="141" text-anchor="end">25</text>
+            </g>
+
+            <!-- priority 1 cap and priority 0 -->
+            <line class="cap" x1="90" y1="80" x2="700" y2="80"/>
+            <text class="svg-lab rk sm" x="84" y="83" text-anchor="end">1</text>
+            <text class="svg-lab rk sm" x="700" y="74" text-anchor="end">batch_priority_min = 1 &#8212; the default cap</text>
+            <path class="svg-rule2" d="M86 70 L94 66 M86 62 L94 58" fill="none"/>
+            <line class="svg-rule2" x1="90" y1="50" x2="700" y2="50" stroke-dasharray="2 4"/>
+            <text class="svg-lab mut sm" x="84" y="53" text-anchor="end">0</text>
+            <text class="svg-lab mut sm" x="700" y="44" text-anchor="end">priority 0 = online parity &#8212; only when sla_strict = true</text>
+
+            <!-- x ticks -->
+            <g class="svg-lab mut sm">
+              <text x="90" y="338" text-anchor="middle">0</text>
+              <text x="242.5" y="338" text-anchor="middle">30 m</text>
+              <text x="395" y="338" text-anchor="middle">60 m</text>
+              <text x="547.5" y="338" text-anchor="middle">90 m</text>
+              <text x="700" y="338" text-anchor="middle">120 m</text>
+            </g>
+            <text class="svg-lab mut sm" x="395" y="356" text-anchor="middle">elapsed &#8212; the full window is 24 h; this is its first 8.3%</text>
+
+            <g clip-path="url(#f4clip)">
+              <!-- A2: 86,000 items @ 12/s -> laxity constant 22h01m -> priority 92, flat -->
+              <line class="f4-a2" x1="90" y1="300.6" x2="697.2" y2="300.6"
+                    stroke="var(--batch)" stroke-width="2" fill="none"/>
+              <!-- A1: 5,000 items @ 12/s -> priority 100, completes at 7m -->
+              <line class="f4-a1" x1="90" y1="320" x2="125.3" y2="320"
+                    stroke="var(--batch)" stroke-width="2" fill="none" opacity=".55"/>
+              <circle cx="125.3" cy="320" r="3.5" fill="var(--batch)" opacity=".55"/>
+              <!-- B: rate collapses under online load -->
+              <polyline class="f4-b" fill="none" stroke="var(--risk)" stroke-width="2.25"
+                points="90.0,305.5 91.7,305.5 93.4,305.5 95.1,305.5 96.8,305.5 98.5,305.5 100.2,305.5 101.9,305.5 103.6,305.5 105.2,305.5 106.9,305.5 108.6,305.5 110.3,305.5 112.0,305.5 113.7,305.5 115.4,305.5 117.1,305.5 118.8,305.5 120.5,305.5 122.2,305.5 123.9,305.5 125.6,305.5 127.3,305.5 129.0,305.5 130.7,305.5 132.4,305.5 134.1,305.5 135.8,305.5 137.4,305.5 139.1,305.5 140.8,305.5 142.5,305.5 144.2,305.5 145.9,305.5 147.6,305.5 149.3,305.5 151.0,305.5 152.7,303.0 154.4,303.0 156.1,303.0 157.8,303.0 159.5,303.0 161.2,303.0 162.9,303.0 164.6,303.0 166.2,300.6 167.9,300.6 169.6,300.6 171.3,300.6 173.0,300.6 174.7,300.6 176.4,298.2 178.1,298.2 179.8,298.2 181.5,298.2 183.2,298.2 184.9,298.2 186.6,295.8 188.3,295.8 190.0,295.8 191.7,295.8 193.4,295.8 195.1,295.8 196.8,293.3 198.4,293.3 200.1,293.3 201.8,293.3 203.5,293.3 205.2,290.9 206.9,290.9 208.6,290.9 210.3,290.9 212.0,288.5 213.7,288.5 215.4,288.5 217.1,288.5 218.8,286.1 220.5,286.1 222.2,286.1 223.9,286.1 225.6,283.6 227.2,283.6 228.9,283.6 230.6,281.2 232.3,281.2 234.0,281.2 235.7,281.2 237.4,278.8 239.1,278.8 240.8,278.8 242.5,276.4 244.2,276.4 245.9,273.9 247.6,273.9 249.3,273.9 251.0,271.5 252.7,271.5 254.4,271.5 256.1,269.1 257.8,269.1 259.4,266.7 261.1,266.7 262.8,266.7 264.5,264.2 266.2,264.2 267.9,261.8 269.6,261.8 271.3,259.4 273.0,259.4 274.7,257.0 276.4,257.0 278.1,254.5 279.8,254.5 281.5,252.1 283.2,252.1 284.9,249.7 286.6,247.3 288.2,247.3 289.9,244.8 291.6,244.8 293.3,242.4 295.0,240.0 296.7,240.0 298.4,237.6 300.1,235.2 301.8,235.2 303.5,232.7 305.2,230.3 306.9,227.9 308.6,227.9 310.3,225.5 312.0,223.0 313.7,220.6 315.4,220.6 317.1,218.2 318.8,215.8 320.4,213.3 322.1,210.9 323.8,208.5 325.5,206.1 327.2,203.6 328.9,201.2 330.6,198.8 332.3,196.4 334.0,193.9 335.7,191.5 337.4,189.1 339.1,186.7 340.8,184.2 342.5,181.8 344.2,177.0 345.9,174.5 347.6,172.1 349.2,169.7 350.9,164.8 352.6,162.4 354.3,160.0 356.0,155.2 357.7,152.7 359.4,150.3 361.1,145.5 362.8,143.0 364.5,138.2 366.2,133.3 367.9,130.9 369.6,126.1 371.3,123.6 373.0,118.8 374.7,113.9 376.4,109.1 378.1,104.2 379.8,101.8 381.4,97.0 383.1,92.1 384.8,87.3 386.5,82.4 388.2,80.0 700.0,80.0"/>
+            </g>
+
+            <!-- markers -->
+            <line id="f4-play" class="svg-rule2" x1="700" y1="46" x2="700" y2="326"/>
+            <line class="svg-rule" x1="379.8" y1="80" x2="379.8" y2="320" stroke-dasharray="2 3"/>
+            <text class="svg-lab rk sm" x="100" y="264">urgency &gt; 0.9 at t = 57 m &#8212;</text>
+            <text class="svg-lab rk sm" x="100" y="276">token-bucket floor engages</text>
+            <circle cx="388.2" cy="80" r="3.5" fill="var(--risk)"/>
+            <text class="svg-lab rk sm" x="398" y="100">pinned at 1 &#8212; t = 59 m,</text>
+            <text class="svg-lab rk sm" x="398" y="112">only 4.1% of the 24 h window</text>
+
+            <text class="svg-lab ba sm" x="132" y="316">A&#8321; done, never escalated</text>
+            <text class="svg-lab ba sm" x="440" y="294">A&#8322; &#8212; flat at 92 for the whole run</text>
+            <text class="svg-lab rk sm" x="96" y="299">B</text>
+
+            <!-- readout panel -->
+            <line class="svg-rule2" x1="716" y1="40" x2="716" y2="424"/>
+            <text class="svg-lab hd" x="730" y="56">at the playhead</text>
+            <text id="f4-t" class="svg-lab mut sm" x="730" y="70">t = 120 m</text>
+
+            <text class="svg-lab ba" x="730" y="98">A&#8322; &#8212; on track</text>
+            <g class="svg-lab sm">
+              <text x="730" y="114">remaining</text><text id="f4-a-rem" x="910" y="114" text-anchor="end">0</text>
+              <text x="730" y="128">observed rate</text><text id="f4-a-rate" x="910" y="128" text-anchor="end">12.00 /s</text>
+              <text x="730" y="142">projected drain</text><text id="f4-a-drain" x="910" y="142" text-anchor="end">0m</text>
+              <text x="730" y="156">laxity</text><text id="f4-a-lax" x="910" y="156" text-anchor="end">22h 01m</text>
+              <text x="730" y="170">urgency</text><text id="f4-a-urg" x="910" y="170" text-anchor="end">0.083</text>
+            </g>
+            <text class="svg-lab mut sm" x="730" y="190">priority</text>
+            <text id="f4-a-pri" class="svg-lab ba hd" x="910" y="190" text-anchor="end">92</text>
+
+            <text class="svg-lab rk" x="730" y="222">B &#8212; at risk</text>
+            <g class="svg-lab sm">
+              <text x="730" y="238">remaining</text><text id="f4-b-rem" x="910" y="238" text-anchor="end">34,071</text>
+              <text x="730" y="252">observed rate</text><text id="f4-b-rate" x="910" y="252" text-anchor="end">0.19 /s</text>
+              <text x="730" y="266">projected drain</text><text id="f4-b-drain" x="910" y="266" text-anchor="end">50h 41m</text>
+              <text x="730" y="280">laxity</text><text id="f4-b-lax" x="910" y="280" text-anchor="end">&#8722;28h 41m</text>
+              <text x="730" y="294">urgency</text><text id="f4-b-urg" x="910" y="294" text-anchor="end">1.000</text>
+            </g>
+            <text class="svg-lab mut sm" x="730" y="314">priority</text>
+            <text id="f4-b-pri" class="svg-lab rk hd" x="910" y="314" text-anchor="end">1</text>
+
+            <line class="svg-rule" x1="730" y1="334" x2="910" y2="334"/>
+            <g class="svg-lab mut sm">
+              <text x="730" y="348">drain = remaining / rate</text>
+              <text x="730" y="362">laxity = (expires_at &#8722; now)</text>
+              <text x="746" y="374">&#8722; drain</text>
+              <text x="730" y="392">u = clamp(1 &#8722; laxity/24h,0,1)</text>
+              <text x="730" y="410">priority = round(100 &#8722; u&#215;99)</text>
+            </g>
+            <text class="svg-lab mut sm" x="22" y="382">A&#8322;&#8217;s laxity is <tspan class="svg-lab ba sm">constant</tspan> while it drains at its observed rate &#8212; the two time terms cancel out.</text>
+            <text class="svg-lab mut sm" x="22" y="398">Only a falling rate or a growing backlog moves a batch. The clock alone never does.</text>
+            <text class="svg-lab mut sm" x="22" y="414">A&#8321; sits exactly at the 100 cap: it drains in under 0.5% of its 24 h window.</text>
+          </svg>
+        </div>
+        <figcaption>
+          <ul class="legend">
+            <li><span class="sw b"></span>on track — flat</li>
+            <li><span class="sw r"></span>at risk — climbing</li>
+          </ul>
+          Priority is recomputed from <b>laxity</b> — the slack left after the projected drain
+          time — and applied when each item is submitted. Because both time terms cancel for a
+          batch draining at a steady rate, an on-track batch's priority is <b>constant</b>: it
+          does not drift upward just because the day is passing, so healthy batches cause zero
+          extra interference and at-risk batches never escalate as a synchronized flood.
+          B maxes out at <b>59 minutes</b>, having burned 4.1% of its window — early enough
+          that the token-bucket floor still has 23 hours to recover it.
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════ COMPARISON ══════════════════════ -->
+<section id="compare">
+  <div class="wrap sec">
+    <p class="mark">&#8801;<small>a vs b</small></p>
+    <div>
+      <div class="sechead">
+        <h2>which one do you want</h2>
+        <p class="lede">Both ship in this repo, share the same store, the same wire format
+          and the same SLA machinery, and are evaluated head-to-head. A is the one you can
+          run against a vLLM you did not build.</p>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <caption>same Batch API, two places to put the policy</caption>
+          <thead>
+            <tr><th scope="col"><span class="sr">dimension</span></th>
+                <th scope="col">A — gateway</th>
+                <th scope="col">B — TidalScheduler</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">where policy runs</th>
+              <td>sidecar process, once a second</td>
+              <td>inside the engine, every step (~10–100&nbsp;ms)</td></tr>
+            <tr><th scope="row">vLLM requirement</th>
+              <td>stock, <code>--scheduling-policy priority</code></td>
+              <td>pinned vLLM main + <code>--scheduler-cls</code> plugin</td></tr>
+            <tr><th scope="row">batch admission</th>
+              <td>AIMD on <code>/metrics</code> watermarks</td>
+              <td>per-iteration token-budget packing</td></tr>
+            <tr><th scope="row">interference control</th>
+              <td>coarse — throttles how many items exist</td>
+              <td>fine — caps tokens via a context-aware latency model</td></tr>
+            <tr><th scope="row">calibration</th>
+              <td>none</td>
+              <td>self-fitting T&#770;; no offline profiling sweep</td></tr>
+            <tr><th scope="row">KV protection</th>
+              <td>back off above <code>kv_high</code>; engine preempts</td>
+              <td>guardband H, admit stop at 1−H, proactive evict at 1−H/2</td></tr>
+            <tr><th scope="row">preemption victim</th>
+              <td>engine default — lowest-priority running request</td>
+              <td>cheapest — <code>argmin(computed − prefix_cached)</code></td></tr>
+            <tr><th scope="row">work conservation</th>
+              <td>leaves slack on the floor by design</td>
+              <td>fills every step; unfilled slack is an alarmed metric</td></tr>
+            <tr><th scope="row">24 h SLA</th>
+              <td>laxity escalation at submission time</td>
+              <td>same, gateway-set; in-engine aging deferred past v1</td></tr>
+            <tr><th scope="row">blast radius</th>
+              <td>none — the engine is untouched</td>
+              <td>subclasses a non-public interface; upstream drift risk</td></tr>
+            <tr><th scope="row">phase</th>
+              <td>P1 — usable first</td>
+              <td>P2 — the throughput ceiling</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="src" style="margin-top:.9rem">Both give you durable OpenAI-wire <code>/v1/files</code> + <code>/v1/batches</code>,
+        SQLite&#8239;(WAL)&#8239;→&#8239;Postgres by DSN swap, EDF&#215;prefix submission order, and metering
+        at a 0.5&#215; discount.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════ QUICKSTART ══════════════════════ -->
+<section id="run">
+  <div class="wrap sec">
+    <p class="mark">$<small>quick<br>start</small></p>
+    <div>
+      <div class="sechead">
+        <h2>two terminals</h2>
+        <p class="lede">Alpha, under active development. Everything below runs on a laptop
+          against a CPU build of vLLM with a small model.</p>
+      </div>
+
+      <p class="step">install and serve</p>
+<pre><code>uv venv &amp;&amp; uv pip install -e <span class="s">".[dev]"</span>
+
+<span class="c"># terminal 1 — the engine, unmodified</span>
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --scheduling-policy priority
+
+<span class="c"># terminal 2 — the batch tier</span>
+tidal serve</code></pre>
+
+      <p class="step">submit a batch with any OpenAI SDK</p>
+<pre><code><span class="k">from</span> openai <span class="k">import</span> OpenAI
+
+client = OpenAI(base_url=<span class="s">"http://127.0.0.1:8080/v1"</span>, api_key=<span class="s">"tidal-dev-key"</span>)
+f = client.files.create(file=open(<span class="s">"requests.jsonl"</span>, <span class="s">"rb"</span>), purpose=<span class="s">"batch"</span>)
+b = client.batches.create(input_file_id=f.id,
+                          endpoint=<span class="s">"/v1/chat/completions"</span>,
+                          completion_window=<span class="s">"24h"</span>)</code></pre>
+
+      <p class="step">or move the policy into the engine (technique B)</p>
+<pre><code>vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+  --scheduling-policy priority \
+  --scheduler-cls tidal.engine.scheduler.TidalScheduler</code></pre>
+
+      <p class="step">see what it earned</p>
+<pre><code>tidal report   <span class="c"># per-batch and per-day cost at the 0.5× batch discount</span></code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════ LINKS ══════════════════════ -->
+<section id="more">
+  <div class="wrap sec">
+    <p class="mark">&#8599;<small>more</small></p>
+    <div>
+      <div class="sechead"><h2>read the rest</h2></div>
+      <ul class="links">
+        <li><a href="https://github.com/rajagurunath/tidal">
+          <b>rajagurunath/tidal</b>
+          <span>The repo. Apache-2.0, alpha, design docs in <code>docs/plans/</code>.</span>
+          <em>source</em></a></li>
+        <li><a href="https://github.com/rajagurunath/lazycode">
+          <b>rajagurunath/lazycode</b>
+          <span>The batch client Tidal was built for — event-sourced job orchestration
+            with an <code>OpenAIBatchAdapter</code> pointed at the gateway.</span>
+          <em>client</em></a></li>
+        <li><a href="paper/">
+          <b>the paper</b>
+          <span>Deadline-guaranteed batch serving under online SLOs: A and B measured
+            head-to-head against an offline ceiling.</span>
+          <em>draft — in progress</em></a></li>
+      </ul>
+      <p class="src" style="margin-top:1.25rem">
+        Every figure on this page is a schematic of the designed mechanism, drawn from the
+        specs and the configuration defaults — not a measurement. Benchmark results land with
+        the paper.
+      </p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>tidal &#8212; batch + online co-serving for vLLM</span>
+    <span>apache-2.0</span>
+    <span>alpha</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var reduce = false;
+  try { reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) {}
+
+  function el(id) { return document.getElementById(id); }
+  function setText(node, s) { if (node) node.textContent = s; }
+  function attr(node, k, v) { if (node) node.setAttribute(k, v); }
+  function show(node, on) { if (node) node.classList[on ? "remove" : "add"]("hidden"); }
+  var fmt = function (n) { return Math.round(n).toLocaleString("en-US"); };
+
+  var hasIO = typeof window.IntersectionObserver === "function";
+  var figures = [];
+  function register(rootId, build, staticT) {
+    var root = el(rootId);
+    if (!root) return;
+    try {
+      var update = build(root);
+      if (update) figures.push({
+        root: root, update: update, staticT: staticT || 0,
+        visible: !hasIO, t0: null
+      });
+    } catch (e) { /* a broken figure must never take the page down */ }
+  }
+
+  /* ─────────── fig 1 — the tide gauge ─────────── */
+  register("f1-water", function () {
+    var water = el("f1-water"), edge = el("f1-edge"), read = el("f1-read");
+    var X = 51.5, MAX = 554.5, TAU = 2048, SLACK = 2028;
+    var PERIOD = 7.2;
+    function ease(u) { return u < .5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; }
+    return function (t) {
+      var p = t % PERIOD, f;
+      if (p < 3.2) f = ease(p / 3.2);
+      else if (p < 4.8) f = 1;
+      else if (p < 6.0) f = 1 - ease((p - 4.8) / 1.2);
+      else f = 0;
+      var w = f * MAX;
+      attr(water, "width", w.toFixed(1));
+      attr(edge, "x1", (X + w).toFixed(1)); attr(edge, "x2", (X + w).toFixed(1));
+      edge.style.opacity = f > .01 && f < .999 ? ".8" : "0";
+      setText(read, "filled " + fmt(20 + f * SLACK) + " / " + fmt(TAU));
+    };
+  }, 1.95);
+
+  /* ─────────── fig 2 — gateway dataflow + AIMD ─────────── */
+  register("f2-dots", function (g) {
+    var ids = ["f2p-batch", "f2p-online", "f2p-metrics"];
+    var paths = {}, ok = true;
+    for (var i = 0; i < ids.length; i++) {
+      var p = el(ids[i]);
+      if (!p || typeof p.getPointAtLength !== "function") { ok = false; break; }
+      paths[ids[i]] = { node: p, len: p.getTotalLength() };
+    }
+    if (!ok) return null;
+
+    var circles = g.querySelectorAll("circle");
+    var batch = [], online = [], metrics = [];
+    for (var j = 0; j < circles.length; j++) {
+      var cls = circles[j].getAttribute("class");
+      if (cls === "dot-b") batch.push(circles[j]);
+      else if (cls === "dot-o") online.push(circles[j]);
+      else metrics.push(circles[j]);
+    }
+
+    function place(node, key, u) {
+      var pr = paths[key], pt = pr.node.getPointAtLength(u * pr.len);
+      attr(node, "cx", pt.x.toFixed(1)); attr(node, "cy", pt.y.toFixed(1));
+    }
+
+    var kvNode = el("f2-kv"), waitNode = el("f2-wait"), modeNode = el("f2-mode"),
+        tgtNode = el("f2-target"), preempt = el("f2-preempt"), heap = el("f2-heap");
+    var PERIOD = 24;
+
+    return function (t) {
+      var p = t % PERIOD, kv, waiting, target, mode, cls, onCount, pre = false;
+
+      if (p < 8) {                       // calm: AIMD additive increase
+        kv = 0.42 + 0.16 * (p / 8);
+        waiting = 0; onCount = 3;
+        target = Math.min(4, 1 + Math.floor(p / 2));
+        mode = "grow +1 — kv < kv_low 0.70"; cls = "svg-lab ba sm";
+      } else if (p < 15) {               // spike: multiplicative decrease
+        var q = (p - 8) / 7;
+        kv = 0.58 + 0.32 * q;
+        waiting = Math.min(6, Math.floor(q * 8));
+        onCount = 10;
+        target = q < .25 ? 2 : (q < .5 ? 1 : 0);
+        mode = kv > .85 ? "halve — kv > kv_high 0.85" : "halve — online queued";
+        cls = "svg-lab rk sm";
+        pre = q > .5;
+      } else {                           // recovery
+        var r = (p - 15) / 9;
+        kv = 0.90 - 0.38 * r;
+        waiting = 0; onCount = 3;
+        target = kv < .70 ? Math.min(4, Math.floor((0.70 - kv) * 22) + 1) : 0;
+        mode = kv < .70 ? "grow +1 — kv < kv_low 0.70" : "hold — kv in hysteresis band";
+        cls = kv < .70 ? "svg-lab ba sm" : "svg-lab mut sm";
+      }
+
+      setText(kvNode, "kv_cache_usage " + kv.toFixed(2));
+      setText(waitNode, "num_requests_waiting " + waiting);
+      setText(modeNode, mode); attr(modeNode, "class", cls);
+      setText(tgtNode, "target = " + target + " / 4");
+      show(preempt, pre);
+      if (heap) heap.style.opacity = target === 0 ? ".35" : "1";
+
+      var active = Math.min(batch.length, target * 2);
+      for (var b = 0; b < batch.length; b++) {
+        if (b < active) {
+          batch[b].style.opacity = "1";
+          place(batch[b], "f2p-batch", (t * 0.20 + b / batch.length) % 1);
+        } else batch[b].style.opacity = "0";
+      }
+      for (var o = 0; o < online.length; o++) {
+        if (o < onCount) {
+          online[o].style.opacity = "1";
+          place(online[o], "f2p-online", (t * 0.30 + o / online.length) % 1);
+        } else online[o].style.opacity = "0";
+      }
+      for (var m = 0; m < metrics.length; m++) {
+        place(metrics[m], "f2p-metrics", (t * 0.55 + m / metrics.length) % 1);
+        metrics[m].setAttribute("fill", pre || kv > .85 ? "var(--risk)" : "var(--ink-3)");
+      }
+    };
+  }, 11.5);
+
+  /* ─────────── fig 3 — per-iteration ledger ─────────── */
+  register("f3-bars", function (g) {
+    var bars = g.querySelectorAll("g.bar");
+    if (!bars.length) return null;
+    var N = bars.length, TAU = 2048, Y0 = 300, YT = 70, PX = (Y0 - YT) / TAU;
+
+    // one step of the ledger, as a function of a step index within a 50-step cycle
+    function step(i) {
+      var k = ((i % 50) + 50) % 50, pon, cap, filled, note = "", kv, mode;
+      if (k < 15) {                       // online light
+        pon = 18 + (k * 7) % 9; cap = TAU - pon; filled = cap - (k * 11) % 40;
+        kv = 0.40 + 0.015 * k; mode = "online light";
+      } else if (k < 25) {                // online burst: T-hat binds
+        pon = 520 + (k * 97) % 260; cap = Math.max(160, 1000 - (k - 15) * 80); filled = cap;
+        kv = 0.62 + 0.018 * (k - 15); mode = "burst \u2014 T\u0302 caps X";
+      } else if (k < 31) {                // queue runs dry
+        pon = 260 + (k * 37) % 60; cap = 900 + (k * 13) % 80; filled = 360 + (k * 29) % 80;
+        note = "starve"; kv = 0.80 + 0.012 * (k - 25); mode = "starved slack";
+      } else if (k < 35) {                // KV pressure -> evict
+        pon = 230 + (k * 19) % 40; cap = 60; filled = 60;
+        note = k === 32 ? "evict" : "";
+        kv = k < 32 ? 0.87 + 0.03 * (k - 31) : 0.79 - 0.01 * (k - 32);
+        mode = k < 32 ? "admit stop \u00b7 kv > 1\u2212H" : "evict cheapest victim";
+      } else {                            // recovery
+        var r = (k - 35) / 15;
+        pon = Math.max(22, 240 - r * 220); cap = Math.min(TAU - pon, 400 + r * 1650);
+        filled = cap; kv = 0.79 - 0.30 * r; mode = "recovering";
+      }
+      filled = Math.max(0, Math.min(filled, cap, TAU - pon));
+      return { pon: pon, cap: Math.min(cap, TAU - pon), filled: filled,
+               note: note, kv: kv, mode: mode };
+    }
+
+    function draw(node, s) {
+      var kids = node.children, x = null, w = 24;
+      var slot = null, starve = null, tb = null, to = null, capline = null;
+      for (var i = 0; i < kids.length; i++) {
+        var c = kids[i].getAttribute("class");
+        if (c === "slot") { slot = kids[i]; x = parseFloat(kids[i].getAttribute("x")); }
+        else if (c === "starve") starve = kids[i];
+        else if (c === "tok-b") tb = kids[i];
+        else if (c === "tok-o") to = kids[i];
+        else if (c === "cap") capline = kids[i];
+      }
+      if (x === null) return;
+      var hp = s.pon * PX, hb = s.filled * PX, yo = Y0 - hp, yb = yo - hb;
+      var ycap = Y0 - hp - s.cap * PX;
+      if (to) { attr(to, "y", yo.toFixed(1)); attr(to, "height", Math.max(1, hp).toFixed(1)); }
+      if (tb) { attr(tb, "y", yb.toFixed(1)); attr(tb, "height", Math.max(0, hb).toFixed(1)); }
+      if (starve) {
+        var sh = (Y0 - hp - hb) - ycap;
+        if (s.note === "starve" && sh > 1) {
+          starve.style.display = ""; attr(starve, "x", x); attr(starve, "width", w);
+          attr(starve, "y", ycap.toFixed(1)); attr(starve, "height", sh.toFixed(1));
+        } else starve.style.display = "none";
+      }
+      if (capline) {
+        if (s.cap < TAU - s.pon - 2) {
+          capline.style.display = "";
+          attr(capline, "x1", x - 2); attr(capline, "x2", x + w + 2);
+          attr(capline, "y1", ycap.toFixed(1)); attr(capline, "y2", ycap.toFixed(1));
+        } else capline.style.display = "none";
+      }
+      if (slot) slot.style.opacity = s.note === "evict" ? ".9" : ".55";
+    }
+
+    var kvfill = el("f3-kvfill"), kvread = el("f3-kvread"), victim = el("f3-victim"),
+        modeN = el("f3-mode"), ponN = el("f3-pon"), xN = el("f3-x"),
+        thatN = el("f3-that"), fillN = el("f3-fill");
+    var cards = document.querySelectorAll("#f3-cards .ev-card");
+    var cheapest = null, cheapestCost = Infinity;
+    for (var ci = 0; ci < cards.length; ci++) {
+      var cost = parseFloat(cards[ci].getAttribute("data-cost"));
+      if (cost < cheapestCost) { cheapestCost = cost; cheapest = cards[ci]; }
+    }
+
+    var RATE = 2.6;   // steps per second
+    return function (t) {
+      var head = Math.floor(t * RATE);
+      var cur = step(head);
+      for (var i = 0; i < N; i++) draw(bars[i], step(head - (N - 1 - i)));
+
+      var kvh = cur.kv * 230;
+      if (kvfill) { attr(kvfill, "y", (Y0 - kvh).toFixed(1)); attr(kvfill, "height", kvh.toFixed(1)); }
+      setText(kvread, cur.kv.toFixed(2));
+      if (kvread) attr(kvread, "class", cur.kv > 0.88 ? "svg-lab rk" : "svg-lab hd");
+
+      var evicting = cur.note === "evict" || (((head % 50) + 50) % 50) === 33;
+      show(victim, evicting);
+      for (var c2 = 0; c2 < cards.length; c2++) {
+        cards[c2].classList.toggle("victim", evicting && cards[c2] === cheapest);
+        cards[c2].classList.toggle("gone", evicting && cards[c2] === cheapest &&
+                                   (((head % 50) + 50) % 50) === 33);
+      }
+
+      setText(modeN, cur.mode);
+      setText(ponN, fmt(cur.pon) + " tok");
+      setText(xN, fmt(cur.cap) + " tok");
+      // T-hat readout: the model's prediction for the step actually scheduled
+      var tot = cur.pon + cur.filled;
+      setText(thatN, (28 + tot * 0.062).toFixed(0) + " ms");
+      var slack = TAU - cur.pon;
+      setText(fillN, slack > 0 ? (cur.filled / slack).toFixed(2) : "1.00");
+      if (fillN) attr(fillN, "class", cur.note === "starve" ? "svg-lab rk" : "svg-lab ba");
+    };
+  }, 12.4);
+
+  /* ─────────── fig 4 — laxity escalation ─────────── */
+  register("f4-play", function () {
+    var W = 86400, AXIS = 7200, X0 = 90, X1 = 700;
+    var clip = el("f4-clip"), play = el("f4-play"), tN = el("f4-t");
+
+    function urg(l) { return Math.min(1, Math.max(0, 1 - l / W)); }
+    function prio(u) { return Math.min(100, Math.max(1, Math.floor(100 - u * 99 + 0.5))); }
+
+    // A2 — 86,000 items, steady 12/s: laxity is invariant, so priority never drifts
+    function simA(t) {
+      var rate = 12, rem = Math.max(0, 86000 - rate * t);
+      var drain = rem > 0 ? rem / rate : 0, lax = (W - t) - drain, u = urg(lax);
+      return { rem: rem, rate: rate, drain: drain, lax: lax, u: u, p: prio(u) };
+    }
+    // B — 60,000 items; rate collapses from 12/s as online load takes the GPU
+    var K = Math.log(200) / 4876;
+    function rateB(t) {
+      if (t < 600) return 12;
+      if (t < 5476) return 12 * Math.exp(-K * (t - 600));
+      return 0.06;
+    }
+    function consB(t) {
+      if (t <= 600) return 12 * t;
+      var base = 7200 + (12 / K) * (1 - Math.exp(-K * (Math.min(t, 5476) - 600)));
+      return t <= 5476 ? base : base + 0.06 * (t - 5476);
+    }
+    function simB(t) {
+      var rate = rateB(t), rem = Math.max(0, 60000 - consB(t));
+      var drain = rem > 0 ? rem / rate : 0, lax = (W - t) - drain, u = urg(lax);
+      return { rem: rem, rate: rate, drain: drain, lax: lax, u: u, p: prio(u) };
+    }
+    function hm(s) {
+      var neg = s < 0; s = Math.abs(s);
+      var h = Math.floor(s / 3600), m = Math.round((s - h * 3600) / 60);
+      if (m === 60) { h++; m = 0; }
+      return (neg ? "−" : "") + (h ? h + "h " : "") + m + "m";
+    }
+    function panel(pre, s) {
+      setText(el(pre + "rem"), fmt(s.rem));
+      setText(el(pre + "rate"), s.rate.toFixed(2) + " /s");
+      setText(el(pre + "drain"), s.rem > 0 ? hm(s.drain) : "—");
+      setText(el(pre + "lax"), hm(s.lax));
+      setText(el(pre + "urg"), s.u.toFixed(3));
+      setText(el(pre + "pri"), String(s.p));
+    }
+
+    var SWEEP = 13, HOLD = 3.5, PERIOD = SWEEP + HOLD;
+    return function (time) {
+      var p = time % PERIOD;
+      var f = p < SWEEP ? p / SWEEP : 1;
+      var t = f * AXIS, x = X0 + f * (X1 - X0);
+      attr(clip, "width", Math.max(1, x - 88).toFixed(1));
+      attr(play, "x1", x.toFixed(1)); attr(play, "x2", x.toFixed(1));
+      setText(tN, "t = " + Math.round(t / 60) + " m");
+      panel("f4-a-", simA(t));
+      panel("f4-b-", simB(t));
+    };
+  }, 13.2);
+
+  /* ─────────── driver ─────────── */
+  var paused = reduce, raf = null, base = null, clock = 0;
+
+  function paintStatic() {
+    // one representative frame per figure: the moment that carries the point
+    for (var i = 0; i < figures.length; i++) {
+      try { figures[i].update(figures[i].staticT); } catch (e) { figures[i].visible = false; }
+    }
+  }
+  function frame(ts) {
+    if (base === null) base = ts;
+    clock = (ts - base) / 1000;
+    for (var i = 0; i < figures.length; i++) {
+      var fg = figures[i];
+      if (!fg.visible) continue;
+      if (fg.t0 === null) fg.t0 = clock;          // each figure starts at its beginning
+      try { fg.update(clock - fg.t0); } catch (e) { fg.visible = false; }
+    }
+    raf = window.requestAnimationFrame(frame);
+  }
+  function start() {
+    if (raf !== null || paused || !figures.length) return;
+    base = null;
+    raf = window.requestAnimationFrame(frame);
+  }
+  function stop() {
+    if (raf !== null) { window.cancelAnimationFrame(raf); raf = null; }
+  }
+
+  if (hasIO && !reduce) {
+    var io = new window.IntersectionObserver(function (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        var host = entries[i].target;
+        for (var j = 0; j < figures.length; j++) {
+          if (host === figures[j].root || (host.contains && host.contains(figures[j].root))) {
+            figures[j].visible = entries[i].isIntersecting;
+          }
+        }
+      }
+    }, { rootMargin: "160px" });
+    for (var f = 0; f < figures.length; f++) {
+      var hostEl = figures[f].root.closest ? figures[f].root.closest("figure") : null;
+      io.observe(hostEl || figures[f].root);
+    }
+  }
+
+  if (reduce) paintStatic();
+
+  var toggle = el("motion-toggle");
+  function syncToggle() {
+    if (!toggle) return;
+    toggle.textContent = paused ? "play motion" : "pause motion";
+    toggle.setAttribute("aria-pressed", paused ? "true" : "false");
+  }
+  if (toggle) {
+    toggle.addEventListener("click", function () {
+      paused = !paused;
+      if (paused) { stop(); paintStatic(); } else { start(); }
+      syncToggle();
+    });
+    syncToggle();
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stop(); else start();
+  });
+  start();
+})();
+</script>
+</body>
+</html>
