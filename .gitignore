@@ -12,3 +12,4 @@ results/
 *.png
 !docs/**/*.png
 .DS_Store
+.gstack/
