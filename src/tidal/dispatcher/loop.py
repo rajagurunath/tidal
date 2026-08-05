@@ -178,9 +178,9 @@ class Dispatcher:
         self.aimd.set_floor(floor)
         target = self.aimd.update(metrics.kv_usage, metrics.waiting, len(self._inflight))
 
-        submitted = await self._fill(target, snapshot, priorities, now)
+        submitted, resolved = await self._fill(target, snapshot, priorities, now)
         inflight = len(self._inflight)
-        expired = await self._sweep_expired(snapshot, now)
+        expired = await self._sweep_expired(snapshot, resolved, now)
 
         return TickReport(
             target=target,
@@ -271,42 +271,78 @@ class Dispatcher:
         snapshot: list[BatchSnapshot],
         priorities: dict[str, int],
         now: datetime,
-    ) -> int:
-        """Claim up to ``target - inflight`` items and submit them."""
+    ) -> tuple[int, list[BatchRecord]]:
+        """Claim up to ``target - inflight`` items and submit them.
+
+        The claim is a *global* ``UPDATE ... RETURNING`` over every pending
+        item, while the snapshot is a bounded page of active batches: the two
+        can disagree. Any claimed item whose batch the snapshot missed has that
+        batch resolved directly, so it is submitted against its own endpoint at
+        its own laxity priority — never the defaults — and an item belonging to
+        a batch that is expired, cancelling or otherwise no longer active is
+        not submitted at all.
+
+        Returns ``(submitted, resolved)``, where ``resolved`` are the batch
+        records fetched outside the snapshot: the expiry sweep needs them, or a
+        batch past its deadline but off the page would never be expired.
+        """
         need = target - len(self._inflight)
         if need <= 0:
-            return 0
+            return 0, []
         claimed = await asyncio.to_thread(
             self.repo.claim_pending_items, need, "edf_prefix", now=now
         )
         if not claimed:
-            return 0
+            return 0, []
 
         batches = {batch.id: batch for batch, _p, _i in snapshot}
+        missing = sorted({item.batch_id for item in claimed} - batches.keys())
+        resolved: list[BatchRecord] = []
+        if missing:
+            for batch, pending, inflight in await asyncio.to_thread(self._resolve, missing):
+                batches[batch.id] = batch
+                resolved.append(batch)
+                priorities.setdefault(
+                    batch.id, self._priority_for(batch, pending + inflight, now)[0]
+                )
+
         started: list[str] = []
         submitted = 0
         for item in claimed:
             batch = batches.get(item.batch_id)
-            if batch is not None and now >= batch.expires_at:
+            if batch is None or batch.status not in ACTIVE_STATUSES:
+                # Cancelled, expired, failed or already finalized: the sweep and
+                # the store own this item's fate now, not the dispatcher.
+                log.debug("item %s left unsubmitted: batch is not active", item.id)
+                continue
+            if now >= batch.expires_at:
                 continue  # the sweep below will expire it
-            if batch is not None and batch.status is BatchStatus.VALIDATING:
+            if batch.status is BatchStatus.VALIDATING:
                 started.append(batch.id)
                 batch.status = BatchStatus.IN_PROGRESS
-            self._submit(
-                item,
-                priorities.get(item.batch_id, self.cfg.batch_priority_max),
-                batch.endpoint if batch is not None else "/v1/chat/completions",
-            )
+            self._submit(item, priorities[batch.id], batch.endpoint)
             submitted += 1
 
         if started:
             await asyncio.to_thread(self._mark_in_progress, started, now)
-        return submitted
+        return submitted, resolved
 
-    async def _sweep_expired(self, snapshot: list[BatchSnapshot], now: datetime) -> list[str]:
-        """Expire batches past their completion window; partial output survives."""
+    async def _sweep_expired(
+        self, snapshot: list[BatchSnapshot], resolved: list[BatchRecord], now: datetime
+    ) -> list[str]:
+        """Expire batches past their completion window; partial output survives.
+
+        Sweeps the paged snapshot *and* any batch resolved during the fill, so a
+        batch that fell outside the page still expires on the tick that touched
+        one of its items.
+        """
         expired: list[str] = []
-        for batch, _pending, _inflight in snapshot:
+        candidates = [batch for batch, _pending, _inflight in snapshot]
+        seen = {batch.id for batch in candidates}
+        candidates.extend(
+            batch for batch in resolved if batch.id not in seen and batch.status in ACTIVE_STATUSES
+        )
+        for batch in candidates:
             if now < batch.expires_at:
                 continue
             await self._cancel_tasks(
@@ -383,9 +419,7 @@ class Dispatcher:
             # nothing, so nothing may be metered here either — but finalize
             # still has to run, or a batch cancelled while its last item was in
             # flight would sit in CANCELLING forever.
-            log.warning(
-                "late result for item %s dropped (state=%s)", item.id, record.state.value
-            )
+            log.warning("late result for item %s dropped (state=%s)", item.id, record.state.value)
             await self._call_finalize(item.batch_id)
             return
         self._rate(item.batch_id).record(now=self._now_ts)
@@ -462,6 +496,19 @@ class Dispatcher:
         return None
 
     # -- store helpers (run inside one thread hop) -------------------------
+
+    def _resolve(self, batch_ids: list[str]) -> list[BatchSnapshot]:
+        """Fetch batches the snapshot missed, with their live item counts."""
+        out: list[BatchSnapshot] = []
+        for batch_id in batch_ids:
+            try:
+                batch = self.repo.get_batch(batch_id)
+                if batch is None:
+                    continue
+                out.append((batch, *self.repo.pending_and_inflight(batch_id)))
+            except KeyError:  # pragma: no cover - deleted mid-tick
+                log.debug("claimed item's batch %s vanished", batch_id, exc_info=True)
+        return out
 
     def _mark_in_progress(self, batch_ids: list[str], now: datetime) -> None:
         for batch_id in dict.fromkeys(batch_ids):

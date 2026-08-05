@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from tidal.config import TidalConfig
+from tidal.dispatcher.laxity import laxity_seconds, priority_for, urgency
 from tidal.dispatcher.loop import Dispatcher, TickReport
 from tidal.dispatcher.vllm_client import (
     EngineDown,
@@ -71,6 +72,9 @@ class FakeRepo:
         self.max_attempts = max_attempts
         self.requeue_calls = 0
         self.page_sizes: list[int] = []
+        #: Batches invisible to ``list_batches`` — stands in for a batch that
+        #: falls outside the dispatcher's paged active-batch scan.
+        self.hidden: set[str] = set()
 
     # -- test helpers -------------------------------------------------------
 
@@ -134,7 +138,8 @@ class FakeRepo:
 
     def list_batches(self, limit: int, after: str | None) -> list[BatchRecord]:
         self.page_sizes.append(limit)
-        ordered = sorted(self.batches.values(), key=lambda b: (b.created_at, b.id), reverse=True)
+        visible = [b for b in self.batches.values() if b.id not in self.hidden]
+        ordered = sorted(visible, key=lambda b: (b.created_at, b.id), reverse=True)
         if after is not None:
             ids = [b.id for b in ordered]
             ordered = ordered[ids.index(after) + 1 :] if after in ids else []
@@ -506,6 +511,69 @@ async def test_escalation_floor_keeps_items_flowing_under_sustained_load():
     for i in range(10):
         await run_tick(calm, T0 + timedelta(seconds=i))
     assert calm_client.calls == [], "an on-track batch yields completely to online load"
+
+
+# --------------------------------------------------------------------------
+# claim / snapshot agreement
+# --------------------------------------------------------------------------
+
+
+async def test_claimed_item_resolves_its_own_batch_when_the_snapshot_missed_it():
+    """The claim is global; the snapshot is a bounded page. They can disagree.
+
+    An item claimed for a batch the active-batch scan never returned used to be
+    submitted at the default priority and against the default endpoint — the
+    completions batch would have been posted to /v1/chat/completions, and an
+    at-risk batch would have flown at priority 100.
+    """
+    cfg = TidalConfig()
+    repo, client = FakeRepo(), FakeClient(kv_usage=0.10)
+    batch = repo.add_batch(1, created_at=T0, window_hours=24, endpoint="/v1/completions")
+    repo.hidden.add(batch.id)  # outside this tick's paged scan
+    disp = make_dispatcher(repo, client, cfg)
+
+    now = T0 + timedelta(hours=23, minutes=45)  # 15 minutes of slack
+    report = await run_tick(disp, now)
+
+    expected = priority_for(
+        urgency(laxity_seconds(batch.expires_at, now, 0, 1.0), cfg.escalation_horizon_s), cfg
+    )
+    assert expected < cfg.batch_priority_max, "the fixture must actually be escalated"
+    assert report.submitted == 1
+    (_body, priority, endpoint) = client.calls[0]
+    assert endpoint == "/v1/completions"
+    assert priority == expected
+    assert repo.batches[batch.id].status is BatchStatus.IN_PROGRESS
+
+
+async def test_items_of_an_expired_batch_are_never_submitted_and_still_sweep():
+    """Past its window the batch is dead — even if the snapshot never saw it."""
+    repo, client = FakeRepo(), FakeClient(kv_usage=0.10)
+    stale = repo.add_batch(2, created_at=T0, window_hours=1)
+    repo.hidden.add(stale.id)
+    finalizer = FakeFinalizer()
+    disp = make_dispatcher(repo, client, finalize=finalizer)
+
+    report = await run_tick(disp, T0 + timedelta(hours=2))
+
+    assert client.calls == []
+    assert report.submitted == 0
+    assert report.expired_batches == [stale.id]
+    assert repo.batches[stale.id].status is BatchStatus.EXPIRED
+    assert repo.item_states(stale.id) == [ItemState.EXPIRED, ItemState.EXPIRED]
+
+
+async def test_items_of_a_cancelling_batch_are_not_submitted():
+    repo, client = FakeRepo(), FakeClient(kv_usage=0.10)
+    batch = repo.add_batch(1)
+    repo.cancel_batch(batch.id, now=T0)
+    repo.items[batch.id][0].state = ItemState.PENDING  # e.g. requeued by a retry
+
+    disp = make_dispatcher(repo, client)
+    report = await run_tick(disp, T0 + timedelta(seconds=1))
+
+    assert client.calls == []
+    assert report.submitted == 0
 
 
 # --------------------------------------------------------------------------
