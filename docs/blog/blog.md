@@ -4,7 +4,7 @@ Your GPU is bored. Not idle in the way `nvidia-smi` shows — utilization might 
 
 OpenAI and Anthropic figured out how to sell that evaporation. It's called the Batch API: upload a file of requests, get results within 24 hours, pay half price. The discount works because batch tokens are produced in the shadow of online traffic, on capacity that would otherwise be wasted. If you self-host, you can't buy this product and you can't sell it either — vLLM has no `/v1/batches`, and the offline batch runner it does ship wants the whole machine to itself.
 
-Tidal fixes that. It's an open-source system that gives your vLLM deployment the same two products the commercial providers have: online inference at full price and full priority, and a durable, OpenAI-wire-compatible batch tier at half price with a *real* 24-hour guarantee — on the same GPU, at the same time.
+Tidal fixes that. It's an open-source system that gives your vLLM deployment the same two products the commercial providers have: online inference at full price and full priority, and a durable, OpenAI-wire-compatible batch tier at half price with a 24-hour completion contract — admission that refuses infeasible jobs, and escalation that spends online headroom only when a deadline demands it — on the same GPU, at the same time.
 
 ## The part that isn't obvious: the guarantee
 
@@ -20,7 +20,7 @@ urgency = clamp(1 − laxity / 6h, 0, 1)      # ramps only in the last 6h of sla
 priority = 100 → 1 as urgency goes 0 → 1    # online is 0; batch never displaces it
 ```
 
-A batch that's on track has hours of laxity, urgency zero, priority 100 — completely invisible to your online users, forever. A batch that's falling behind — because your online traffic spiked and the engine preempted its work — sees its laxity shrink and starts climbing the priority ladder *early*, hours before a wall-clock rule would react, and independently of every other batch. At maximum urgency it sits one notch below online priority with a token-bucket floor guaranteeing forward progress. Deadline math, not hope.
+A batch that's on track has hours of laxity, urgency zero, priority 100 — it never asks for more than the leftover capacity. (Co-location itself isn't free: our measurements show ~1.8× online p99 even with everything behaving. What escalation guarantees is that batch never takes *more* than the deadline requires.) A batch that's falling behind — because your online traffic spiked and the engine preempted its work — sees its laxity shrink and starts climbing the priority ladder *early*, hours before a wall-clock rule would react, and independently of every other batch. At maximum urgency it sits one notch below online priority with a token-bucket floor guaranteeing forward progress. Deadline math, not hope. And the same arithmetic runs at submission time: a batch whose projected completion already exceeds its window is rejected up front with the numbers in the error — a contract has an admission face, not just a scheduling face.
 
 Two details we got wrong first, so you don't have to:
 
@@ -60,7 +60,7 @@ And because the wire format is exactly OpenAI's, existing batch-API clients work
 
 ## What we measured
 
-[RESULTS — to be filled from the eval run: online p99 impact, % of offline ceiling harvested, the deadline-stress plot where best-effort misses and laxity meets, and the A-vs-B comparison.]
+On our CPU testbed (yes, a MacBook — mechanism validation, not GPU numbers): naive co-location with vLLM's priority field alone destroyed online latency (22.6× p99) while the gateway delivered the same batch work at 1.76×. The A-vs-B comparison produced the night's most interesting result — a placement *inversion*: the in-engine scheduler harvested 71% of the offline throughput ceiling versus the gateway's 45%, but at 8–10× online p99 versus the gateway's ~2×, because on this hardware the binding interference is resident-decode contention, which sits below the reach of admission-time control. External-vs-in-engine isn't a ranking; it's a throughput/latency frontier, and nobody in the fork-based literature has measured it because each system only evaluates its own placement. Full distributions, negative results included, in the paper.
 
 ## Try it
 
