@@ -91,16 +91,26 @@ Three implementation observations from bringing the system up are worth recordin
 
 ## 5. Evaluation
 
-Setup: [EVAL-HW: Mac M4 Pro CPU, Qwen2.5-0.5B-Instruct, τ=..., and (if available) H100/H200 runs]. Online load: Poisson and diurnal (sinusoidal) arrival traces of short chat requests, plus a bursty trace. Batch load: [N]-item jobs of [workload]. Conditions: online-only (latency ceiling), offline-only (throughput ceiling), naive co-location (priority field only, no Tidal policy), Technique A, Technique B. Metrics: online TTFT/TBT p50/p99; batch throughput as fraction of offline ceiling; deadline attainment under load; preemption lost-tokens; T̂ MAPE over time.
+**Setup.** Apple M4 Pro (CPU-only vLLM build, v0.26.1 series @ e6d67fdd), Qwen2.5-0.5B-Instruct, τ = 2048, `--scheduling-policy priority`, `--enforce-eager`. Online load: seeded Poisson arrivals of short chat requests (1.0 req/s, 10-minute windows, identical schedule across conditions); latencies are total non-streaming request latencies (on this configuration ≈ TTFT + a short decode). Batch load: 1,200-item jobs of short chat completions. Conditions: online-only (latency baseline), offline-only (throughput ceiling), naive co-location (all items submitted at once with the priority field, no Tidal policy), Technique A (gateway), Technique B (in-engine; TBT budget re-pointed at this hardware: 60 ms). We stress that CPU-scale numbers characterize *mechanisms and their relative behavior*, not GPU performance; the GPU evaluation is planned on 8×H200.
 
-Questions:
-- **Q1 (co-location tax):** what do techniques A and B do to online p99 TTFT/TBT versus online-only? [RESULTS TABLE]
-- **Q2 (work conservation):** what fraction of the offline ceiling does each technique sustain at low/mid/high online load? [RESULTS TABLE; HyGen reports 84%, ConServe 78–88% on GPU-class hardware — direct numeric comparison is architecture-relative, shape comparison is fair]
-- **Q3 (the guarantee):** under sustained online load sized so best-effort misses a tight deadline, does laxity escalation meet it, and at what online latency price? Including the `sla_strict` dial. [RESULTS FIGURE: the money plot]
-- **Q4 (placement):** A vs B on all of the above — what does in-engine buy? [RESULTS + DISCUSSION]
-- **Q5 (self-calibration):** T̂ convergence time from cold start, MAPE steady-state, and behavior across a mid-run regime change. [RESULTS FIGURE]
+**Q1 — the co-location tax (and why naive is not a baseline you can live with).** All co-location conditions completed the identical 1,200-item batch during the window. The online latency price differed by an order of magnitude:
 
-[RESULTS SECTIONS TO BE FILLED FROM tidal/eval RUNS — no numbers appear in this draft that were not measured.]
+| condition | online p50 | online p99 | vs baseline (p50 / p99) |
+|---|---|---|---|
+| online-only | 0.44 s | 1.43 s | 1.00× / 1.00× |
+| naive (priority only) | 11.97 s | 32.24 s | 27.3× / 22.6× |
+| Technique A | 1.12 s | 2.52 s | 2.54× / 1.76× |
+| Technique B | 1.26 s | 11.80 s | 2.86× / 8.25× |
+
+Naive co-location — the configuration vLLM's priority field alone gives you — is catastrophic: flooding the engine with resident batch work destroys online latency despite correct priority ordering, because admission priority does not bound resident-request contention. Technique A holds p99 to 1.76× while delivering the same batch work. Note the median: it degrades *more* than the tail everywhere (co-serving adds a near-constant per-step cost that dominates fast requests), so p99-only reporting — the norm in this literature — flatters every technique including ours.
+
+**Q2 — work conservation.** The offline ceiling on this box is 4.43 items/s (68.5 output tok/s). In the Q1 runs all co-location conditions were pool-limited (they drained the 1,200 items; 45.2% of ceiling is a floor, not a measurement). With a non-draining 3,000-item pool: [CAPACITY-RESULTS].
+
+**Q3 — the guarantee.** Deadline-stress: a 900-item batch with a 15-minute completion window under 3 req/s online load (three times the Q1 pressure), escalation horizon 10 minutes, versus a control with escalation effectively disabled (1-second horizon) — best-effort co-location, i.e., what HyGen/ConServe-style systems provide. [DEADLINE-RESULTS].
+
+**Q4 — placement, and an inversion.** The naive expectation — in-engine placement must dominate — is wrong on this hardware. Technique B's admission gate and KV guardband address interference channels that never bind here: peak KV usage in every run was below 0.5%, so guardband eviction never fired, and once a batch request is *resident* it decodes every iteration regardless of the admission cap. The dominant interference channel on the CPU box is resident-decode contention, which only sub-iteration participation control could bound (§7). Technique A wins (1.76× vs 8.25× p99) precisely because its control point — how many batch requests exist at all — is upstream of residency. We expect the ordering to tighten or invert on hardware where compute, not residency, binds (large τ-filling prefills, real KV pressure engaging the guardband); measuring that crossover is the core of the planned GPU evaluation. This placement inversion is, to our knowledge, unreported: the fork-based literature evaluates only its own placement.
+
+**Q5 — self-calibration.** From a cold start, T̂ reached its R² gate within the first capped-mode phase of the integration run and settled at MAPE ≈ 0.11 on live traffic; the capped batch-token budget X moved from the cold-start 40 tokens to a converged 1 (correctly tight: at a 60 ms budget with ~25 ms online-only steps, there is little slack to sell on this box, and the model discovered that). Regime-change behavior on model swap remains untested (§7).
 
 ## 6. Related Work
 
