@@ -486,3 +486,39 @@ def test_usage_summary_aggregates_by_model(repo):
 
     (recent,) = repo.usage_summary(T0 + timedelta(minutes=30))
     assert recent["items"] == 1 and recent["prompt_tokens"] == 200
+
+
+# -- admission feasibility -----------------------------------------------
+
+
+def test_global_completion_rate_is_none_without_history(repo):
+    _batch(repo, items=[("a", 1, 0, _body())], now=T0)
+    assert repo.global_completion_rate(now=T0) is None
+
+
+def test_global_completion_rate_counts_successes_inside_the_window(repo):
+    _batch(
+        repo,
+        items=[(c, n, 0, _body()) for n, c in enumerate("abcd", start=1)],
+        now=T0,
+    )
+    a, b, c, d = repo.claim_pending_items(limit=4, now=T0)
+    repo.record_item_success(a.id, {}, 1, 1, None, now=T0 + timedelta(minutes=10))
+    repo.record_item_success(b.id, {}, 1, 1, None, now=T0 + timedelta(minutes=50))
+    repo.record_item_success(c.id, {}, 1, 1, None, now=T0 + timedelta(minutes=90))
+    # a failure is not throughput, however recent it is
+    repo.record_item_failure(d.id, "boom", retryable=False, now=T0 + timedelta(minutes=55))
+
+    hour_in = T0 + timedelta(minutes=60)
+    assert repo.global_completion_rate(now=hour_in) == pytest.approx(2 / 3600)
+    # a shorter window keeps only the success inside it
+    assert repo.global_completion_rate(1800.0, now=hour_in) == pytest.approx(1 / 1800)
+    # later, only the third success is still inside the hour
+    assert repo.global_completion_rate(now=T0 + timedelta(minutes=120)) == pytest.approx(1 / 3600)
+    # and once every success has aged out there is nothing to judge by
+    assert repo.global_completion_rate(now=T0 + timedelta(minutes=300)) is None
+
+
+def test_global_completion_rate_rejects_a_non_positive_window(repo):
+    with pytest.raises(ValueError):
+        repo.global_completion_rate(0.0, now=T0)

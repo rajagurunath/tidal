@@ -23,6 +23,10 @@ class TidalConfig:
     completion_window_hours: float = 24.0
     max_item_attempts: int = 3
     served_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    # Admission feasibility: a batch is refused when its projected completion
+    # at the observed rate exceeds this fraction of the window. <1 keeps
+    # headroom for the online traffic sharing the GPU; 0 disables the check.
+    admission_feasibility_margin: float = 0.8
 
     # -- dispatcher (technique A: external control) --
     poll_interval_s: float = 1.0

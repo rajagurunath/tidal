@@ -7,7 +7,9 @@ whole batch lifecycle.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 
 import httpx
 import openai
@@ -370,3 +372,108 @@ async def test_cancelling_a_terminal_batch_is_409(sdk, repo, http, auth):
     assert resp.json()["error"]["message"]
     with pytest.raises(openai.ConflictError):
         await sdk.batches.cancel(batch.id)
+
+
+# -- admission feasibility -------------------------------------------------
+#
+# The gateway sells a completion window, so it must not accept work its own
+# observed throughput says it cannot finish inside that window.
+
+
+def big_input(n: int) -> bytes:
+    return jsonl(*(chat_request(f"c{i}") for i in range(n)))
+
+
+def seed_history(repo: FakeRepository, count: int) -> None:
+    """Give the store ``count`` just-succeeded items — the observed history
+    the feasibility check reads back as a completion rate."""
+    source = repo.create_file("batch", "history.jsonl", GOOD_INPUT)
+    repo.create_batch(
+        source.id, CHAT, 24, {}, [(f"h{n}", n, 0, {"model": "m"}) for n in range(count)]
+    )
+    for item in repo.claim_pending_items(count):
+        repo.record_item_success(item.id, {"ok": True}, 1, 1, None)
+
+
+@contextlib.asynccontextmanager
+async def client_for(cfg: TidalConfig, repo: FakeRepository):
+    transport = httpx.ASGITransport(app=create_app(cfg, repo))
+    async with httpx.AsyncClient(transport=transport, base_url=BASE) as client:
+        yield client
+
+
+def create_body(file_id: str) -> dict:
+    return {"input_file_id": file_id, "endpoint": CHAT, "completion_window": "24h"}
+
+
+async def test_batch_is_admitted_when_there_is_no_history(http, auth, repo):
+    """Nothing has ever completed, so there is no rate to judge by — admit."""
+    source = repo.create_file("batch", "in.jsonl", big_input(5000))
+
+    resp = await http.post("/v1/batches", headers=auth, json=create_body(source.id))
+
+    assert resp.status_code == 200
+    assert resp.json()["request_counts"]["total"] == 5000
+
+
+async def test_batch_within_the_observed_rate_is_admitted(http, auth, repo):
+    seed_history(repo, 100)  # 100 items in the last hour ≈ 0.0278 items/s
+    source = repo.create_file("batch", "in.jsonl", GOOD_INPUT)
+
+    resp = await http.post("/v1/batches", headers=auth, json=create_body(source.id))
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "validating"
+
+
+async def test_batch_projected_past_its_window_is_rejected(http, auth, repo):
+    seed_history(repo, 1)  # one item an hour: 0.000278 items/s
+    source = repo.create_file("batch", "in.jsonl", big_input(25))
+
+    resp = await http.post("/v1/batches", headers=auth, json=create_body(source.id))
+
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "batch_infeasible"
+    assert error["type"] == "invalid_request_error"
+    message = error["message"]
+    assert "25 items" in message  # the work asked for
+    assert "0.000278 items/s" in message  # the rate actually observed
+    assert "25.0h" in message  # where that projects completion
+    assert "24.0h" in message  # the window being sold
+    # the batch was refused outright, not created and left to expire
+    assert len(repo.batches) == 1  # only the seeded history batch
+
+
+async def test_margin_of_zero_disables_the_feasibility_check(repo):
+    seed_history(repo, 1)
+    source = repo.create_file("batch", "in.jsonl", big_input(25))
+    cfg = TidalConfig(api_key="test-key", admission_feasibility_margin=0.0)
+
+    async with client_for(cfg, repo) as client:
+        resp = await client.post(
+            "/v1/batches",
+            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            json=create_body(source.id),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["request_counts"]["total"] == 25
+
+
+async def test_store_failure_during_the_check_admits_and_logs(http, auth, repo, caplog):
+    """Admission control is advisory: a broken store must not stop intake."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("store is down")
+
+    repo.global_completion_rate = boom
+    source = repo.create_file("batch", "in.jsonl", big_input(25))
+
+    with caplog.at_level(logging.WARNING):
+        resp = await http.post("/v1/batches", headers=auth, json=create_body(source.id))
+
+    assert resp.status_code == 200
+    assert resp.json()["request_counts"]["total"] == 25
+    assert "feasibility" in caplog.text.lower()
+    assert "store is down" in caplog.text

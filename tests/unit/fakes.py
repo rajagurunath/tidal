@@ -274,6 +274,23 @@ class FakeRepository:
             sum(1 for i in items if i.state is ItemState.INFLIGHT),
         )
 
+    def global_completion_rate(
+        self, window_s: float = 3600.0, *, now: datetime | None = None
+    ) -> float | None:
+        if window_s <= 0:
+            raise ValueError("window_s must be > 0")
+        end = now or _now()
+        cutoff = end - timedelta(seconds=window_s)
+        count = sum(
+            1
+            for items in self.items.values()
+            for item in items
+            if item.state is ItemState.SUCCEEDED
+            and item.finished_at is not None
+            and cutoff <= item.finished_at <= end
+        )
+        return count / window_s if count else None
+
     # -- metering -----------------------------------------------------------
 
     def record_usage(

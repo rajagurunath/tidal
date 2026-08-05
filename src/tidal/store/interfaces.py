@@ -184,6 +184,19 @@ class Repository(Protocol):
         """Items of a batch in ``line_no`` order, optionally filtered by state."""
         ...
 
+    # added for admission feasibility
+    def global_completion_rate(
+        self, window_s: float = 3600.0, *, now: datetime | None = None
+    ) -> float | None:
+        """Succeeded items per second observed system-wide over the window
+        ``[now - window_s, now]``, from the items' completion timestamps.
+
+        Returns ``None`` when the window holds no successes: with no history
+        the gateway cannot judge whether a deadline is reachable, and must not
+        pretend the rate is zero.
+        """
+        ...
+
     # -- metering --
     def record_usage(
         self,

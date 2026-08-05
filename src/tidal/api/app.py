@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, Request, Response, UploadFile
@@ -34,8 +35,12 @@ from tidal.api.schemas import (
 from tidal.config import TidalConfig
 from tidal.store.interfaces import BatchStatus, IllegalTransition, Repository
 
+log = logging.getLogger("tidal.api")
+
 INPUT_PURPOSE = "batch"
 ERROR_PURPOSE = "batch_error"
+INFEASIBLE_CODE = "batch_infeasible"
+RATE_WINDOW_S = 3600.0  # how far back the observed completion rate is measured
 
 
 class ApiError(Exception):
@@ -183,6 +188,7 @@ def _v1_router(cfg: TidalConfig, repo: Repository) -> APIRouter:
             return await render_batch(rec)
 
         items = [tuple(line) for line in parsed]
+        await _check_feasibility(repo, call, cfg, len(items))
         rec = await call(
             repo.create_batch,
             body.input_file_id,
@@ -232,6 +238,49 @@ def _v1_router(cfg: TidalConfig, repo: Repository) -> APIRouter:
         return await render_batch(closed or rec)
 
     return router
+
+
+async def _check_feasibility(repo: Repository, call: Any, cfg: TidalConfig, n_items: int) -> None:
+    """Refuse a batch the system's own laxity arithmetic says it cannot finish.
+
+    The deadline sold to the client is ``completion_window_hours``; the only
+    honest estimate of how long the work takes is the completion rate the
+    system has actually been observed to sustain. If ``n_items / rate`` runs
+    past ``margin`` of that window, the batch is rejected at the door rather
+    than accepted and expired a day later. The margin (<1) is the headroom
+    left for the online traffic that shares the GPU; a margin of 0 turns the
+    check off.
+
+    Admission control is advisory, never fatal: no history (rate is ``None``)
+    and any store failure both mean *no verdict*, and no verdict means admit.
+    """
+    margin = cfg.admission_feasibility_margin
+    if margin <= 0 or n_items <= 0:
+        return
+    try:
+        rate = await call(repo.global_completion_rate, RATE_WINDOW_S)
+    except Exception:
+        log.warning(
+            "admission feasibility check skipped: completion-rate lookup failed", exc_info=True
+        )
+        return
+    if rate is None or rate <= 0:
+        return
+
+    window_h = cfg.completion_window_hours
+    projected_h = n_items / rate / 3600.0
+    budget_h = window_h * margin
+    if projected_h <= budget_h:
+        return
+    raise ApiError(
+        400,
+        f"Batch of {n_items} items is not feasible within its completion window: "
+        f"at the observed completion rate of {rate:.6f} items/s it projects "
+        f"{projected_h:.1f}h to finish, against a {window_h:.1f}h window "
+        f"(admission budget {budget_h:.1f}h at margin {margin:.2f}). "
+        f"Split the batch or resubmit when the queue drains.",
+        code=INFEASIBLE_CODE,
+    )
 
 
 async def _fail_validation(

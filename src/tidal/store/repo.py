@@ -685,6 +685,35 @@ class SqlRepository:
             stmt = stmt.order_by(ItemRow.line_no, ItemRow.seq)
             return [_item_record(r) for r in session.execute(stmt).scalars()]
 
+    def global_completion_rate(
+        self, window_s: float = 3600.0, *, now: datetime | None = None
+    ) -> float | None:
+        """Observed system-wide throughput in succeeded items per second over
+        the window ``[now - window_s, now]`` (added for admission feasibility).
+
+        The count is divided by the whole window rather than by the span the
+        successes actually cover, so a store whose history is younger than the
+        window reads low — the estimate is deliberately the one the system can
+        prove it sustained. ``None`` when the window contains no successes at
+        all: no history means no verdict, not a rate of zero.
+        """
+        if window_s <= 0:
+            raise ValueError("window_s must be > 0")
+        end = _now(now)
+        cutoff = end - timedelta(seconds=window_s)
+        with self._session() as session:
+            count = int(
+                session.execute(
+                    select(func.count(ItemRow.seq)).where(
+                        ItemRow.state == ItemState.SUCCEEDED,
+                        ItemRow.finished_at.is_not(None),
+                        ItemRow.finished_at >= cutoff,
+                        ItemRow.finished_at <= end,
+                    )
+                ).scalar_one()
+            )
+        return count / window_s if count else None
+
     # -- metering --
 
     def record_usage(
