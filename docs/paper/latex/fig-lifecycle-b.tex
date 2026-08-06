@@ -1,0 +1,138 @@
+% Figure 2 --- Technique B: one iteration of TidalScheduler.schedule().
+% Mechanically verified against src/tidal/engine/scheduler.py,
+% src/tidal/engine/latency_model.py, src/tidal/engine/guardband.py, src/tidal/config.py.
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  box/.style={rounded corners=2pt, draw=black!45, fill=white, text width=7.5cm,
+              align=center, inner sep=4pt, minimum height=0.8cm},
+  keybox/.style={box, draw=accent, line width=0.7pt, fill=accent!8},
+  sidebox/.style={rounded corners=2pt, draw=black!45, fill=white, text width=4.2cm,
+                  align=center, inner sep=4pt, minimum height=0.8cm},
+  dec/.style={diamond, aspect=2.9, draw=accent, line width=0.7pt, fill=accent!8,
+              inner sep=1pt, align=center, font=\sffamily\scriptsize},
+  fl/.style={-{Stealth[length=1.7mm,width=1.5mm]}, draw=black!60, line width=0.5pt},
+  loop/.style={-{Stealth[length=1.7mm,width=1.5mm]}, draw=black!45, dashed, line width=0.5pt},
+  lbl/.style={font=\sffamily\scriptsize, inner sep=1.5pt, fill=white},
+  stage/.style={font=\sffamily\scriptsize\bfseries, accent, anchor=west},
+]
+
+% ---- phase bands ------------------------------------------------------------
+\begin{scope}[on background layer]
+  \fill[black!5, rounded corners=3pt] (0.9,-1.05) rectangle (9.1,-4.35);
+  \fill[accent!6, rounded corners=3pt] (0.9,-4.75) rectangle (9.1,-13.45);
+  \fill[black!5, rounded corners=3pt] (0.9,-15.55) rectangle (9.1,-16.85);
+\end{scope}
+\node[stage] at (0.95,-0.75) {OBSERVE};
+\node[stage] at (0.95,-4.45) {PRE-GATE};
+\node[stage] at (0.95,-15.25) {POST};
+
+% ---- entry ------------------------------------------------------------------
+\node[box, fill=black!8] (top) at (5,-0.2)
+  {\texttt{TidalScheduler.schedule()} --- iteration $n$};
+
+% ---- observe ----------------------------------------------------------------
+\node[box] (obs) at (5,-1.6)
+  {observe the \emph{previous} step: $(P,\,C,\,\text{step\_ms})$, where
+   step\_ms is the monotonic delta between \texttt{schedule()} calls};
+\node[box] (fit) at (5,-3.5)
+  {fit $\hat T(P,C)=k_1P + k_2P(P{+}C) + k_4(P{+}C) + k_5$\\
+   ring buffer $\rightarrow$ periodic least squares $\rightarrow$ non-negativity
+   clamps $\rightarrow$ $R^2$ gate};
+\draw[fl] (top) -- (obs);
+\draw[fl] (obs) -- (fit);
+
+% ---- pre-gate ---------------------------------------------------------------
+\node[box] (cls) at (5,-5.4)
+  {classify: \texttt{priority}\,$\ge 1 \Rightarrow$ \textbf{batch};
+   \texttt{priority}\,$=0 \Rightarrow$ \textbf{online}
+   (an \texttt{sla\_strict} job that reaches $0$ \emph{is} online)};
+\draw[fl] (fit) -- (cls);
+
+\node[dec] (zero) at (5,-6.9) {zero online resident?};
+\draw[fl] (cls) -- (zero);
+
+\node[sidebox, draw=accent, fill=accent!8] (offline) at (12.5,-6.9)
+  {\textbf{offline mode}\\ cap lifted entirely: batch work fills $\tau$};
+\draw[fl] (zero) -- (offline) node[lbl, midway, above] {yes};
+
+\node[keybox] (cap) at (5,-8.7)
+  {$X=\max\{x : \hat T(P_{\mathrm{on}}+x,\,C) \le \mathrm{TBT}\cdot(1-\text{guard})\}$\\
+   cold start / failed $R^2$ gate: $X = 0.25\cdot\tau$;\quad clamp to $[0,\ \tau-P_{\mathrm{on}}]$};
+\draw[fl] (zero) -- (cap) node[lbl, midway, right] {no};
+
+\node[box] (hide) at (5,-10.3)
+  {hide every waiting batch request beyond $X$ in the \textbf{held set} ---
+   the stock pass never sees them};
+\draw[fl] (cap) -- (hide);
+
+\node[box] (guard) at (5,-12.3)
+  {\textbf{guardband} $H = \mathrm{clamp}(\text{EWMA of online KV demand},\,5\%,\,30\%)$\\
+   admission stops at $\mathrm{kv} > 1-H$;\ \ proactive eviction at $\mathrm{kv} > 1-H/2$\\
+   victim $=$ batch request with the least non-prefix-cached work};
+\draw[fl] (hide) -- (guard);
+
+% ---- stock pass -------------------------------------------------------------
+\node[box, fill=black!8] (stock) at (5,-14.2)
+  {\texttt{super().schedule()} --- stock vLLM V1 pass:\\ online first, then the
+   \emph{visible} batch requests};
+\draw[fl] (guard) -- (stock);
+% offline branch rejoins the stock pass, routed through the gap between the
+% pipeline column (right edge 9.1) and the side panel (left edge 9.9).
+\draw[fl] (offline.south) -- (12.5,-8.15) -- (9.5,-8.15) -- (9.5,-14.2) -- (stock.east);
+
+% ---- post -------------------------------------------------------------------
+\node[box] (post) at (5,-16.2)
+  {restore the held set in a \texttt{finally} block (exception-safe, heap order
+   preserved); emit \texttt{TickStats} telemetry};
+\draw[fl] (stock) -- (post);
+\draw[loop] (post.west) -- ++(-1.35,0) |- (top.west)
+  node[lbl, pos=0.25, rotate=90] {next iteration};
+
+% ---- side panel: the token budget bar ---------------------------------------
+\begin{scope}[on background layer]
+  \fill[black!5, rounded corners=3pt] (9.9,-9.0) rectangle (15.7,-16.9);
+\end{scope}
+\node[font=\sffamily\scriptsize\bfseries, anchor=west] at (9.95,-9.35)
+  {per-iteration token budget};
+
+% bar: x 11.0..12.0, bottom -16.3, top -10.1 ; total height 6.2 == tau
+\fill[black!45]  (11.0,-16.3) rectangle (12.0,-14.3);
+\fill[accent!70] (11.0,-14.3) rectangle (12.0,-11.7);
+\fill[white]     (11.0,-11.7) rectangle (12.0,-10.1);
+\draw[pattern=north east lines, pattern color=black!35]
+     (11.0,-11.7) rectangle (12.0,-10.1);
+\draw[black!60]  (11.0,-16.3) rectangle (12.0,-10.1);
+\draw[dashed, accent, line width=0.6pt] (10.85,-11.7) -- (12.35,-11.7);
+
+% tau brace on the left of the bar
+\draw[decorate, decoration={brace, amplitude=3pt}, black!60] (10.8,-16.3) -- (10.8,-10.1);
+\node[rotate=90, font=\sffamily\scriptsize, align=center, black!70] at (10.35,-13.2)
+  {$\tau=$ \texttt{max\_num\_batched\_tokens}};
+
+% segment labels on the right
+\node[anchor=west, font=\sffamily\scriptsize, text width=3.3cm] at (12.2,-15.3)
+  {online tokens $P_{\mathrm{on}}$};
+\node[anchor=west, font=\sffamily\scriptsize, text width=3.3cm] at (12.2,-13.1)
+  {batch fill, up to $X$};
+\node[anchor=west, font=\sffamily\scriptsize, accent] at (12.2,-11.7) {cap $X$};
+\node[anchor=west, font=\sffamily\scriptsize, text width=3.3cm] at (12.2,-10.65)
+  {unfilled slack\\ (\texttt{starved\_slack}, alarmed)};
+
+\end{tikzpicture}
+\caption[Technique B per-iteration flow]{%
+  \textbf{Technique B: one engine iteration.}
+  \texttt{TidalScheduler} wraps rather than reimplements the stock \texttt{schedule()}.
+  Before the stock pass it feeds the previous step's $(P,C,\text{step\_ms})$ to a
+  continuously refitted latency model, solves that model for the largest batch-token
+  cap $X$ that keeps the step inside the guarded inter-token budget, and hides every
+  waiting batch request beyond $X$ --- lifting the cap entirely when no online request
+  is resident. A KV guardband stops batch admission before online bursts can be starved
+  of blocks and evicts the cheapest batch victim under further growth. After the stock
+  pass the held set is restored in a \texttt{finally} block.
+  The side panel shows what $X$ governs: online tokens occupy the bottom of the
+  $\tau$-token budget, batch work fills up to the cap, and whatever is left unfilled is
+  reported as starved slack.}
+\label{fig:lifecycle-b}
+\end{figure}

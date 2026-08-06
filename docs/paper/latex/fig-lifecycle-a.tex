@@ -1,0 +1,148 @@
+% Figure 1 --- Technique A: full request lifecycle across four swimlanes.
+% Mechanically verified against src/tidal/api/app.py, src/tidal/store/interfaces.py,
+% src/tidal/dispatcher/loop.py, src/tidal/dispatcher/aimd.py, src/tidal/api/assembler.py.
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  box/.style={rounded corners=2pt, draw=black!45, fill=white, text width=3.05cm,
+              align=center, inner sep=3pt, minimum height=0.8cm},
+  keybox/.style={box, draw=accent, line width=0.7pt, fill=accent!8},
+  ghost/.style={box, draw=black!45, dashed, fill=black!2},
+  note/.style={rounded corners=2pt, draw=black!35, dashed, fill=black!2,
+               text width=5.6cm, align=left, inner sep=4pt, font=\sffamily\scriptsize},
+  hdr/.style={rounded corners=2pt, draw=accent!70, fill=accent!18, text width=3.3cm,
+              align=center, inner sep=3pt, minimum height=0.75cm, font=\sffamily\small\bfseries},
+  fl/.style={-{Stealth[length=1.7mm,width=1.5mm]}, draw=black!60, line width=0.5pt},
+  flb/.style={{Stealth[length=1.7mm,width=1.5mm]}-{Stealth[length=1.7mm,width=1.5mm]},
+              draw=black!60, line width=0.5pt},
+  bypass/.style={-{Stealth[length=2.4mm,width=2.2mm]}, draw=accent, line width=1.4pt},
+  reject/.style={-{Stealth[length=1.7mm,width=1.5mm]}, draw=black!60, dashed, line width=0.5pt},
+  lbl/.style={font=\sffamily\scriptsize, inner sep=1.5pt, fill=white, midway},
+]
+
+% ---- lane bands -------------------------------------------------------------
+\begin{scope}[on background layer]
+  \foreach \x in {2,6,10,14} {
+    \fill[black!5, rounded corners=3pt] (\x-1.85,0.55) rectangle (\x+1.85,-17.55);
+  }
+\end{scope}
+
+% ---- lane headers -----------------------------------------------------------
+\node[hdr] (hC) at (2,0)  {Client};
+\node[hdr] (hG) at (6,0)  {Gateway + Store};
+\node[hdr] (hD) at (10,0) {Dispatcher};
+\node[hdr] (hV) at (14,0) {vLLM};
+\node[font=\sffamily\tiny\itshape, black!60, text width=3.3cm, align=center] at (2,-0.62)
+  {OpenAI SDK};
+\node[font=\sffamily\tiny\itshape, black!60, text width=3.3cm, align=center] at (6,-0.62)
+  {FastAPI + SQLite (WAL)};
+\node[font=\sffamily\tiny\itshape, black!60, text width=3.3cm, align=center] at (10,-0.62)
+  {1\,Hz control loop};
+\node[font=\sffamily\tiny\itshape, black!60, text width=3.3cm, align=center] at (14,-0.62)
+  {unmodified engine};
+
+% ---- row 1: file upload -----------------------------------------------------
+\node[box] (c1) at (2,-1.6)
+  {\textbf{1}~~\texttt{files.create}\\ JSONL, \texttt{purpose="batch"}};
+\node[box] (g1) at (6,-1.6)
+  {validate line by line\\ (\texttt{custom\_id}, method, url, body); store blob};
+\draw[fl] (c1) -- (g1);
+
+% ---- row 2: admission -------------------------------------------------------
+\node[box] (c2) at (2,-3.2)
+  {\textbf{2}~~\texttt{batches.create}\\ \texttt{completion\_window="24h"}};
+\node[keybox] (g2) at (6,-3.2)
+  {\textbf{admission feasibility}\\ $n/r_{\mathrm{global}} \le 24\,\mathrm{h}\times\text{margin}$?};
+\draw[fl] (c2) -- (g2);
+
+% ---- row 3: reject / persist ------------------------------------------------
+\node[ghost] (c3) at (2,-4.9)
+  {\texttt{400 batch\_infeasible}\\ \emph{(no history $\Rightarrow$ admit)}};
+\node[box] (g3) at (6,-4.9)
+  {rows persisted: batch \textsc{validating}, items \textsc{pending},
+   \texttt{expires\_at} $=$ now $+\,24$\,h};
+\draw[reject] (g2) -- (c3) node[lbl,pos=0.5] {no};
+\draw[fl] (g2) -- (g3) node[lbl,pos=0.5] {yes};
+
+% ---- row 4: scrape ----------------------------------------------------------
+\node[box] (d4) at (10,-6.6)
+  {\textbf{3}~~tick @ 1\,Hz: scrape \texttt{/metrics} $\rightarrow$ EWMA};
+\node[box] (v4) at (14,-6.6)
+  {\texttt{/metrics}:\\ running, waiting, KV usage};
+\draw[fl] (v4) -- (d4);
+
+% ---- row 5: AIMD ------------------------------------------------------------
+\node[box] (d5) at (10,-8.2)
+  {AIMD target: halve on online queueing or KV high; $+1$ below KV low};
+\draw[fl] (d4) -- (d5);
+
+% ---- row 6: laxity ----------------------------------------------------------
+\node[keybox] (d6) at (10,-9.9)
+  {\textbf{laxity}$(b) \rightarrow$ urgency $\rightarrow$ priority $100\!\rightarrow\!1$;
+   token-bucket floor above urgency $0.9$};
+\draw[fl] (d5) -- (d6);
+
+% ---- row 7: claim -----------------------------------------------------------
+\node[box] (g7) at (6,-11.6)
+  {single atomic\\ \texttt{UPDATE {\ldots} RETURNING}\\ (no double claim)};
+\node[box] (d7) at (10,-11.6)
+  {claim items, EDF $\times$ prefix order: \textsc{pending} $\rightarrow$ \textsc{inflight}};
+\draw[fl] (d6) -- (d7);
+\draw[flb] (d7) -- (g7);
+
+% ---- row 8: submit + the online bypass --------------------------------------
+\node[box] (c8) at (2,-13.4) {online clients\\ (interactive chat)};
+\node[keybox] (v8) at (14,-13.4)
+  {vLLM V1 priority scheduler: online $p{=}0$ first, batch $p \in [1,100]$ behind};
+\draw[bypass] (c8) -- (v8)
+  node[pos=0.5, above=1pt, font=\sffamily\scriptsize\bfseries, accent, fill=black!5, inner sep=2pt]
+  {online traffic never traverses the gateway};
+\draw[fl] (d7.east) -| ([xshift=-0.9cm]v8.north);
+\node[font=\sffamily\scriptsize, align=center, text width=2.8cm, fill=black!5, inner sep=1.5pt]
+  at (13.15,-10.75)
+  {\textbf{4}~~\texttt{POST}\\ \texttt{/v1/chat/completions}\\ \texttt{priority}\,$=p$};
+
+% ---- row 9: result ----------------------------------------------------------
+\node[box] (d9) at (10,-15.0)
+  {\textbf{5}~~\textsc{succeeded} (idempotent) $\rightarrow$ meter at $0.5\times$
+   $\rightarrow$ \texttt{finalize\_if\_done}};
+\draw[fl] ([xshift=-0.9cm]v8.south) |- (d9.east);
+\node[font=\sffamily\scriptsize, fill=black!5, inner sep=1.5pt, anchor=west]
+  at (13.25,-14.6) {result};
+
+% ---- row 10: result files ---------------------------------------------------
+\node[box] (g10) at (6,-16.6)
+  {\texttt{output.jsonl} / \texttt{error.jsonl} attached (first-writer-wins); batch \textsc{completed}};
+\draw[fl] (d9) -- (g10);
+
+% ---- row 11: client polls ---------------------------------------------------
+\node[box] (c11) at (2,-16.6)
+  {\textbf{6}~~\texttt{batches.retrieve}\\ $\rightarrow$ \texttt{files.content}};
+\draw[flb] (g10) -- (c11);
+
+% ---- annotations ------------------------------------------------------------
+\node[note] (n1) at (4.6,-18.9)
+  {\textbf{Crash recovery.} On restart the dispatcher re-queues every resultless
+   \textsc{inflight} item to \textsc{pending}; re-execution rides vLLM's prefix cache.};
+\node[note] (n2) at (11.4,-18.9)
+  {\textbf{Expiry sweep.} Each tick, batches past \texttt{expires\_at} become
+   \textsc{expired}; items already succeeded still ship in the output file.};
+\draw[reject] (n1.north) -- (8.9,-17.7);
+\draw[reject] (n2.north) -- (11.1,-17.7);
+
+\end{tikzpicture}
+\caption[Technique A request lifecycle]{%
+  \textbf{Technique A: the batch request lifecycle, end to end.}
+  A client uploads a JSONL file and creates a batch; the gateway validates every line
+  and applies the laxity admission test, refusing with \texttt{batch\_infeasible} any
+  job whose projected completion exceeds the window times a margin, and otherwise
+  persisting \textsc{pending} items with a $24$-hour \texttt{expires\_at}.
+  A 1\,Hz dispatcher scrapes the engine's public metrics, sets an AIMD in-flight target,
+  computes each batch's laxity-derived priority, claims items in deadline $\times$ prefix
+  order and submits them to vLLM as ordinary low-priority chat completions --- while
+  online clients (thick arrow) reach the engine directly, never through the gateway.
+  Results settle idempotently, are metered at the batch discount, and are assembled into
+  the output and error files the client downloads.}
+\label{fig:lifecycle-a}
+\end{figure}

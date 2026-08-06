@@ -1,0 +1,71 @@
+% Figure 3 --- the complete loop: lazycode intent -> Tidal -> vLLM -> applied code.
+% Verified against ~/ionet/repos/lazycode (branch feat/openai-batch-adapter):
+% lazycode/planner, lazycode/optimizer, lazycode/scheduler (wave loop),
+% lazycode/providers/openai_batch.py, lazycode/verify, lazycode/workspace.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  n/.style={rounded corners=2pt, draw=black!45, fill=white, text width=2.45cm,
+            align=center, inner sep=3pt, minimum height=0.95cm},
+  client/.style={n, draw=black!55, fill=black!6},
+  tidal/.style={n, draw=accent, line width=0.7pt, fill=accent!10},
+  engine/.style={n, draw=black!70, fill=black!12},
+  fl/.style={-{Stealth[length=1.9mm,width=1.7mm]}, draw=black!55, line width=0.6pt},
+  key/.style={rounded corners=2pt, draw=black!30, fill=white, inner sep=3pt,
+              font=\sffamily\scriptsize},
+]
+
+\node[client] (plan)   at ( 7.90, 4.30) {\textbf{lazycode planner}\\ realtime LLM};
+\node[client] (opt)    at (11.44, 3.29) {optimizer\\ \emph{rules + physical plan}};
+\node[client] (waves)  at (13.32, 1.03) {barrier \textbf{waves}\\ of rendered calls};
+\node[client] (adapt)  at (12.65,-1.65) {\texttt{OpenAIBatch}\\\texttt{Adapter}\\
+                                         \emph{idempotency key in \texttt{metadata}}};
+\node[tidal]  (gw)     at ( 9.78,-3.64) {\textbf{Tidal gateway}\\ admission $\rightarrow$
+                                         store $\rightarrow$ dispatch};
+\node[engine] (vllm)   at ( 6.02,-3.64) {\textbf{vLLM}\\ co-served with online users};
+\node[tidal]  (out)    at ( 3.15,-1.65) {\texttt{output.jsonl}\\ $+$ \texttt{error.jsonl}};
+\node[client] (fetch)  at ( 2.48, 1.03) {adapter \texttt{fetch}\\ union by
+                                         \texttt{custom\_id}};
+\node[client] (verify) at ( 4.36, 3.29) {verifier\\ $\rightarrow$ apply};
+
+\node[client, text width=2.45cm] (wt) at (7.90, 1.55)
+  {\textbf{git worktree}\\ \emph{applied code}};
+
+\draw[fl] (plan)  to[bend right=8] (opt);
+\draw[fl] (opt)   to[bend right=8] (waves);
+\draw[fl] (waves) to[bend right=8] (adapt);
+\draw[fl] (adapt) to[bend right=8] (gw);
+\draw[fl] (gw)    -- (vllm);
+\draw[fl] (vllm)  to[bend right=8] (out);
+\draw[fl] (out)   to[bend right=8] (fetch);
+\draw[fl] (fetch) to[bend right=8] (verify);
+\draw[fl] (verify) to[bend right=8] (plan);
+
+\draw[fl, dashed, draw=black!45] (verify.east) to[bend left=12] (wt.north west);
+\draw[fl, dashed, draw=black!45] (wt.north east) to[bend left=12] (plan.east);
+
+\node[key, anchor=north west] at (0.0,4.75)
+  {\tikz\draw[draw=black!55, fill=black!6, rounded corners=1pt] (0,0) rectangle (0.28,0.20);\;
+   lazycode (client)\quad
+   \tikz\draw[draw=accent, fill=accent!10, rounded corners=1pt] (0,0) rectangle (0.28,0.20);\;
+   Tidal\quad
+   \tikz\draw[draw=black!70, fill=black!12, rounded corners=1pt] (0,0) rectangle (0.28,0.20);\;
+   engine};
+
+\node[font=\sffamily\scriptsize\itshape, black!60, text width=3.0cm, align=center]
+  at (7.90,-0.35) {one wave: plan $\rightarrow$ batch $\rightarrow$ verify $\rightarrow$ apply};
+
+\end{tikzpicture}
+\caption[The complete loop with lazycode]{%
+  \textbf{The complete loop.} A realtime model plans the work; the optimizer lowers the
+  plan into barrier waves of rendered calls; the \texttt{OpenAIBatchAdapter} uploads a
+  wave as JSONL and stamps a server-side idempotency key in the batch's
+  \texttt{metadata}, so a crashed run can adopt its own orphaned batch. Tidal admits,
+  stores and dispatches the wave into a vLLM that is simultaneously serving online users;
+  the adapter fetches the output and error files and reassembles the wave by union over
+  \texttt{custom\_id}; the verifier runs the results and applies what passes into a git
+  worktree, which feeds the next wave. This is the request lifecycle from client intent
+  to applied code, entirely on self-hosted capacity at batch pricing.}
+\label{fig:loop}
+\end{figure}

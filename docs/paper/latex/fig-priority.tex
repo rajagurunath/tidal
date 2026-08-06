@@ -1,0 +1,82 @@
+% Figure 4 --- priority as a function of laxity.
+% Verified against src/tidal/dispatcher/laxity.py and src/tidal/config.py
+% (escalation_horizon_s = 6h, batch_priority_max = 100, batch_priority_min = 1,
+%  floor_urgency = 0.9, sla_strict reaches 0 at urgency exactly 1.0).
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  x=0.95cm, y=0.042cm,
+  font=\sffamily\scriptsize,
+  ann/.style={font=\sffamily\scriptsize, align=center, inner sep=1.5pt},
+  ptr/.style={-{Stealth[length=1.5mm,width=1.3mm]}, draw=black!55, line width=0.4pt},
+]
+
+% floor region: urgency > 0.9  <=>  laxity < 0.1 H = 0.6 h
+\fill[accent!14] (0,0) rectangle (0.6,112);
+
+% axes
+\draw[-{Stealth[length=1.6mm]}, black!70] (-0.5,0) -- (12.6,0);
+\draw[-{Stealth[length=1.6mm]}, black!70] (-0.5,0) -- (-0.5,118);
+
+% x ticks
+\foreach \x/\t in {0/0, 2/2\,h, 4/4\,h, 6/6\,h, 8/8\,h, 10/10\,h, 12/12\,h}
+  \draw[black!70] (\x,0) -- (\x,-4) node[below, inner sep=2pt] {\t};
+% y ticks (0 and 1 are 1/100 of the axis apart: nudge their labels apart)
+\draw[black!70] (-0.5,0)   -- (-0.62,0)   node[left, inner sep=2pt, yshift=-4pt] {0};
+\draw[black!70] (-0.5,1)   -- (-0.62,1)   node[left, inner sep=2pt, yshift=6pt]  {1};
+\draw[black!70] (-0.5,50)  -- (-0.62,50)  node[left, inner sep=2pt] {50};
+\draw[black!70] (-0.5,100) -- (-0.62,100) node[left, inner sep=2pt] {100};
+
+% axis labels
+\node[ann, anchor=north] at (6,-16) {laxity $=$ (deadline $-$ now) $-$ remaining$/$rate};
+\node[ann, rotate=90, anchor=south] at (-1.55,56)
+  {vLLM \texttt{priority}\\[-1pt] \emph{(lower $=$ scheduled sooner)}};
+
+% online reference line
+\draw[dotted, black!60] (-0.5,0) -- (12.6,0);
+\node[ann, anchor=west, black!60] at (10.4,7) {online $=0$};
+
+% horizon marker
+\draw[dashed, black!45] (6,0) -- (6,104);
+\node[ann, anchor=south, black!55] at (6,105) {$H = 6$\,h};
+
+% the curve
+\draw[accent, line width=1.1pt] (0,1) -- (6,100) -- (12.4,100);
+\fill[accent] (0,1) circle (1.6pt);
+\fill[accent] (6,100) circle (1.6pt);
+% sla_strict continuation
+\draw[accent, dashed, line width=1.0pt] (0,1) -- (0,0);
+\fill[accent] (0,0) circle (1.6pt);
+
+% annotations
+\node[ann, anchor=west] (a1) at (7.2,78)
+  {on track: laxity $\ge H \Rightarrow$ urgency $0$,\\ priority pinned at $100$ ---
+   no escalation,\\ however deep into the 24\,h window};
+\draw[ptr] (a1.west) -- (9.6,100);
+
+\node[ann, anchor=west] (a2) at (3.05,42)
+  {linear ramp over the last\\ $H$ of \emph{slack}, not of the window};
+\draw[ptr] (a2.west) -- (2.6,44);
+
+\node[ann, anchor=west] (a3) at (1.35,14)
+  {token-bucket floor engages\\ (urgency $>0.9$)};
+\draw[ptr] (a3.west) -- (0.62,17);
+
+\node[ann, anchor=west] (a4) at (0.85,-30)
+  {\texttt{sla\_strict}: at urgency exactly $1.0$ the\\ dashed continuation reaches
+   priority $0$ --- parity};
+\draw[ptr] (a4.west) -- (0.05,-14);
+
+\node[ann, anchor=east, black!60] at (12.4,-32) {$\leftarrow$ deadline approaches};
+
+\end{tikzpicture}
+\caption[Priority as a function of laxity]{%
+  \textbf{The escalation curve.} Priority is flat at the lowest band ($100$) for every
+  job with at least a full escalation horizon $H = 6\,\mathrm{h}$ of slack, then ramps
+  linearly to $1$ --- one notch below online --- as laxity runs out. Scaling urgency by
+  $H$ rather than by the 24-hour window is what keeps a healthy job from escalating on
+  the clock alone. Above urgency $0.9$ (shaded) a token bucket guarantees a minimum
+  admission rate, and the \texttt{sla\_strict} dial allows the dashed continuation to
+  priority $0$ at urgency exactly $1.0$.}
+\label{fig:priority}
+\end{figure}
