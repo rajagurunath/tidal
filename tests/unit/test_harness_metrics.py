@@ -8,17 +8,26 @@ wrong, and no amount of live-vLLM testing would catch it.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
+import httpx
 import pytest
+from typer.testing import CliRunner
 
+from tidal.eval import harness
 from tidal.eval.harness import (
     BatchCompletion,
     MetricSample,
+    RunConfig,
+    VllmServer,
+    app,
+    batch_limits,
     batch_summary,
     make_batch_items,
     parse_tidal_stats,
     percent_of_ceiling,
+    resolve_preset,
     summarize_metrics,
     summarize_tick_reports,
     tidal_probe_line,
@@ -237,3 +246,239 @@ def test_batch_items_are_deterministic_and_share_a_prefix():
     assert all(item["max_tokens"] == 8 and item["model"] == "m" for item in a)
     prefixes = {item["messages"][0]["content"][:20] for item in a}
     assert len(prefixes) == 1  # shared prefix → prefix-cache hits
+
+
+# ---------------------------------------------------------------------------
+# engine shape: the GPU flags
+#
+# The harness was written against a Mac CPU build and hardcoded that fact in
+# four places. Each is now a flag, and the thing these tests defend is that the
+# *defaults did not move*: a bare `run` must produce the same command line, the
+# same environment and the same connection pool it always did, or every CPU
+# number in the paper is being compared against a differently-configured
+# engine.
+# ---------------------------------------------------------------------------
+
+
+def test_run_config_defaults_are_still_the_cpu_testbeds():
+    cfg = RunConfig(condition="online_only")
+    assert cfg.enforce_eager is True
+    assert cfg.hf_offline is True
+    assert cfg.tensor_parallel == 1
+    assert cfg.max_model_len == 4096
+    assert cfg.batch_concurrency == 100
+
+
+def test_default_command_is_byte_identical_to_the_pre_flag_harness():
+    cmd = VllmServer(port=8400, vllm_bin="/bin/vllm", model="m").command()
+    assert cmd == [
+        "/bin/vllm",
+        "serve",
+        "m",
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "4096",
+        "--enforce-eager",
+        "--scheduling-policy",
+        "priority",
+        "--port",
+        "8400",
+    ]
+
+
+def test_command_reflects_the_gpu_flags():
+    cmd = VllmServer(
+        port=8400,
+        vllm_bin="/bin/vllm",
+        model="m",
+        enforce_eager=False,
+        tensor_parallel=8,
+        max_model_len=32768,
+    ).command()
+    assert "--enforce-eager" not in cmd
+    assert cmd[cmd.index("--tensor-parallel-size") + 1] == "8"
+    assert cmd[cmd.index("--max-model-len") + 1] == "32768"
+    # Orthogonal to the flavor switch: technique B still gets its scheduler.
+    tidal_cmd = VllmServer(port=1, flavor="tidal", enforce_eager=False, tensor_parallel=4).command()
+    assert "tidal.engine.scheduler.TidalScheduler" in tidal_cmd
+
+
+def test_tensor_parallel_of_one_is_left_off_the_command_line():
+    """`--tensor-parallel-size 1` is what vLLM does anyway; emitting it would
+    change every existing single-GPU and CPU invocation for no benefit."""
+    assert "--tensor-parallel-size" not in VllmServer(port=1, tensor_parallel=1).command()
+
+
+def test_torchdynamo_is_disabled_only_under_enforce_eager(monkeypatch):
+    """`--no-enforce-eager` with TORCHDYNAMO_DISABLE still inherited from the
+    surrounding shell would be a silent no-op — exactly the failure mode the
+    flag exists to prevent, so the variable is removed rather than not set."""
+    monkeypatch.setenv("TORCHDYNAMO_DISABLE", "1")
+    assert VllmServer(port=1).environment()["TORCHDYNAMO_DISABLE"] == "1"
+    assert "TORCHDYNAMO_DISABLE" not in VllmServer(port=1, enforce_eager=False).environment()
+
+
+def test_hf_offline_flag_wins_over_an_inherited_value(monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert VllmServer(port=1, hf_offline=False).environment()["HF_HUB_OFFLINE"] == "0"
+    monkeypatch.delenv("HF_HUB_OFFLINE")
+    assert VllmServer(port=1).environment()["HF_HUB_OFFLINE"] == "1"
+    assert VllmServer(port=1, hf_offline=False).environment()["HF_HUB_OFFLINE"] == "0"
+
+
+def test_batch_limits_size_the_pool_in_both_directions():
+    assert batch_limits(100).max_connections == 100
+    wide = batch_limits(512)
+    assert wide.max_connections == 512
+    # Keepalives track the ceiling: a 512-wide pool that only keeps 20 alive
+    # spends the run reconnecting.
+    assert wide.max_keepalive_connections == 512
+
+
+async def test_direct_submission_builds_a_client_with_the_requested_limits(monkeypatch):
+    captured: dict = {}
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return real_client(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"usage": {}})),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    done = await harness.submit_batch_direct(
+        "http://engine", make_batch_items(2), t0=0.0, max_connections=512
+    )
+    assert len(done) == 2
+    assert captured["limits"].max_connections == 512
+
+
+async def test_measure_threads_batch_concurrency_into_direct_submission(monkeypatch):
+    """The flag is worthless if the pool size stops at RunConfig."""
+    captured: dict = {}
+
+    async def fake_submit(_base_url, _items, *, t0, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    cfg = RunConfig(condition="offline_only", batch_items=2, batch_concurrency=512, port=9)
+    await harness._measure(cfg, server=None)
+    assert captured["max_connections"] == 512
+
+
+# -- the preset --------------------------------------------------------------
+
+
+def test_gpu_preset_flips_exactly_the_three_defaults_it_claims_to():
+    assert resolve_preset(gpu_preset=False) == {
+        "enforce_eager": True,
+        "hf_offline": True,
+        "batch_concurrency": 100,
+    }
+    assert resolve_preset(gpu_preset=True) == {
+        "enforce_eager": False,
+        "hf_offline": False,
+        "batch_concurrency": 512,
+    }
+
+
+def test_explicit_flags_outrank_the_preset_in_both_directions():
+    forced = resolve_preset(gpu_preset=True, enforce_eager=True, batch_concurrency=64)
+    assert forced["enforce_eager"] is True  # CUDA-graph-free numbers on a GPU
+    assert forced["batch_concurrency"] == 64
+    assert forced["hf_offline"] is False  # untouched flags keep the preset
+    assert resolve_preset(gpu_preset=False, hf_offline=False)["hf_offline"] is False
+
+
+# -- CLI wiring --------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_config(monkeypatch, tmp_path):
+    """Invoke `run` with the engine stubbed out; hand back the RunConfig built.
+
+    The CLI's whole job for these flags is to assemble a RunConfig, so that is
+    what is asserted on — no vLLM, no event loop work beyond the stub.
+    """
+    seen: list[RunConfig] = []
+
+    async def fake_run_condition(cfg, *, log_dir=None):
+        seen.append(cfg)
+        return {
+            "online": {"summary": {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0}, "errors": 0},
+            "batch": {
+                "completed": 0,
+                "pool_size": 0,
+                "completed_in_window": 0,
+                "output_tokens_per_s": 0.0,
+                "makespan_s": 0.0,
+                "drained": False,
+            },
+        }
+
+    monkeypatch.setattr(harness, "run_condition", fake_run_condition)
+
+    def invoke(*args: str) -> RunConfig:
+        result = CliRunner().invoke(
+            app,
+            ["run", "--condition", "online_only", "--out", str(tmp_path / "r.json"), *args],
+        )
+        assert result.exit_code == 0, result.output
+        return seen[-1]
+
+    return invoke
+
+
+def test_cli_without_the_new_flags_still_describes_the_cpu_testbed(captured_config):
+    cfg = captured_config()
+    assert (cfg.enforce_eager, cfg.hf_offline) == (True, True)
+    assert (cfg.tensor_parallel, cfg.max_model_len, cfg.batch_concurrency) == (1, 4096, 100)
+
+
+def test_cli_parses_each_engine_flag_into_the_run_config(captured_config):
+    cfg = captured_config(
+        "--no-enforce-eager",
+        "--no-hf-offline",
+        "--tensor-parallel",
+        "8",
+        "--max-model-len",
+        "32768",
+        "--batch-concurrency",
+        "1024",
+    )
+    assert cfg.enforce_eager is False
+    assert cfg.hf_offline is False
+    assert cfg.tensor_parallel == 8
+    assert cfg.max_model_len == 32768
+    assert cfg.batch_concurrency == 1024
+
+
+def test_cli_gpu_preset_flips_the_defaults(captured_config):
+    cfg = captured_config("--gpu-preset")
+    assert cfg.enforce_eager is False
+    assert cfg.hf_offline is False
+    assert cfg.batch_concurrency == 512
+    # The preset is about engine *mode*, not topology: TP and context length
+    # are node-specific and stay where they were.
+    assert (cfg.tensor_parallel, cfg.max_model_len) == (1, 4096)
+
+
+def test_cli_flags_after_gpu_preset_win(captured_config):
+    cfg = captured_config("--gpu-preset", "--enforce-eager", "--batch-concurrency", "64")
+    assert cfg.enforce_eager is True
+    assert cfg.batch_concurrency == 64
+    assert cfg.hf_offline is False
+
+
+def test_the_engine_shape_survives_into_the_result_document():
+    """`run_condition` writes `asdict(cfg)` into the result JSON, so a result
+    file says which engine produced it. The flags are useless as provenance if
+    they are not serializable alongside everything else."""
+    cfg = RunConfig(condition="naive", tensor_parallel=8, enforce_eager=False, hf_offline=False)
+    payload = json.loads(json.dumps(asdict(cfg)))
+    assert payload["tensor_parallel"] == 8
+    assert payload["enforce_eager"] is False
+    assert payload["hf_offline"] is False
+    assert payload["max_model_len"] == 4096

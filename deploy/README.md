@@ -305,15 +305,21 @@ docker run --rm \
   -v "$PWD/results:/opt/tidal/results" \
   -e MODEL=Qwen/Qwen2.5-7B-Instruct \
   -e ONLINE_RPS=20 -e MINUTES=15 \
+  -e TENSOR_PARALLEL_SIZE=1 -e MAX_MODEL_LEN=8192 \
   -e HF_TOKEN="$HF_TOKEN" \
   --entrypoint tidal-run-gpu-eval \
   <registry>/tidal-engine:fast
 ```
 
-`--gpus '"device=0"'` is deliberate: **the harness never passes
-`--tensor-parallel-size`**, so every eval condition is a single-GPU run whatever
-the box has. Pinning to one card makes that explicit and leaves the rest of an
-8-GPU node free.
+`--gpus '"device=0"'` with `TENSOR_PARALLEL_SIZE=1` is the single-card run, and
+it leaves the other seven GPUs of an 8-GPU node free. **The two must agree**:
+to shard, raise both together (`--gpus all -e TENSOR_PARALLEL_SIZE=8`).
+`TENSOR_PARALLEL_SIZE` larger than the visible device count fails at engine
+startup, which the sizing probe catches before any matrix time is spent.
+
+The script passes `--gpu-preset` on every case, so CUDA graphs, `torch.compile`
+and a 512-wide batch pool are on — see *Harness engine flags* below for what
+that changes and how to override it.
 
 Expect roughly 2–3 hours at the defaults. Run it under `tmux`/`nohup`.
 
@@ -353,7 +359,9 @@ set `RESUME=0` for a clean one.
 
 Knobs: `ONLINE_RPS` `MINUTES` `ONLINE_MAX_TOKENS` `BATCH_MAX_TOKENS`
 `MAX_INFLIGHT` `POOL_SAFETY` `PROBE_ITEMS` `DIURNAL_MINUTES` `DEADLINE_MINUTES`
-`DEADLINE_TIGHTNESS` `CASE_TIMEOUT_S` `SEED` `EVAL_PORT` `RESUME` `PREWARM`.
+`DEADLINE_TIGHTNESS` `CASE_TIMEOUT_S` `SEED` `EVAL_PORT` `RESUME` `PREWARM`,
+plus the engine shape: `TENSOR_PARALLEL_SIZE` `MAX_MODEL_LEN`
+`BATCH_CONCURRENCY` (empty = the preset's 512).
 
 ## Step 7 — Fetch results
 
@@ -367,22 +375,42 @@ derived pool size, and the ran/skipped/failed case lists.
 
 ---
 
-## Known harness constraints on GPU
+## Harness engine flags
 
-`src/tidal/eval/harness.py` was written for a Mac CPU box. Several choices are
-hardcoded and are **not** what you want at GPU scale. This kit deliberately does
-not patch the harness — but you should know what you are measuring, and each of
-these is a one-line change:
+`src/tidal/eval/harness.py` was written for a Mac CPU box, and for a while this
+kit worked around that. It no longer needs to: the CPU-specific choices are now
+flags on `run`, and `run_gpu_eval.sh` passes them for every case.
 
-| Constraint | Where | Effect on GPU | Fix |
+**The defaults did not move.** A bare `run` still produces the same command
+line, environment and connection pool it always did, so every CPU number in the
+paper remains comparable. GPU behaviour is opt-in, and `--gpu-preset` is the
+one-flag way to opt in.
+
+| Was | Now | Default | Under `--gpu-preset` |
 |---|---|---|---|
-| `--enforce-eager` always | `VllmServer.command()` | No CUDA graphs. Decode throughput well below what the card can do. | Make it conditional on a flavor flag. |
-| `TORCHDYNAMO_DISABLE=1` always | `VllmServer.environment()` | No `torch.compile`. Compounds the above. | Only set it on CPU builds. |
-| `max_model_len` defaults to 4096, no CLI flag on `run` | `VllmServer` / `harness.run` | Long-context behaviour is untested no matter what `MAX_MODEL_LEN` the image sets. | Add `--max-model-len` to `run` and thread it into `RunConfig`. |
-| No `--tensor-parallel-size` | `VllmServer.command()` | Every eval is single-GPU. An 8×H200 node is evaluated as 1×H200. | Add a `tp` field to `RunConfig`. |
-| `HF_HUB_OFFLINE` defaults to `1` | `VllmServer.environment()` | A cold node cannot fetch weights. `run_gpu_eval.sh` exports `0` to work around it. | Default it to unset. |
-| `httpx.AsyncClient()` default pool | `submit_batch_direct()` | Batch concurrency is capped at ~100 regardless of pool size, in `offline_only`, `naive`, and `technique_b`. | Pass explicit `httpx.Limits`. |
-| `DEFAULT_VLLM_BIN` is an absolute Mac path | `harness.py` | Unusable in a container. `run_gpu_eval.sh` passes `--vllm-bin` explicitly. | Default to `shutil.which("vllm")`. |
+| `--enforce-eager` always → no CUDA graphs | `--enforce-eager` / `--no-enforce-eager` | eager | **off** |
+| `TORCHDYNAMO_DISABLE=1` always → no `torch.compile` | same flag; the two always travel together | disabled | **enabled** |
+| `max_model_len` fixed at 4096, no CLI flag | `--max-model-len N` | `4096` | `4096` (pass it) |
+| No `--tensor-parallel-size` → 8×H200 evaluated as 1×H200 | `--tensor-parallel N` | `1` | `1` (pass it) |
+| `HF_HUB_OFFLINE=1`, worked around by exporting `0` | `--hf-offline` / `--no-hf-offline` | offline | **online** |
+| `httpx` default pool capped batch at ~100 | `--batch-concurrency N` → explicit `httpx.Limits` | `100` | **512** |
+
+`--gpu-preset` only moves *defaults*: an explicit flag beats it in either
+direction and at any position, so `--gpu-preset --enforce-eager` is a
+legitimate way to ask for CUDA-graph-free numbers on a GPU. It deliberately
+does **not** touch `--tensor-parallel` or `--max-model-len` — those are
+properties of the node and the run, not of "is this a GPU", so pass them.
+
+The engine shape is serialized into every result JSON under `config`, and
+`run_gpu_eval.sh` also writes it into `MANIFEST.txt`. A result file therefore
+says which engine produced it; do not compare across differing shapes.
+
+Two constraints remain, both benign because the kit already routes around them:
+
+| Constraint | Where | Why it is left alone |
+|---|---|---|
+| `DEFAULT_VLLM_BIN` is an absolute Mac path | `harness.py` | `run_gpu_eval.sh` passes `--vllm-bin "$(command -v vllm)"`. |
+| `OnlineLoadGen.run()` uses httpx's default 100-connection pool | `eval/loadgen.py` | Only bites if online concurrency exceeds 100 — at `ONLINE_RPS=20` that needs p99 above ~5 s. Watch for it in the `naive` arm, where a flooded engine is the point; if online p99 flattens suspiciously near a fixed value, this is the first suspect. |
 
 Also worth stating plainly: the technique-B numbers are only trustworthy if the
 capability probe came up clean (Step 0) and the compat canary is green.

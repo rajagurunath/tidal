@@ -8,7 +8,13 @@
 #     -v tidal_hf-cache:/root/.cache/huggingface \
 #     -v "$PWD/results:/opt/tidal/results" \
 #     -e MODEL=Qwen/Qwen2.5-7B-Instruct \
+#     -e TENSOR_PARALLEL_SIZE=8 -e MAX_MODEL_LEN=8192 \
 #     --entrypoint tidal-run-gpu-eval tidal-engine:fast
+#
+# Every case runs the harness with `--gpu-preset` plus `--tensor-parallel` and
+# `--max-model-len` from the environment. Without those the harness would run
+# its Mac-CPU defaults on the GPU: eager-only, torchdynamo disabled, one card,
+# 4096 context, and batch concurrency capped by httpx at ~100.
 #
 # WHY THE SERVING STACK MUST BE DOWN: `tidal.eval.harness` owns its engine. It
 # launches a fresh `vllm serve` per condition (stock or --scheduler-cls tidal),
@@ -46,6 +52,16 @@ RESULTS_BASE="${RESULTS_BASE:-${REPO_DIR}/results}"
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EVAL_PORT="${EVAL_PORT:-8400}"
 
+# Engine shape. The harness defaults describe the Mac CPU testbed it was
+# written on; --gpu-preset flips the three that are actively wrong on a GPU
+# (eager-only, torchdynamo off, offline hub, a ~100-connection batch pool).
+# TP and context length are node-specific, so they are passed explicitly and
+# share names with docker-compose.gpu.yml / engine-entrypoint.sh.
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+# Empty means "whatever --gpu-preset says" (512). Set it to override.
+BATCH_CONCURRENCY="${BATCH_CONCURRENCY:-}"
+
 # GPU-scale load. 20 rps peak is the target the plan calls for; the CPU testbed
 # in the paper topped out near 3.
 ONLINE_RPS="${ONLINE_RPS:-20}"
@@ -59,10 +75,10 @@ SEED="${SEED:-7}"
 
 # Sizing probe: an offline_only run that measures the batch ceiling. Its length
 # is governed by PROBE_ITEMS, not by --minutes: offline_only builds no arrival
-# schedule and simply drains the pool. Note the harness fires the whole pool at
-# once through one httpx.AsyncClient, whose default pool caps at 100 concurrent
-# connections — so this measures the ceiling at ~100-way batch concurrency,
-# which is the same ceiling every co-located condition is bounded by.
+# schedule and simply drains the pool. The harness fires the whole pool at once
+# through one httpx.AsyncClient, so the ceiling is measured at
+# --batch-concurrency-way concurrency — the same bound every co-located
+# condition gets, because every case below is passed the same value.
 PROBE_ITEMS="${PROBE_ITEMS:-600}"
 # Pool multiple over "how many items the ceiling could do in the window". >1
 # guarantees the pool never drains, which is what makes batch throughput a
@@ -97,15 +113,28 @@ RESUME="${RESUME:-1}"
 # The harness defaults this to a path on the author's Mac.
 VLLM_BIN="${VLLM_BIN:-$(command -v vllm || true)}"
 
-# VllmServer.environment() defaults HF_HUB_OFFLINE to "1" when unset, which
-# would make a cold node fail to fetch weights. Force it off unless told
-# otherwise; after the prewarm step it is a no-op either way.
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+# HF_HUB_OFFLINE is no longer exported here: --gpu-preset implies
+# --no-hf-offline, and the harness now sets the variable for the engine from
+# the flag rather than inheriting it. Pass --hf-offline explicitly (see
+# HARNESS_ENGINE_ARGS below) if you want a pinned, air-gapped run.
 export TIDAL_EVAL_MODEL="$MODEL"
 export TIDAL_EVAL_HEALTH_TIMEOUT_S="${TIDAL_EVAL_HEALTH_TIMEOUT_S:-1800}"
 export PYTHONUNBUFFERED=1
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# Applied to every case, including the sizing probe — the ceiling is only a
+# valid divisor for the conditions it sizes if it was measured on the same
+# engine. Append to this to force an individual flag: it is read left to right
+# by typer, and an explicit flag beats --gpu-preset regardless of position.
+HARNESS_ENGINE_ARGS=(
+  --gpu-preset
+  --tensor-parallel "$TENSOR_PARALLEL_SIZE"
+  --max-model-len "$MAX_MODEL_LEN"
+)
+if [ -n "$BATCH_CONCURRENCY" ]; then
+  HARNESS_ENGINE_ARGS+=(--batch-concurrency "$BATCH_CONCURRENCY")
+fi
 
 # --------------------------------------------------------------------------
 # Layout
@@ -286,6 +315,7 @@ run_case() {
         --vllm-bin "$VLLM_BIN" \
         --log-dir "$engine_logs" \
         --out "$out" \
+        "${HARNESS_ENGINE_ARGS[@]}" \
         "$@" \
       >"$case_log" 2>&1 || rc=$?
 
@@ -467,6 +497,9 @@ fi
   echo "online_max_tokens: ${ONLINE_MAX_TOKENS}"
   echo "batch_max_tokens:  ${BATCH_MAX_TOKENS}"
   echo "max_inflight:      ${MAX_INFLIGHT}"
+  echo "engine_args:       ${HARNESS_ENGINE_ARGS[*]}"
+  echo "tensor_parallel:   ${TENSOR_PARALLEL_SIZE}"
+  echo "max_model_len:     ${MAX_MODEL_LEN}"
   echo "items_per_s_probe: ${ITEMS_PER_S}"
   echo "batch_items:       ${BATCH_ITEMS}"
   echo "diurnal_items:     ${DIURNAL_ITEMS}"

@@ -74,15 +74,19 @@ from tidal.eval.loadgen import (
 
 __all__ = [
     "CONDITIONS",
+    "CPU_DEFAULTS",
+    "GPU_PRESET",
     "BatchCompletion",
     "MetricSample",
     "RunConfig",
     "VllmServer",
     "app",
+    "batch_limits",
     "batch_summary",
     "make_batch_items",
     "parse_tidal_stats",
     "percent_of_ceiling",
+    "resolve_preset",
     "run_condition",
     "summarize_metrics",
     "summarize_tick_reports",
@@ -105,7 +109,53 @@ BATCH_PRIORITY = 100
 HEALTH_TIMEOUT_S = float(os.environ.get("TIDAL_EVAL_HEALTH_TIMEOUT_S", "300"))
 METRICS_INTERVAL_S = 1.0
 
+DEFAULT_MAX_MODEL_LEN = 4096
+DEFAULT_TENSOR_PARALLEL = 1
+
+#: What the harness has always done, and still does when no flag is passed: a
+#: Mac CPU build, eager-only, offline hub, and httpx's stock 100-connection
+#: pool. Every one of these is wrong on a GPU, which is what ``GPU_PRESET`` is.
+CPU_DEFAULTS = {
+    "enforce_eager": True,
+    "hf_offline": True,
+    "batch_concurrency": 100,
+}
+
+#: ``--gpu-preset``. CUDA graphs and ``torch.compile`` on (the single biggest
+#: decode-throughput lever), the hub reachable so a cold node can fetch
+#: weights, and a connection pool wide enough that batch concurrency is set by
+#: the scheduler under test rather than by httpx.
+GPU_PRESET = {
+    "enforce_eager": False,
+    "hf_offline": False,
+    "batch_concurrency": 512,
+}
+
 app = typer.Typer(add_completion=False, help="Tidal A/B evaluation harness.")
+
+
+def resolve_preset(
+    *,
+    gpu_preset: bool = False,
+    enforce_eager: bool | None = None,
+    hf_offline: bool | None = None,
+    batch_concurrency: int | None = None,
+) -> dict:
+    """Fold ``--gpu-preset`` and the individual flags into concrete settings.
+
+    The preset only moves *defaults*: anything passed explicitly wins, so
+    ``--gpu-preset --enforce-eager`` is a legitimate way to ask for CUDA-graph-
+    free numbers on a GPU. ``None`` means "not passed" — which is why the CLI
+    declares the two booleans as tri-state rather than plain flags.
+    """
+    resolved = dict(GPU_PRESET if gpu_preset else CPU_DEFAULTS)
+    if enforce_eager is not None:
+        resolved["enforce_eager"] = enforce_eager
+    if hf_offline is not None:
+        resolved["hf_offline"] = hf_offline
+    if batch_concurrency is not None:
+        resolved["batch_concurrency"] = batch_concurrency
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +209,13 @@ class VllmServer:
         log_path: where combined stdout/stderr goes; the technique-B
             assertions and the timeline plot read it back.
         model / max_model_len / vllm_bin: engine knobs.
+        enforce_eager: pass ``--enforce-eager`` *and* disable torchdynamo. The
+            two travel together: eager mode is only the right answer where
+            ``torch.compile`` is also a non-starter, i.e. the CPU build.
+        tensor_parallel: ``--tensor-parallel-size``. Emitted only when >1, so a
+            single-GPU (or CPU) command line stays exactly what it always was.
+        hf_offline: set ``HF_HUB_OFFLINE=1``. False forces ``0``, which is what
+            a cold node needs to fetch weights at all.
         env_extra: additional environment (``TIDAL_*`` for the scheduler).
 
     Started with ``start_new_session=True`` so teardown can signal the whole
@@ -170,8 +227,11 @@ class VllmServer:
     flavor: str = "stock"
     log_path: str | None = None
     model: str = DEFAULT_MODEL
-    max_model_len: int = 4096
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
     vllm_bin: str = DEFAULT_VLLM_BIN
+    enforce_eager: bool = CPU_DEFAULTS["enforce_eager"]
+    tensor_parallel: int = DEFAULT_TENSOR_PARALLEL
+    hf_offline: bool = CPU_DEFAULTS["hf_offline"]
     env_extra: dict[str, str] = field(default_factory=dict)
     proc: subprocess.Popen | None = None
     _log_file: object | None = None
@@ -189,7 +249,12 @@ class VllmServer:
             "bfloat16",
             "--max-model-len",
             str(self.max_model_len),
-            "--enforce-eager",
+        ]
+        if self.enforce_eager:
+            cmd.append("--enforce-eager")
+        if self.tensor_parallel > 1:
+            cmd += ["--tensor-parallel-size", str(self.tensor_parallel)]
+        cmd += [
             "--scheduling-policy",
             "priority",
             "--port",
@@ -203,13 +268,21 @@ class VllmServer:
         env = dict(os.environ)
         env.update(
             {
-                # Inductor is a non-starter on this CPU build.
-                "TORCHDYNAMO_DISABLE": "1",
                 "VLLM_CPU_KVCACHE_SPACE": env.get("VLLM_CPU_KVCACHE_SPACE", "4"),
-                "HF_HUB_OFFLINE": env.get("HF_HUB_OFFLINE", "1"),
                 "PYTHONUNBUFFERED": "1",
             }
         )
+        if self.enforce_eager:
+            # Inductor is a non-starter on the CPU build, and there is nothing
+            # for it to do when the engine is running eager anyway.
+            env["TORCHDYNAMO_DISABLE"] = "1"
+        else:
+            # An inherited TORCHDYNAMO_DISABLE would silently defeat
+            # --no-enforce-eager, so drop it rather than merely not setting it.
+            env.pop("TORCHDYNAMO_DISABLE", None)
+        # Explicit in both directions: an inherited value must not be able to
+        # override the flag the run was launched with.
+        env["HF_HUB_OFFLINE"] = "1" if self.hf_offline else "0"
         if self.flavor == "tidal":
             existing = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = f"{TIDAL_SRC}:{existing}" if existing else TIDAL_SRC
@@ -338,6 +411,20 @@ class BatchCompletion:
         return asdict(self)
 
 
+def batch_limits(max_connections: int) -> httpx.Limits:
+    """Connection pool for direct batch submission.
+
+    httpx's default is 100 connections with 20 kept alive, which quietly caps
+    batch concurrency at ~100 no matter how large the pool is — on a GPU that
+    is the harness measuring httpx rather than the engine. Keepalives are sized
+    to match the ceiling so a wide pool does not spend the run reconnecting.
+    """
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=max_connections,
+    )
+
+
 async def submit_batch_direct(
     base_url: str,
     items: Sequence[dict],
@@ -345,16 +432,20 @@ async def submit_batch_direct(
     t0: float,
     priority: int = BATCH_PRIORITY,
     concurrency: int | None = None,
+    max_connections: int = CPU_DEFAULTS["batch_concurrency"],
     timeout_s: float = 900.0,
     client: httpx.AsyncClient | None = None,
 ) -> list[BatchCompletion]:
     """Fire the whole pool straight at vLLM (the ``naive``/``technique_b`` path).
 
     ``concurrency=None`` means *all at once*, which is exactly the point of the
-    naive condition: no client-side admission control whatsoever.
+    naive condition: no client-side admission control whatsoever. The real
+    ceiling is then ``max_connections``, the size of the HTTP pool — an
+    unavoidable one, but it must be a stated number rather than an httpx
+    default nobody chose.
     """
     owns = client is None
-    http = client or httpx.AsyncClient(timeout=timeout_s)
+    http = client or httpx.AsyncClient(timeout=timeout_s, limits=batch_limits(max_connections))
     gate = asyncio.Semaphore(concurrency) if concurrency else None
 
     async def one(index: int, body: dict) -> BatchCompletion:
@@ -612,6 +703,14 @@ class RunConfig:
     vllm_bin: str = DEFAULT_VLLM_BIN
     drain_timeout_s: float = 300.0
     out: str = "results/run.json"
+    #: Engine shape. The defaults are the CPU testbed's; `--gpu-preset` and the
+    #: individual flags move them, and since the whole config is serialized into
+    #: the result JSON, every number carries the engine it was measured on.
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
+    tensor_parallel: int = DEFAULT_TENSOR_PARALLEL
+    enforce_eager: bool = CPU_DEFAULTS["enforce_eager"]
+    hf_offline: bool = CPU_DEFAULTS["hf_offline"]
+    batch_concurrency: int = CPU_DEFAULTS["batch_concurrency"]
 
     @property
     def duration_s(self) -> float:
@@ -639,6 +738,10 @@ async def run_condition(cfg: RunConfig, *, log_dir: str | None = None) -> dict:
         log_path=str(log_path),
         model=cfg.model,
         vllm_bin=cfg.vllm_bin,
+        max_model_len=cfg.max_model_len,
+        enforce_eager=cfg.enforce_eager,
+        tensor_parallel=cfg.tensor_parallel,
+        hf_offline=cfg.hf_offline,
         env_extra={"VLLM_LOGGING_CONFIG_PATH": logging_config},
     )
     typer.echo(f"[{cfg.condition}] launching {flavor} vLLM on port {cfg.port} ...")
@@ -685,10 +788,15 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
         if cfg.condition == "online_only":
             online = await gen.run(offsets, t0=t0)
         elif cfg.condition == "offline_only":
-            completions = await submit_batch_direct(cfg.base_url, items, t0=t0)
+            completions = await submit_batch_direct(
+                cfg.base_url, items, t0=t0, max_connections=cfg.batch_concurrency
+            )
         elif cfg.condition in ("naive", "technique_b"):
             batch_task = asyncio.create_task(
-                submit_batch_direct(cfg.base_url, items, t0=t0), name="batch"
+                submit_batch_direct(
+                    cfg.base_url, items, t0=t0, max_connections=cfg.batch_concurrency
+                ),
+                name="batch",
             )
             online = await gen.run(offsets, t0=t0)
             completions = await asyncio.wait_for(batch_task, timeout=cfg.drain_timeout_s)
@@ -889,8 +997,40 @@ def run(
     vllm_bin: str = typer.Option(DEFAULT_VLLM_BIN, help="Path to the `vllm` executable."),
     drain_timeout_s: float = typer.Option(300.0, help="Cap on the post-window batch drain."),
     log_dir: str = typer.Option("", help="Directory for engine logs (default: a temp dir)."),
+    gpu_preset: bool = typer.Option(
+        False,
+        "--gpu-preset",
+        help=(
+            "Flip the defaults to GPU-sane: --no-enforce-eager, --no-hf-offline, "
+            "--batch-concurrency 512. Individual flags still win."
+        ),
+    ),
+    max_model_len: int = typer.Option(DEFAULT_MAX_MODEL_LEN, help="Engine --max-model-len."),
+    tensor_parallel: int = typer.Option(
+        DEFAULT_TENSOR_PARALLEL, help="Engine --tensor-parallel-size (>1 shards across GPUs)."
+    ),
+    enforce_eager: bool | None = typer.Option(
+        None,
+        "--enforce-eager/--no-enforce-eager",
+        help="Eager mode + TORCHDYNAMO_DISABLE. Default: on (off under --gpu-preset).",
+    ),
+    hf_offline: bool | None = typer.Option(
+        None,
+        "--hf-offline/--no-hf-offline",
+        help="HF_HUB_OFFLINE. Default: on (off under --gpu-preset, so a cold node can fetch).",
+    ),
+    batch_concurrency: int | None = typer.Option(
+        None,
+        help="HTTP pool size for direct batch submission. Default: 100 (512 under --gpu-preset).",
+    ),
 ) -> None:
     """Run one condition end to end and write ``<out>``."""
+    engine = resolve_preset(
+        gpu_preset=gpu_preset,
+        enforce_eager=enforce_eager,
+        hf_offline=hf_offline,
+        batch_concurrency=batch_concurrency,
+    )
     cfg = RunConfig(
         condition=condition,
         minutes=minutes,
@@ -906,6 +1046,11 @@ def run(
         vllm_bin=vllm_bin,
         drain_timeout_s=drain_timeout_s,
         out=out,
+        max_model_len=max_model_len,
+        tensor_parallel=tensor_parallel,
+        enforce_eager=engine["enforce_eager"],
+        hf_offline=engine["hf_offline"],
+        batch_concurrency=engine["batch_concurrency"],
     )
     result = asyncio.run(run_condition(cfg, log_dir=log_dir or None))
 
