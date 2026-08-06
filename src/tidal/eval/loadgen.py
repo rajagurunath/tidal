@@ -253,7 +253,14 @@ class OnlineLoadGen:
         show up in the numbers at all.
         """
         owns = client is None
-        http = client or httpx.AsyncClient(timeout=self.timeout_s)
+        # A load generator must never self-throttle: the default httpx pool
+        # caps at 100 connections, which silently converts this open-loop
+        # generator into a closed loop exactly when the engine is saturated —
+        # understating the latency damage it exists to measure.
+        http = client or httpx.AsyncClient(
+            timeout=self.timeout_s,
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
+        )
         start = t0 if t0 is not None else time.perf_counter()
         tasks: list[asyncio.Task] = []
         try:
