@@ -394,6 +394,15 @@ of the dedicated-offline ceiling.}
 \label{fig:throughput}
 \end{figure}
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/diurnal_tide.png}
+\caption{\textbf{Batch fills the trough.} Per-minute batch completions (bars) against a sinusoidal online load (two 10-minute cycles, peak 3\,req/s, trough 20\% of peak): anti-correlation $r=-0.95$, with 93.7 items/min in high-load minutes versus 120.3 in low-load minutes. The gateway's AIMD target stayed pinned at its cap throughout --- the tide-filling is produced entirely by the engine-level priority mechanism, direct evidence for the two-level division of labor.}
+\label{fig:diurnal}
+\end{figure}
+
+\paragraph{Diurnal trace --- batch fills the trough.} Under a sinusoidal online load with a non-draining pool, technique A's per-minute batch completions anti-correlate with online arrivals at $r=-0.95$ (\cref{fig:diurnal}): 93.7 items/min during the high-load half of each cycle versus 120.3 during the low-load half. Notably, the AIMD target never moved from its cap --- the tide-filling came entirely from the engine-level mechanism (priority scheduling over shared capacity), with the external throttle never needing to engage: the two-level design's division of labor, observed directly.
+
 \paragraph{Q3 --- the contract, honestly.} We attempted to demonstrate end-to-end deadline
 discrimination --- a feasible-but-tight job that best-effort co-location misses and laxity
 escalation meets --- and did not find a load regime on this testbed that discriminates. At
