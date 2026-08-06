@@ -5,6 +5,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{newtxtext,newtxmath}
 \usepackage{microtype}
+\usepackage{placeins}
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{array}
@@ -327,7 +328,7 @@ planned GPU evaluation (8$\times$H200) is where those claims must be earned.
 All co-location conditions completed the identical batch. The online latency price differed
 by an order of magnitude (\cref{tab:q1}, \cref{fig:cdf}).
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Q1: online request latency under each co-location condition. All conditions
 completed the identical 1{,}200-item batch.}
@@ -344,7 +345,7 @@ Technique B                 & 1.26\,s  & 11.80\,s & $2.86\times$ / $8.25\times$ 
 \end{tabular}
 \end{table}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.86\linewidth]{figures/latency_cdf.png}
 \caption{Measured distribution of online request latency under each condition. Reporting
@@ -369,7 +370,7 @@ with latency. For shape calibration only: HyGen and ConServe report 78--88\% of 
 GPU-class hardware where the mechanisms that would let B have both (guardband eviction,
 compute-bound $\tau$ filling) actually engage.
 
-\begin{table}[h]
+\begin{table}[!htbp]
 \centering
 \caption{Q2: batch throughput recovered against a non-draining pool, and the online
 latency paid for it. The ceiling is the dedicated-offline rate, 4.43\,items/s
@@ -386,13 +387,29 @@ Technique B            & 71.2\,\%  & $9.9\times$ \\
 \end{tabular}
 \end{table}
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.80\linewidth]{figures/batch_throughput.png}
 \caption{Batch output throughput recovered while online traffic is served, as a fraction
 of the dedicated-offline ceiling.}
 \label{fig:throughput}
 \end{figure}
+
+\begin{table}[!htbp]
+\centering
+\caption{Diurnal trace: per-minute batch completions against online load phase (technique A, two 10-minute cycles, peak 3\,req/s, trough 0.6\,req/s, non-draining pool).}
+\label{tab:diurnal}
+\begin{tabular}{lccc}
+\toprule
+phase (10 bins each) & online arrivals/min & batch completed/min & share of batch work \\
+\midrule
+high-load minutes & 158.6 & 93.7  & 43.8\% \\
+low-load minutes  & 63.1  & 120.3 & 56.2\% \\
+\midrule
+\multicolumn{4}{l}{correlation(online, batch) $= -0.95$; online p99 $= 4.61$\,s; AIMD target pinned at cap throughout} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \begin{figure}[t]
 \centering
@@ -416,6 +433,23 @@ engages at the configured urgency, and the admission check (\cref{sec:contract})
 jobs the observed rate cannot serve. Constructing the discriminating regime --- bursty
 diurnal online load with genuinely scarce slack --- is a primary goal of the GPU evaluation.
 
+\begin{table}[!htbp]
+\centering
+\caption{Deadline-stress runs (technique A, 15-minute completion windows). Every feasible configuration completed inside the window for \emph{both} arms; the escalation machinery engaged (minimum priority observed) but was never the difference-maker on this testbed.}
+\label{tab:deadline}
+\begin{tabular}{lccccc}
+\toprule
+run & online load & items & completed by deadline & makespan & min.\ priority seen \\
+\midrule
+saturated, best-effort      & 3.0 req/s & 900 & 900/900 & 692\,s & 100 \\
+easy, best-effort           & 2.0 req/s & 350 & 350/350 & 204\,s & 100 \\
+easy, laxity                & 2.0 req/s & 350 & 350/350 & 188\,s & 91 \\
+tight, best-effort          & 2.6 req/s & 500 & 500/500 & 351\,s & 100 \\
+tight, laxity (+floor)      & 2.6 req/s & 500 & 500/500 & 328\,s & 66 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \paragraph{Q4 --- placement, and an inversion.} The naive expectation --- in-engine must
 dominate --- is wrong on this hardware. Technique B's cap and guardband address interference
 channels that never bind here: peak KV usage in every run was below 0.5\%, so guardband
@@ -437,7 +471,7 @@ tight, since at a 60\,ms budget with $\sim$25\,ms online-only steps this box has
 to sell, and the model discovered that (\cref{fig:timeline}). Regime-change adaptation (model
 swap, thermal drift) is untested (\cref{sec:limitations}).
 
-\begin{figure}[h]
+\begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.82\linewidth]{figures/technique_b_timeline.png}
 \caption{Technique B step by step: online and batch tokens scheduled per iteration (top) and
@@ -446,6 +480,7 @@ near $t = 600$\,s the held set empties and batch work takes the whole budget ---
 \label{fig:timeline}
 \end{figure}
 
+\FloatBarrier
 \section{Related Work}
 
 Iteration-level scheduling and its descendants frame the mechanism space: Orca introduced
@@ -473,6 +508,7 @@ PR~\citep{vllm-pr-44445} --- demand without an assembled answer. Every individua
 here is published; the contribution is the contract semantics, the synthesis, and the
 placement measurement.
 
+\FloatBarrier
 \section{Limitations}
 \label{sec:limitations}
 
