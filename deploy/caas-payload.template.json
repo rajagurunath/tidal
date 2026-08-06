@@ -1,0 +1,39 @@
+{
+  "resource_private_name": "${RESOURCE_PRIVATE_NAME}",
+  "device_id": "${DEVICE_ID}",
+  "duration_hours": 24,
+  "gpus_per_container": 1,
+  "hardware_id": "${HARDWARE_ID}",
+  "node_pool_id": "${NODE_POOL_ID}",
+  "container_config": {
+    "replica_count": 1,
+    "env_variables": {
+      "created_by": "${CREATED_BY}",
+      "SCHEDULER_MODE": "${SCHEDULER_MODE}",
+      "MODEL": "${MODEL}",
+      "MAX_MODEL_LEN": "${MAX_MODEL_LEN}",
+      "TBT_SLO": "${TBT_SLO}",
+      "TENSOR_PARALLEL_SIZE": "${TENSOR_PARALLEL_SIZE}",
+      "PORT": "8000",
+      "EXTRA_VLLM_ARGS": "${EXTRA_VLLM_ARGS}",
+      "VLLM_LOG_STATS_INTERVAL": "1",
+      "VLLM_RPC_TIMEOUT": "600000",
+      "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+      "HF_HUB_ENABLE_HF_TRANSFER": "1",
+      "internal_logging_enabled": "true"
+    },
+    "secret_env_variables": {
+      "HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN}",
+      "VLLM_API_KEY": "${VLLM_API_KEY}"
+    },
+    "entrypoint": ["/usr/local/bin/tidal-engine-entrypoint"],
+    "traffic_port": 8000,
+    "args": [],
+    "command": ""
+  },
+  "registry_config": {
+    "image_url": "${ENGINE_IMAGE}",
+    "registry_username": "${REGISTRY_USERNAME}",
+    "registry_secret": "${REGISTRY_SECRET}"
+  }
+}

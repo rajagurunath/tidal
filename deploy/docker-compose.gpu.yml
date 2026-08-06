@@ -1,0 +1,107 @@
+# Tidal on a single GPU node — engine + gateway (technique A wiring).
+#
+#   cd <repo root>
+#   docker compose -f deploy/docker-compose.gpu.yml up -d --build
+#
+# Build context is the repo root (see `context: ..`), so run compose from
+# anywhere; the relative paths resolve against this file.
+#
+# This is the *serving* topology. The evaluation harness is a different shape:
+# it launches and tears down its own engine per condition, so run_gpu_eval.sh
+# executes inside the engine container with this stack's engine stopped. See
+# deploy/README.md.
+
+name: tidal
+
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.engine
+      args:
+        BUILD_MODE: ${BUILD_MODE:-fast}
+        VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:v0.26.0}
+    image: ${ENGINE_IMAGE:-tidal-engine:fast}
+    environment:
+      # technique A wants `stock`; technique B wants `tidal`.
+      SCHEDULER_MODE: ${SCHEDULER_MODE:-stock}
+      MODEL: ${MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-8192}
+      TBT_SLO: ${TBT_SLO:-200}
+      TENSOR_PARALLEL_SIZE: ${TENSOR_PARALLEL_SIZE:-1}
+      PORT: "8000"
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      EXTRA_VLLM_ARGS: ${EXTRA_VLLM_ARGS:-}
+      # Weights come from the shared cache volume; unset to allow downloads.
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      # Per-second stats make the harness's /metrics sampling meaningful.
+      VLLM_LOG_STATS_INTERVAL: "1"
+      VLLM_RPC_TIMEOUT: "600000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ../results:/opt/tidal/results
+    ports:
+      - "${ENGINE_PORT:-8000}:8000"
+    ipc: host
+    shm_size: "32gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)
+      interval: 30s
+      timeout: 10s
+      # Cold weight download on a fresh node is the long pole here, not load.
+      start_period: 25m
+      retries: 5
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    image: ${GATEWAY_IMAGE:-tidal-gateway:latest}
+    depends_on:
+      engine:
+        condition: service_healthy
+    environment:
+      TIDAL_VLLM_BASE_URL: http://engine:8000
+      TIDAL_VLLM_METRICS_URL: http://engine:8000/metrics
+      TIDAL_SERVED_MODEL: ${MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      # Set a real secret. `tidal serve` warns when it binds a non-loopback
+      # address while this is still the placeholder.
+      TIDAL_API_KEY: ${TIDAL_API_KEY:-tidal-dev-key}
+      TIDAL_HOST: 0.0.0.0
+      TIDAL_PORT: "8080"
+      TIDAL_DSN: sqlite:////data/tidal.db
+      TIDAL_BLOB_DIR: /data/blobs
+      # 4 is the Mac-CPU default; a GPU can keep far more batch items resident.
+      TIDAL_MAX_INFLIGHT: ${TIDAL_MAX_INFLIGHT:-64}
+      TIDAL_COMPLETION_WINDOW_HOURS: ${TIDAL_COMPLETION_WINDOW_HOURS:-24.0}
+      TIDAL_TBT_SLO_MS: ${TBT_SLO:-200}
+    volumes:
+      - gateway-data:/data
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  # Named rather than a bind so the CaaS fleet's shared NVMe cache convention
+  # (/ephemeral/hf-cache/<deployer-uuid>) can be substituted with a bind here
+  # when running on an io.net box that already has the weights staged.
+  hf-cache:
+  gateway-data:

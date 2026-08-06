@@ -1,0 +1,20 @@
+# BuildKit reads <dockerfile-path>.dockerignore in preference to the context's
+# root .dockerignore, which lets this kit keep its ignore rules inside deploy/.
+# Requires DOCKER_BUILDKIT=1 (default on modern Docker). Without BuildKit the
+# whole repo — including a multi-GB .venv — is sent as build context.
+.git
+.github
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.gstack
+**/__pycache__
+**/*.pyc
+*.egg-info
+dist
+results
+tidal.db*
+tidal_blobs
+docs/paper
+.DS_Store
