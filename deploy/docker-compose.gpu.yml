@@ -42,7 +42,11 @@ services:
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     volumes:
       - hf-cache:/root/.cache/huggingface
-      - ../results:/opt/tidal/results
+      # /results is the image's RESULTS_DIR, shared with the eval script and the
+      # selfdrive supervisor. This service serves rather than evaluates, so the
+      # mount is only here so a `docker compose run --entrypoint
+      # tidal-run-gpu-eval engine` lands results on the host.
+      - ../results:/results
     ports:
       - "${ENGINE_PORT:-8000}:8000"
     ipc: host

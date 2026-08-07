@@ -43,11 +43,21 @@
 
 set -euo pipefail
 
+# No TTY is ever required: stdin is closed up front, so this runs identically
+# under `docker run` without -it, under nohup, and as the selfdrive supervisor's
+# child. Anything that tried to prompt gets EOF instead of hanging forever.
+exec </dev/null
+
 # --------------------------------------------------------------------------
 # Knobs
 # --------------------------------------------------------------------------
 REPO_DIR="${REPO_DIR:-/opt/tidal}"
-RESULTS_BASE="${RESULTS_BASE:-${REPO_DIR}/results}"
+# RESULTS_DIR is the name the selfdrive supervisor (src/tidal/eval/selfdrive.py)
+# exports; RESULTS_BASE is the older name this script used. Either works, and
+# the supervisor always sets both to the same path so the HTTP result endpoints
+# and this script can never disagree about where things landed.
+RESULTS_DIR="${RESULTS_DIR:-${RESULTS_BASE:-/results}}"
+RESULTS_BASE="$RESULTS_DIR"
 
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EVAL_PORT="${EVAL_PORT:-8400}"
@@ -105,6 +115,9 @@ CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-5400}"
 
 PREWARM="${PREWARM:-1}"
 MAKE_TARBALL="${MAKE_TARBALL:-1}"
+# The 10-minute compat canary, run before any GPU time is spent. Set to 0 only
+# if you have already run it against this exact image.
+RUN_CANARY="${RUN_CANARY:-1}"
 # RESUME=1 reuses the newest gpu-<host>-* run directory instead of starting a
 # fresh one, which is what makes "just re-run it" pick up after a crash. Set
 # RESUME=0 (or pass an explicit RUN_DIR) for a clean run.
@@ -184,8 +197,22 @@ log() {
   printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
 }
 
+# Machine-readable state changes, for src/tidal/eval/selfdrive.py's /status.
+# One token per line, stderr like log() so ordering in a merged log is sane:
+#   booting | canary | probing | running:<case> | rendering | done
+#   total <n> | case_done <name> | case_failed <name>
+#   canary_ok | canary_failed <msg> | failed <msg>
+# A human reading the log loses nothing; a supervisor parsing it needs no regex
+# against prose that might get reworded later.
+progress() {
+  printf 'PROGRESS %s\n' "$*" >&2
+}
+
 die() {
   log "FATAL: $*"
+  # The supervisor's /status shows this verbatim; it is often the only thing an
+  # operator on the far end of a public URL will ever see.
+  progress "failed $*"
   exit 1
 }
 
@@ -228,6 +255,67 @@ prewarm_weights() {
   if ! "$dl" download "$MODEL" >"${LOG_DIR}/prewarm.log" 2>&1; then
     log "WARNING: prewarm failed (see logs/prewarm.log); continuing — the probe will retry"
   fi
+}
+
+# The 10-minute compat canary. It exercises TidalScheduler against *this
+# image's* vLLM using real Scheduler machinery and real KV block accounting with
+# no weights loaded, so it costs minutes rather than an evaluation's worth of
+# GPU hours. Running it here rather than by hand is the whole point of the
+# SSH-less flow: nobody is around to run it first.
+#
+# On failure the run does NOT stop. Only technique_b depends on the plugin, so
+# the technique_a matrix, the diurnal technique_a arm and the deadline pair are
+# still worth the GPU time. What changes:
+#   * CANARY_OK=0 -> both technique_b cases are skipped
+#   * PROGRESS canary_failed <msg> -> /status carries the error from here on
+#   * the failure joins FAILED_CASES, so the script exits non-zero and the
+#     supervisor's terminal phase is `failed` rather than `done`
+#   * MANIFEST.txt records it, so a downloaded tarball is self-describing
+#
+# `python3 -m pytest` rather than bare `pytest` is required, not stylistic:
+# tests/ has no __init__.py, so `from tests.unit.engine_fixtures import ...`
+# only resolves because -m puts the working directory on sys.path.
+CANARY_OK=1
+CANARY_NOTE="ok"
+
+run_compat_canary() {
+  progress "canary"
+  if [ "$RUN_CANARY" != "1" ]; then
+    CANARY_NOTE="skipped (RUN_CANARY=0)"
+    log "compat canary disabled (RUN_CANARY=0)"
+    return 0
+  fi
+
+  local out="${LOG_DIR}/compat_canary.log"
+  local rc=0
+  log "compat canary: tests/unit/test_tidal_scheduler.py"
+  (cd "$REPO_DIR" && "$PYTHON_BIN" -m pytest tests/unit/test_tidal_scheduler.py -q) \
+    >"$out" 2>&1 || rc=$?
+
+  # Three distinguishable outcomes, because the fix differs for each:
+  #   exit 5 / no passing tests -> vLLM did not import, the image is broken
+  #   any other non-zero        -> upstream drifted away from the plan-B pin
+  #   green                     -> proceed
+  local msg=""
+  if [ "$rc" -eq 5 ] || { [ "$rc" -eq 0 ] && ! grep -qE '[0-9]+ passed' "$out"; }; then
+    rc=5
+    msg="compat canary exercised nothing (exit 5 / all skipped): vLLM did not import in this image, so TidalScheduler was never tested. Rebuild the image. technique_b is skipped; see logs/compat_canary.log"
+  elif [ "$rc" -ne 0 ]; then
+    msg="compat canary FAILED (exit ${rc}): this image's vLLM has drifted from the TidalScheduler interface points. technique_b is not trustworthy here and is skipped; see logs/compat_canary.log"
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    CANARY_OK=0
+    CANARY_NOTE="FAILED - ${msg}"
+    progress "canary_failed ${msg}"
+    log "$msg"
+    tail -n 20 "$out" >&2 || true
+    FAILED_CASES+=("compat_canary(exit ${rc})")
+    return 0
+  fi
+
+  progress "canary_ok"
+  log "compat canary green"
 }
 
 # SIGKILL anything still holding the eval port. vLLM V1 forks an EngineCore
@@ -280,7 +368,18 @@ run_case() {
   if result_ok "$out"; then
     log "SKIP ${name} (result exists: ${out})"
     SKIPPED_CASES+=("$name")
+    # A resumed case is a completed case as far as progress is concerned: its
+    # result JSON is in the tarball either way.
+    progress "case_done ${name}"
     return 0
+  fi
+
+  # The sizing probe gets its own phase name because it is not one of the
+  # measured conditions — it is the engine-health gate in front of them.
+  if [ "$name" = "probe_offline" ]; then
+    progress "probing"
+  else
+    progress "running:${name}"
   fi
 
   reap_port "$EVAL_PORT"
@@ -323,12 +422,14 @@ run_case() {
     log "FAIL ${name} (exit ${rc}); tail of ${case_log}:"
     tail -n 25 "$case_log" >&2 || true
     FAILED_CASES+=("${name}(exit ${rc})")
+    progress "case_failed ${name}"
     reap_port "$EVAL_PORT"
     return 0
   fi
 
   tail -n 4 "$case_log" >&2 || true
   RAN_CASES+=("$name")
+  progress "case_done ${name}"
   reap_port "$EVAL_PORT"
 }
 
@@ -371,7 +472,20 @@ PY
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+progress "booting"
 preflight
+# Before the weight download, not after: the canary takes minutes, prewarm can
+# take half an hour, and an operator watching /status wants the verdict early.
+run_compat_canary
+
+# Denominator for /status. 1 probe + 5 matrix + 2 diurnal + 2 deadline = 10,
+# less the two technique_b cases a failed canary takes off the table.
+TOTAL_CASES=10
+if [ "$CANARY_OK" != "1" ]; then
+  TOTAL_CASES=8
+fi
+progress "total ${TOTAL_CASES}"
+
 prewarm_weights
 
 # The probe doubles as the "wait for engine health" gate: it is the first thing
@@ -412,6 +526,11 @@ log "deadline pair: ${DEADLINE_ITEMS} items, window ${DEADLINE_WINDOW_HOURS} h"
 # Identical flags across conditions; the condition name is the only variable.
 # Same seed everywhere, so every arm sees the same arrival trace.
 for condition in online_only offline_only naive technique_a technique_b; do
+  if [ "$condition" = "technique_b" ] && [ "$CANARY_OK" != "1" ]; then
+    log "SKIP technique_b — the compat canary failed; the plugin's numbers would be meaningless"
+    SKIPPED_CASES+=("technique_b(canary)")
+    continue
+  fi
   run_case "$condition" "${MATRIX_DIR}/${condition}.json" "" \
     --condition "$condition" \
     --minutes "$MINUTES" \
@@ -429,6 +548,10 @@ done
 # The tide-filling claim: batch completions should anti-correlate with online
 # arrivals. Run both placements so the correlation can be compared.
 for condition in technique_a technique_b; do
+  if [ "$condition" = "technique_b" ] && [ "$CANARY_OK" != "1" ]; then
+    SKIPPED_CASES+=("diurnal_technique_b(canary)")
+    continue
+  fi
   run_case "diurnal_${condition}" "${DIURNAL_DIR}/diurnal_${condition}.json" "" \
     --condition "$condition" \
     --minutes "$DIURNAL_MINUTES" \
@@ -477,6 +600,7 @@ run_case "deadline_laxity" "${DEADLINE_DIR}/deadline_laxity.json" \
 # Only the matrix directory: plots.load_results keys by the payload's
 # `condition`, so the diurnal and deadline runs (all technique_a/technique_b)
 # would collide with the matrix arms if they shared a directory.
+progress "rendering"
 log "rendering figures"
 if ! "$PYTHON_BIN" -m tidal.eval.plots render \
       --results-dir "$MATRIX_DIR" \
@@ -500,6 +624,7 @@ fi
   echo "engine_args:       ${HARNESS_ENGINE_ARGS[*]}"
   echo "tensor_parallel:   ${TENSOR_PARALLEL_SIZE}"
   echo "max_model_len:     ${MAX_MODEL_LEN}"
+  echo "canary:            ${CANARY_NOTE}"
   echo "items_per_s_probe: ${ITEMS_PER_S}"
   echo "batch_items:       ${BATCH_ITEMS}"
   echo "diurnal_items:     ${DIURNAL_ITEMS}"
@@ -526,7 +651,12 @@ fi
 if [ "${#FAILED_CASES[@]}" -gt 0 ]; then
   log "completed with ${#FAILED_CASES[@]} failed case(s): ${FAILED_CASES[*]}"
   log "re-run this script to retry only the failures (successful results are skipped)"
+  # Results are packed and servable regardless — the supervisor keeps serving
+  # after a non-zero exit, so `failed` here means "download it and read the
+  # manifest", not "nothing to see".
+  progress "failed ${#FAILED_CASES[@]} case(s) failed: ${FAILED_CASES[*]}"
   exit 1
 fi
 
+progress "done"
 log "all cases completed"

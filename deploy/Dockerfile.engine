@@ -180,12 +180,22 @@ ENV SCHEDULER_MODE=stock \
     MAX_MODEL_LEN=8192 \
     TBT_SLO=200 \
     TENSOR_PARALLEL_SIZE=1 \
+    RESULTS_DIR=/results \
     PORT=8000
+
+# The selfdrive supervisor's default results root. Mount over it for a
+# compose/dev run; on CaaS it is container-local and read back over HTTP.
+RUN mkdir -p /results
 
 EXPOSE 8000
 
-# /health is unauthenticated in vLLM even when --api-key is set.
+# Both modes on one probe: MODE=serve answers /health (unauthenticated in vLLM
+# even when --api-key is set), MODE=selfdrive answers /healthz. A healthcheck
+# that only knew about /health would kill self-driving containers, and CaaS
+# restarting the container mid-eval would throw away hours of GPU time.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25m --retries=5 \
-    CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health', timeout=4)" || exit 1
+    CMD python3 -c "import os,urllib.request as u;p=os.environ.get('PORT','8000');u.urlopen('http://127.0.0.1:'+p+'/healthz',timeout=4)" \
+     || python3 -c "import os,urllib.request as u;p=os.environ.get('PORT','8000');u.urlopen('http://127.0.0.1:'+p+'/health',timeout=4)" \
+     || exit 1
 
 ENTRYPOINT ["/usr/local/bin/tidal-engine-entrypoint"]
