@@ -52,6 +52,144 @@ engine on the same GPU makes every latency number meaningless.
 
 ---
 
+## Two paths: a node you own, or a node you rent
+
+Steps 0–6 below are the **deploy-to-specific-device** path. You already have a
+box, you read its `device_id` off the machine, you look its `hardware_id` and
+`node_pool_id` up in Prod RDS, and you build the image yourself.
+
+`hire_and_run.sh` is the **marketplace** path, for when you have no box at all.
+It shops the public `/hardware` catalogue, hires the cheapest card that fits a
+budget, boots a *stock* `vllm/vllm-openai` image, installs Tidal into it from a
+pinned SHA, waits out the eval, downloads the results, and destroys the rental.
+Nothing is built and nothing is pushed — which is the whole point at 11pm.
+
+```bash
+export CAAS_API_KEY=...          # never printed; see "Secret discipline" below
+deploy/hire_and_run.sh           # one shot: hire → run → fetch → destroy
+```
+
+### Knobs
+
+All are environment variables; only `CAAS_API_KEY` is required.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `CAAS_API_KEY` | — | **Required.** Sent as `x-api-key`. |
+| `CAAS_BASE` | `https://api-dev.io.solutions/enterprise/v1/io-cloud/caas` | API root. DEV is VPN-gated. |
+| `BUDGET_USD` | `10` | Total spend you are authorising for this experiment. |
+| `BUDGET_FRACTION` | `0.6` | Share of the budget the *initial* hire may use. The rest is held back for an extension. |
+| `INITIAL_HOURS` | `2` | `duration_hours` on the deploy. Charged up front. |
+| `MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Model under test. |
+| `CASES` | `online_only,offline_only,naive,technique_a,technique_b` | Subset of `run_gpu_eval.sh`'s cases. The canary and sizing probe always run. |
+| `MINUTES` | `6` | Per-case window. Short, because the rental is short. |
+| `ONLINE_RPS` | `20` | Peak online arrival rate. |
+| `MAX_MODEL_LEN` | `8192` | Engine context length. |
+| `WARMUP_S` | `45` | Unmeasured warm-up per case; `run_gpu_eval.sh` turns it into `--warmup-s`. |
+| `BATCH_CONCURRENCY` | `512` | Offline pool concurrency. |
+| `TENSOR_PARALLEL_SIZE` | `1` | Must equal `gpus_per_container`, which is pinned to 1. |
+| `RUN_CANARY` | `1` | Compat canary before any measurement. |
+| `PREFER` | `a6000\|a100\|4090\|l40` | Case-insensitive regex over `hardware_name`. |
+| `MIN_VRAM_GB` | `24` | VRAM floor, when the catalogue reveals VRAM at all. |
+| `LOCATION_IDS` | `US` | Comma-separated. `location_ids` **or** `private_node_pool` is required by `/deploy`. |
+| `IMAGE_URL` | `vllm/vllm-openai:v0.26.0` | The stock image Tidal is installed into. |
+| `TIDAL_SHA` | `git rev-parse HEAD` | The exact commit the container installs and checks out. |
+| `TIDAL_REPO_URL` | `https://github.com/rajagurunath/tidal` | Where it installs from. Must be public — the container has no credentials. |
+| `EVIDENCE_DIR` | `./evidence/gpu-$(date +%Y%m%d-%H%M)` | Where every artefact lands. |
+| `RESOURCE_PRIVATE_NAME` | `tidal-eval-<utc>` | Deployment name. |
+| `HF_TOKEN` / `TIDAL_API_KEY` | empty | Forwarded as `secret_env_variables`; redacted in the saved payload. `TIDAL_API_KEY` is the only auth on `POST /abort`. |
+| `POLL_BOOT_S` / `POLL_STATUS_S` | `30` / `60` | Poll intervals for the containers endpoint and `/status`. |
+| `BOOT_TIMEOUT_S` | `1200` | How long to wait for a running container with a `public_url`. |
+| `EVAL_TIMEOUT_S` | `0` | `0` derives `INITIAL_HOURS × 3600 + 900`. |
+| `FETCH_RETRIES` | `5` | Attempts at `results.tar.gz`. |
+| `HF_TRANSFER` | `0` | Stock vLLM images do not ship `hf_transfer`; leave it off. |
+| `KEEP` | `0` | `1` = do **not** destroy on exit. You are then paying for it. |
+| `DRY_RUN` | `0` | `1` = select hardware, price it, write the payload, and stop before `POST /deploy`. |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | The eval reached `phase=done` and the tarball was fetched. |
+| `2` | Hire failed — API unreachable or VPN-gated, no eligible hardware, or `/deploy` rejected. Nothing is running. |
+| `3` | Boot timeout — no running container with a `public_url` inside `BOOT_TIMEOUT_S`. The deployment is destroyed. |
+| `4` | The eval failed (`phase=failed`/`aborted`, or the eval timed out). Results and logs are still fetched first. |
+| `5` | Budget abort — the `/price` estimate exceeded `BUDGET_USD × BUDGET_FRACTION`. Nothing was hired. |
+
+### What it leaves behind
+
+`$EVIDENCE_DIR` is the receipt for whatever number comes out of the run:
+
+```
+driver.log                    every decision and poll, UTC-timestamped
+hardware.json                 the raw catalogue, as returned
+hardware-choice.json          the filtered set and the row that won
+price.json                    the /price response
+entrypoint-cmd.txt            the exact bash -lc string the container ran
+deploy-request.redacted.json  the payload, secrets replaced with REDACTED
+deploy-response.json          deployment_id and whatever else came back
+containers-log.jsonl          one line per boot poll
+status-log.jsonl              one /status document per poll, with driver elapsed
+status-final.json             the last /status
+full-log.txt                  /log?tail=5000 — the whole run log
+results.tar.gz                the results themselves
+delete-response.json          proof the rental was destroyed
+```
+
+### Sharp edges this script exists to handle
+
+- **`container_config.args` is silently dropped** by `/deploy`. Not rejected —
+  dropped. Everything therefore lives in the `entrypoint` `bash -lc` string:
+  the pip install (retried with backoff), the `git clone` + checkout of
+  `TIDAL_SHA` for the script assets, every export, and the `exec`. That string
+  is assembled from an array and contains no single quotes, so it stays safe to
+  paste inside `'…'`.
+- **`--depth 1` cannot check out an arbitrary SHA.** The entrypoint falls back
+  to `git fetch --depth 1 origin <sha> && git checkout FETCH_HEAD`.
+- **You are charged up front and there is no refund** for an early `DELETE`. A
+  leaked deployment costs exactly as much as a used one, so teardown runs from
+  an `EXIT`/`INT`/`TERM` trap rather than from the happy path. `KEEP=1` is the
+  only way past it.
+- **Extension is not automatic.** On the way out the script prints the exact
+  `extend` curl (with the key left as `$CAAS_API_KEY`) and exits. Extending is
+  additive and costs money, so it is an operator decision, not a retry policy.
+- **DEV is VPN-gated.** When Cloudflare answers instead of the API, the response
+  is an HTML page with a 403 or 200. The script sniffs for that on every call
+  and fails immediately with "connect the VPN", instead of handing the HTML to
+  `jq` and dying somewhere confusing three steps later.
+
+### Secret discipline
+
+`CAAS_API_KEY` is written once, by a shell **builtin**, into a `0600` curl
+config file and passed as `curl --config`. It is never in this script's argv,
+never in curl's argv (so `ps` cannot see it), never in `driver.log`, and never
+in the saved payloads — `secret_env_variables` are rewritten to `REDACTED`
+before anything is written to `$EVIDENCE_DIR`. `set -x` is off at the top of the
+script and re-disabled around the one function that touches the key. The mock
+test asserts all of this, including that the key is never sent to the
+container's own `public_url`, which is an unauthenticated third-party address.
+
+### Testing it without spending anything
+
+```bash
+deploy/test_hire_and_run_mock.sh
+```
+
+Spins an inline `http.server` stub of the marketplace API that also doubles as
+the container's `public_url`, then runs the real driver against it. The stubbed
+catalogue is rigged so the correct answer is only reachable if the availability,
+`PREFER` and budget filters all work, and the stub walks `/status` through
+`booting → running:online_only → done`. It asserts the evidence files exist, the
+phase machine was recorded, a real tarball was retrieved, `DELETE` was issued
+against the right deployment id, the key never leaked, and that an over-budget
+`/price` exits `5` without hiring anything. Both scripts are `bash -n` and
+`shellcheck` clean.
+
+`DRY_RUN=1` does the same reality check against the *live* API: it selects,
+prices and writes the payload, then stops before spending anything.
+
+---
+
 ## Step 0 — Pick the vLLM tag, and read the pin caveat
 
 `Dockerfile.engine` defaults to `--build-arg VLLM_IMAGE=vllm/vllm-openai:v0.26.0`.
