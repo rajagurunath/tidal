@@ -34,9 +34,12 @@ log. Aggregation is done in pure functions at the bottom of this module so the
 maths is unit-testable without a GPU, a CPU, or a server.
 
 The harness owns the vLLM process for the run (launch → wait for /health →
-teardown of the whole process group), because a condition is only meaningful
-against a *fresh* engine: prefix cache, KV pool and the latency model's fit
-must not carry over between conditions.
+``--warmup-s`` seconds of unmeasured traffic → teardown of the whole process
+group), because a condition is only meaningful against a *fresh* engine: prefix
+cache, KV pool and the latency model's fit must not carry over between
+conditions. Fresh is not the same as *ready*, though, which is what the warm-up
+is for: a cold engine's CUDA-graph capture and ``torch.compile`` would
+otherwise be charged to the first condition's latency.
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -88,6 +91,7 @@ __all__ = [
     "percent_of_ceiling",
     "resolve_preset",
     "run_condition",
+    "run_warmup",
     "summarize_metrics",
     "summarize_tick_reports",
     "write_logging_config",
@@ -112,23 +116,36 @@ METRICS_INTERVAL_S = 1.0
 DEFAULT_MAX_MODEL_LEN = 4096
 DEFAULT_TENSOR_PARALLEL = 1
 
+#: Hard cap on warm-up requests, whatever ``--warmup-s`` says. The warm-up
+#: exists to pay one-off costs, and those are paid within a handful of
+#: requests; a broken engine that answers instantly must not be allowed to
+#: turn the time budget into thousands of pointless round trips.
+WARMUP_MAX_REQUESTS = 30
+
 #: What the harness has always done, and still does when no flag is passed: a
-#: Mac CPU build, eager-only, offline hub, and httpx's stock 100-connection
-#: pool. Every one of these is wrong on a GPU, which is what ``GPU_PRESET`` is.
+#: Mac CPU build, eager-only, offline hub, httpx's stock 100-connection pool,
+#: and no warm-up. Every one of these is wrong on a GPU, which is what
+#: ``GPU_PRESET`` is.
 CPU_DEFAULTS = {
     "enforce_eager": True,
     "hf_offline": True,
     "batch_concurrency": 100,
+    "warmup_s": 0.0,
 }
 
 #: ``--gpu-preset``. CUDA graphs and ``torch.compile`` on (the single biggest
 #: decode-throughput lever), the hub reachable so a cold node can fetch
-#: weights, and a connection pool wide enough that batch concurrency is set by
-#: the scheduler under test rather than by httpx.
+#: weights, a connection pool wide enough that batch concurrency is set by the
+#: scheduler under test rather than by httpx, and a warm-up window: on a GPU,
+#: ``/health`` answering 200 is *not* the same as the engine being at steady
+#: state — the first requests still pay CUDA-graph capture, ``torch.compile``,
+#: kernel autotuning and an empty prefix cache, and on a 15-minute window that
+#: lands entirely inside the measurement.
 GPU_PRESET = {
     "enforce_eager": False,
     "hf_offline": False,
     "batch_concurrency": 512,
+    "warmup_s": 45.0,
 }
 
 app = typer.Typer(add_completion=False, help="Tidal A/B evaluation harness.")
@@ -140,6 +157,7 @@ def resolve_preset(
     enforce_eager: bool | None = None,
     hf_offline: bool | None = None,
     batch_concurrency: int | None = None,
+    warmup_s: float | None = None,
 ) -> dict:
     """Fold ``--gpu-preset`` and the individual flags into concrete settings.
 
@@ -155,6 +173,8 @@ def resolve_preset(
         resolved["hf_offline"] = hf_offline
     if batch_concurrency is not None:
         resolved["batch_concurrency"] = batch_concurrency
+    if warmup_s is not None:
+        resolved["warmup_s"] = float(warmup_s)
     return resolved
 
 
@@ -711,6 +731,9 @@ class RunConfig:
     enforce_eager: bool = CPU_DEFAULTS["enforce_eager"]
     hf_offline: bool = CPU_DEFAULTS["hf_offline"]
     batch_concurrency: int = CPU_DEFAULTS["batch_concurrency"]
+    #: Seconds of unmeasured traffic between ``/health`` and ``t0``. Zero (the
+    #: CPU default) reproduces every number measured before the flag existed.
+    warmup_s: float = CPU_DEFAULTS["warmup_s"]
 
     @property
     def duration_s(self) -> float:
@@ -719,6 +742,66 @@ class RunConfig:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+
+async def run_warmup(
+    cfg: RunConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+    max_requests: int = WARMUP_MAX_REQUESTS,
+) -> dict:
+    """Unmeasured traffic between ``/health`` and ``t0``. Returns what it did.
+
+    ``/health`` answering 200 means the weights are loaded, not that the engine
+    is at steady state: the first requests of a run still pay CUDA-graph
+    capture, ``torch.compile``, kernel autotuning and a cold prefix cache. On a
+    15-minute window that cost lands entirely inside the measurement, and it
+    lands on whichever condition happens to be first — which is a property of
+    the loop order in ``run_gpu_eval.sh``, not of the scheduler under test.
+
+    Requests are **sequential** on purpose: the point is to walk the engine
+    through its one-off costs, not to load it. They reuse the online request
+    body builder, so the warm-up exercises exactly the shape the measured
+    window will send. Results, errors and timings are all discarded — this is
+    the one place in the harness where a failed request is not a data point.
+    Whichever of ``warmup_s`` and ``max_requests`` runs out first ends it.
+
+    This is engine warm-up, not load shape, so it applies to every condition
+    that boots an engine — including ``offline_only``, whose ceiling would
+    otherwise be measured against a colder engine than the conditions it is the
+    divisor for.
+    """
+    if cfg.warmup_s <= 0:
+        return {"requests": 0, "elapsed_s": 0.0}
+
+    gen = OnlineLoadGen(
+        base_url=cfg.base_url, model=cfg.model, max_tokens=cfg.online_max_tokens, priority=0
+    )
+    url = f"{cfg.base_url.rstrip('/')}/v1/chat/completions"
+    owns = client is None
+    http = client or httpx.AsyncClient(timeout=cfg.warmup_s)
+
+    started = clock()
+    sent = 0
+    try:
+        while sent < max_requests:
+            remaining = cfg.warmup_s - (clock() - started)
+            if remaining <= 0:
+                break
+            # The per-request timeout is the remaining budget, so a single
+            # wedged request cannot push the warm-up past the window it was
+            # given (plus the one second of floor).
+            with contextlib.suppress(Exception):
+                await http.post(url, json=gen.body_for(sent), timeout=max(1.0, remaining))
+            sent += 1
+    finally:
+        if owns:
+            await http.aclose()
+
+    elapsed = clock() - started
+    typer.echo(f"[{cfg.condition}] warmup: {sent} requests in {elapsed:.1f}s")
+    return {"requests": sent, "elapsed_s": elapsed}
 
 
 async def run_condition(cfg: RunConfig, *, log_dir: str | None = None) -> dict:
@@ -773,6 +856,10 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
         base_url=cfg.base_url, model=cfg.model, max_tokens=cfg.online_max_tokens, priority=0
     )
 
+    # Strictly before t0: anything the warm-up costs must fall outside the
+    # measured window, or it would be reported as latency the scheduler caused.
+    warmup = await run_warmup(cfg)
+
     t0 = time.perf_counter()
     epoch0 = time.time()
     samples: list[MetricSample] = []
@@ -813,6 +900,7 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
     return {
         "epoch0": epoch0,
         "window_s": window,
+        "warmup": warmup,
         "online": {
             "requests": [r.as_dict() for r in online],
             "summary": summarize_latencies(latencies),
@@ -1023,6 +1111,14 @@ def run(
         None,
         help="HTTP pool size for direct batch submission. Default: 100 (512 under --gpu-preset).",
     ),
+    warmup_s: float | None = typer.Option(
+        None,
+        "--warmup-s",
+        help=(
+            "Seconds of unmeasured sequential requests after /health and before t0, "
+            f"capped at {WARMUP_MAX_REQUESTS} requests. Default: 0 (45 under --gpu-preset)."
+        ),
+    ),
 ) -> None:
     """Run one condition end to end and write ``<out>``."""
     engine = resolve_preset(
@@ -1030,6 +1126,7 @@ def run(
         enforce_eager=enforce_eager,
         hf_offline=hf_offline,
         batch_concurrency=batch_concurrency,
+        warmup_s=warmup_s,
     )
     cfg = RunConfig(
         condition=condition,
@@ -1051,6 +1148,7 @@ def run(
         enforce_eager=engine["enforce_eager"],
         hf_offline=engine["hf_offline"],
         batch_concurrency=engine["batch_concurrency"],
+        warmup_s=engine["warmup_s"],
     )
     result = asyncio.run(run_condition(cfg, log_dir=log_dir or None))
 

@@ -267,6 +267,7 @@ def test_run_config_defaults_are_still_the_cpu_testbeds():
     assert cfg.tensor_parallel == 1
     assert cfg.max_model_len == 4096
     assert cfg.batch_concurrency == 100
+    assert cfg.warmup_s == 0.0
 
 
 def test_default_command_is_byte_identical_to_the_pre_flag_harness():
@@ -371,16 +372,18 @@ async def test_measure_threads_batch_concurrency_into_direct_submission(monkeypa
 # -- the preset --------------------------------------------------------------
 
 
-def test_gpu_preset_flips_exactly_the_three_defaults_it_claims_to():
+def test_gpu_preset_flips_exactly_the_defaults_it_claims_to():
     assert resolve_preset(gpu_preset=False) == {
         "enforce_eager": True,
         "hf_offline": True,
         "batch_concurrency": 100,
+        "warmup_s": 0.0,
     }
     assert resolve_preset(gpu_preset=True) == {
         "enforce_eager": False,
         "hf_offline": False,
         "batch_concurrency": 512,
+        "warmup_s": 45.0,
     }
 
 
@@ -390,6 +393,10 @@ def test_explicit_flags_outrank_the_preset_in_both_directions():
     assert forced["batch_concurrency"] == 64
     assert forced["hf_offline"] is False  # untouched flags keep the preset
     assert resolve_preset(gpu_preset=False, hf_offline=False)["hf_offline"] is False
+    # Zero is a value, not "unset": --gpu-preset --warmup-s 0 must be a way to
+    # ask for the un-warmed measurement on a GPU.
+    assert resolve_preset(gpu_preset=True, warmup_s=0)["warmup_s"] == 0.0
+    assert resolve_preset(gpu_preset=False, warmup_s=10)["warmup_s"] == 10.0
 
 
 # -- CLI wiring --------------------------------------------------------------
@@ -435,6 +442,7 @@ def test_cli_without_the_new_flags_still_describes_the_cpu_testbed(captured_conf
     cfg = captured_config()
     assert (cfg.enforce_eager, cfg.hf_offline) == (True, True)
     assert (cfg.tensor_parallel, cfg.max_model_len, cfg.batch_concurrency) == (1, 4096, 100)
+    assert cfg.warmup_s == 0.0
 
 
 def test_cli_parses_each_engine_flag_into_the_run_config(captured_config):
@@ -472,13 +480,173 @@ def test_cli_flags_after_gpu_preset_win(captured_config):
     assert cfg.hf_offline is False
 
 
+def test_cli_warmup_defaults_to_off_and_to_45s_under_the_preset(captured_config):
+    assert captured_config().warmup_s == 0.0
+    assert captured_config("--gpu-preset").warmup_s == 45.0
+
+
+def test_cli_warmup_flag_wins_over_the_preset_in_both_directions(captured_config):
+    assert captured_config("--warmup-s", "20").warmup_s == 20.0
+    assert captured_config("--gpu-preset", "--warmup-s", "90").warmup_s == 90.0
+    # Explicitly asking for the un-warmed measurement on a GPU.
+    assert captured_config("--gpu-preset", "--warmup-s", "0").warmup_s == 0.0
+
+
 def test_the_engine_shape_survives_into_the_result_document():
     """`run_condition` writes `asdict(cfg)` into the result JSON, so a result
     file says which engine produced it. The flags are useless as provenance if
     they are not serializable alongside everything else."""
-    cfg = RunConfig(condition="naive", tensor_parallel=8, enforce_eager=False, hf_offline=False)
+    cfg = RunConfig(
+        condition="naive", tensor_parallel=8, enforce_eager=False, hf_offline=False, warmup_s=45.0
+    )
     payload = json.loads(json.dumps(asdict(cfg)))
     assert payload["tensor_parallel"] == 8
     assert payload["enforce_eager"] is False
     assert payload["hf_offline"] is False
     assert payload["max_model_len"] == 4096
+    # A warmed run and an un-warmed one are not the same measurement, so the
+    # result file has to say which one it is.
+    assert payload["warmup_s"] == 45.0
+
+
+# ---------------------------------------------------------------------------
+# measurement warm-up
+#
+# `/health` answering 200 says the weights are loaded, not that the engine is at
+# steady state. The first requests still pay CUDA-graph capture, torch.compile
+# and a cold prefix cache — a cost that, unwarmed, lands inside the measured
+# window of whichever condition the script happens to run first.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """A monotonic clock that only moves when a request is served."""
+
+    def __init__(self, step: float = 1.0) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self) -> None:
+        self.now += self.step
+
+
+def warmup_client(clock: FakeClock, seen: list[dict]) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        clock.tick()
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_warmup_stops_at_the_time_budget():
+    clock = FakeClock(step=1.0)
+    seen: list[dict] = []
+    async with warmup_client(clock, seen) as client:
+        stats = await harness.run_warmup(
+            RunConfig(condition="offline_only", warmup_s=5.0), client=client, clock=clock
+        )
+    assert stats["requests"] == 5
+    assert stats["elapsed_s"] == pytest.approx(5.0)
+    assert len(seen) == 5
+
+
+async def test_warmup_stops_at_the_request_cap_when_the_engine_is_fast():
+    """A 45-second budget against an engine that answers in microseconds must
+    not become thousands of requests: the cap is what makes the warm-up a
+    bounded, one-off cost rather than a second load generator."""
+    clock = FakeClock(step=0.001)
+    seen: list[dict] = []
+    async with warmup_client(clock, seen) as client:
+        stats = await harness.run_warmup(
+            RunConfig(condition="technique_a", warmup_s=45.0), client=client, clock=clock
+        )
+    assert stats["requests"] == harness.WARMUP_MAX_REQUESTS == 30
+
+
+async def test_warmup_reuses_the_online_request_body_builder():
+    """Warming with a differently-shaped request would warm the wrong paths."""
+    clock = FakeClock()
+    seen: list[dict] = []
+    cfg = RunConfig(condition="naive", warmup_s=3.0, model="m", online_max_tokens=64, port=9)
+    async with warmup_client(clock, seen) as client:
+        await harness.run_warmup(cfg, client=client, clock=clock)
+    expected = harness.OnlineLoadGen(base_url=cfg.base_url, model="m", max_tokens=64, priority=0)
+    assert seen == [expected.body_for(i) for i in range(3)]
+
+
+async def test_warmup_swallows_engine_errors_and_still_counts_them():
+    """A refused or 500ing warm-up request is not a data point — it is still a
+    request the engine was walked through, and it must not abort the run."""
+    clock = FakeClock()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        clock.tick()
+        raise httpx.ConnectError("refused")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        stats = await harness.run_warmup(
+            RunConfig(condition="online_only", warmup_s=3.0), client=client, clock=clock
+        )
+    assert stats["requests"] == 3
+
+
+async def test_warmup_is_off_by_default_and_makes_no_requests():
+    stats = await harness.run_warmup(RunConfig(condition="online_only"))
+    assert stats == {"requests": 0, "elapsed_s": 0.0}
+
+
+async def test_warmup_logs_exactly_one_line(capsys):
+    clock = FakeClock()
+    seen: list[dict] = []
+    async with warmup_client(clock, seen) as client:
+        await harness.run_warmup(
+            RunConfig(condition="technique_b", warmup_s=2.0), client=client, clock=clock
+        )
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out == ["[technique_b] warmup: 2 requests in 2.0s"]
+
+
+async def test_warmup_runs_before_t0_even_for_conditions_with_no_online_load(monkeypatch):
+    """The whole point is that the cost falls *outside* the measured window,
+    and warm-up is engine warm-up, not load shape: offline_only boots an engine,
+    so it warms up too."""
+    order: list[str] = []
+    warmed_at: list[float] = []
+    captured: dict = {}
+
+    async def fake_warmup(cfg, **_kwargs):
+        order.append("warmup")
+        warmed_at.append(harness.time.perf_counter())
+        return {"requests": 3, "elapsed_s": 1.0}
+
+    async def fake_submit(_base_url, _items, *, t0, **_kwargs):
+        order.append("batch")
+        captured["t0"] = t0
+        return []
+
+    monkeypatch.setattr(harness, "run_warmup", fake_warmup)
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    result = await harness._measure(
+        RunConfig(condition="offline_only", batch_items=2, warmup_s=45.0, port=9), server=None
+    )
+    assert order == ["warmup", "batch"]
+    assert warmed_at[0] <= captured["t0"]
+    # And it is reported, so a result file says whether it was warmed.
+    assert result["warmup"] == {"requests": 3, "elapsed_s": 1.0}
+
+
+def test_warmup_never_reaches_the_engine_command_line():
+    """It is a harness-side behaviour. vLLM has no such flag, so leaking it into
+    argv would not slow the engine down — it would fail to start it."""
+    for server in (
+        VllmServer(port=8400, vllm_bin="/bin/vllm", model="m"),
+        VllmServer(
+            port=8400, vllm_bin="/bin/vllm", model="m", enforce_eager=False, tensor_parallel=8
+        ),
+    ):
+        assert not any("warmup" in arg for arg in server.command())
+        assert not any("warmup" in key.lower() for key in server.environment())

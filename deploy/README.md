@@ -450,7 +450,9 @@ the tarball *first*.
    not racing a multi-GB download.
 4. **Sizing probe** — a short `offline_only` run. Both the engine-health gate (a
    bad image or missing driver fails here, before hours of matrix runs) and the
-   measurement of the offline throughput ceiling in items/s.
+   measurement of the offline throughput ceiling in items/s. It is **not**
+   selectable through `CASES` and runs even when the `offline_only` *condition*
+   is deselected: every pool size downstream is computed from its number.
 5. **Matrix** — `online_only`, `offline_only`, `naive`, `technique_a`,
    `technique_b` at `ONLINE_RPS`, same seed, pool sized to
    `POOL_SAFETY × ceiling × window` so it **never drains** — a drained pool
@@ -467,8 +469,13 @@ the tarball *first*.
    and one pair at one setting is a starting point, not an answer.
 8. **Figures** — rendered from the matrix directory only, because
    `plots.load_results` keys by the payload's `condition` and the diurnal and
-   deadline runs would otherwise collide with the matrix arms.
+   deadline runs would otherwise collide with the matrix arms. Skipped when
+   `CASES` selected no matrix case: there would be nothing new to draw, and a
+   render over an empty directory would fail a run that did what it was asked.
 9. **Manifest + tarball** — `$RESULTS_DIR/tidal-gpu-<host>-<utc>.tar.gz`.
+
+Every one of steps 5–7 boots its own engine, and every one of them is warmed
+first — see **Measurement warm-up** below.
 
 Layout under `$RESULTS_DIR/gpu-<host>-<utc>/`: `matrix/` (+ `figures/`),
 `diurnal/`, `deadline/`, `probe/`, `logs/` (per-case stdout, per-case vLLM
@@ -481,12 +488,74 @@ port are reaped between cases. **It is resumable** — a case whose result JSON
 already parses is skipped, and a bare re-invocation reuses the newest
 `gpu-<host>-*` directory. Delete a JSON to force a re-run, or set `RESUME=0`.
 
-Knobs (all settable from `env_variables`): `ONLINE_RPS` `MINUTES`
+Knobs (all settable from `env_variables`): `CASES` `ONLINE_RPS` `MINUTES`
 `ONLINE_MAX_TOKENS` `BATCH_MAX_TOKENS` `MAX_INFLIGHT` `POOL_SAFETY`
 `PROBE_ITEMS` `DIURNAL_MINUTES` `DEADLINE_MINUTES` `DEADLINE_TIGHTNESS`
 `CASE_TIMEOUT_S` `SEED` `EVAL_PORT` `RESUME` `PREWARM` `RUN_CANARY`
 `MAKE_TARBALL` `RESULTS_DIR`, plus the engine shape: `TENSOR_PARALLEL_SIZE`
-`MAX_MODEL_LEN` `BATCH_CONCURRENCY` (empty = the preset's 512).
+`MAX_MODEL_LEN` `BATCH_CONCURRENCY` (empty = the preset's 512) `WARMUP_S`
+(empty = the preset's 45 s).
+
+---
+
+## `CASES` — running less than everything
+
+A full run is ten cases and the better part of four GPU-hours. `CASES` is a
+comma-separated subset; anything not listed is not run at all.
+
+```
+CASES=online_only,offline_only,naive,technique_a,technique_b,diurnal_technique_a,diurnal_technique_b,deadline_control,deadline_laxity
+```
+
+That is also the default, so an unset `CASES` is exactly the run this kit
+always did. Whitespace around names is tolerated, duplicates collapse, and the
+order you write them in does not matter — the script always runs matrix, then
+diurnal, then deadline.
+
+* **An unknown name is fatal in preflight**, before the canary, the weight
+  download and any GPU time, and the error lists every valid name. A typo that
+  silently fell back to "run everything" is the expensive failure mode this
+  exists to prevent, so there is no lenient path.
+* **`PROGRESS total <n>` counts the trimmed selection**, so `/status` shows
+  `3/3` and not `3/10` — the supervisor's progress bar stays honest. A failed
+  canary still discounts the two `technique_b` cases, but only if they were
+  selected in the first place.
+* **The compat canary and the sizing probe are not selectable and always run.**
+  In particular, dropping `offline_only` does *not* drop the probe: the probe
+  is its own `offline_only` run against the same engine shape, and it is the
+  ceiling divisor every pool size is computed from. `RUN_CANARY=0` remains the
+  separate switch for the canary.
+* **`MANIFEST.txt` records both** the resolved list (`cases:`, in run order)
+  and the raw string you passed (`cases_env:`), so a downloaded tarball says
+  which subset produced it — and, by omission, which numbers it does not
+  contain.
+
+`CASES` composes with resumability rather than replacing it: a case whose
+result JSON already parses is skipped either way, so `CASES=technique_b` after
+a canary fix re-runs exactly that arm into the existing run directory.
+
+---
+
+## Measurement warm-up (`WARMUP_S`)
+
+`/health` answering 200 means the weights are loaded, not that the engine is at
+steady state. The first requests of a run still pay CUDA-graph capture,
+`torch.compile`, kernel autotuning and a cold prefix cache — and unwarmed, that
+cost lands inside the measured window of whichever condition the loop happens to
+reach first, where it is indistinguishable from latency the scheduler caused.
+
+`WARMUP_S` (default: the preset's 45 s; `0` disables) buys unmeasured
+sequential requests fired **after** `/health` and **before** `t0`, capped at 30
+requests, built by the same online request builder the measured window uses.
+Results, timings and errors are all discarded.
+
+It is *engine* warm-up, not load shape, so it applies to every condition that
+boots an engine — including `offline_only` and the sizing probe, whose ceiling
+would otherwise be measured against a colder engine than the conditions it is
+the divisor for. The engine command line is untouched by it. Each condition
+prints one line, `warmup: <n> requests in <x>s`, and `warmup_s` is serialized
+into every result JSON's `config`: a warmed run and an unwarmed one are not the
+same measurement, and the result file says which one it is.
 
 ---
 
@@ -509,6 +578,7 @@ one-flag way to opt in.
 | No `--tensor-parallel-size` → 8×H200 evaluated as 1×H200 | `--tensor-parallel N` | `1` | `1` (pass it) |
 | `HF_HUB_OFFLINE=1`, worked around by exporting `0` | `--hf-offline` / `--no-hf-offline` | offline | **online** |
 | `httpx` default pool capped batch at ~100 | `--batch-concurrency N` → explicit `httpx.Limits` | `100` | **512** |
+| Measurement started the instant `/health` went green | `--warmup-s N` → unmeasured requests before `t0` | `0` | **45** |
 
 `--gpu-preset` only moves *defaults*: an explicit flag beats it in either
 direction and at any position, so `--gpu-preset --enforce-eager` is a legitimate

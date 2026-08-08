@@ -34,6 +34,11 @@
 #   logs/       per-case stdout and per-case vLLM engine logs
 #   MANIFEST.txt, and a tarball next to the directory.
 #
+# CASES trims that list — see the "Case selector" block below. The canary and
+# the sizing probe are outside it and always run. WARMUP_S buys unmeasured
+# requests between /health and t0 so first-condition warm-up costs are not
+# reported as scheduler-induced latency.
+#
 # Robustness contract:
 #   * set -euo pipefail
 #   * every case is failure-isolated — one bad condition does not abort the run
@@ -71,6 +76,11 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 # Empty means "whatever --gpu-preset says" (512). Set it to override.
 BATCH_CONCURRENCY="${BATCH_CONCURRENCY:-}"
+# Measurement warm-up: unmeasured sequential requests fired after the engine's
+# /health goes green and before t0, so CUDA-graph capture, torch.compile and
+# the cold prefix cache are not charged to the first condition's latency
+# numbers. Empty means "whatever --gpu-preset says" (45 s); 0 disables it.
+WARMUP_S="${WARMUP_S:-}"
 
 # GPU-scale load. 20 rps peak is the target the plan calls for; the CPU testbed
 # in the paper topped out near 3.
@@ -113,6 +123,32 @@ DEADLINE_WINDOW_SLACK="${DEADLINE_WINDOW_SLACK:-1.15}"
 # Hard cap per case, so a wedged engine cannot hang an overnight run.
 CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-5400}"
 
+# --------------------------------------------------------------------------
+# Case selector
+# --------------------------------------------------------------------------
+# CASES is a comma-separated subset of ALL_CASES; anything not listed is not
+# run at all, and `PROGRESS total <n>` counts only what will actually run. An
+# unknown name is fatal in preflight, before a second of GPU time is spent —
+# a typo that silently ran the full 3.6 h matrix would be the expensive
+# failure mode.
+#
+# Two things are NOT selectable and always run:
+#   * the compat canary (RUN_CANARY=0 is its own switch)
+#   * the sizing probe — it is the engine-health gate *and* the divisor every
+#     pool size is computed from. In particular, dropping `offline_only` from
+#     CASES does not drop the probe: the probe is its own `offline_only` run
+#     against the same engine shape, so the pools stay correctly sized even
+#     when the measured offline_only condition is not part of this invocation.
+#
+# Order is fixed by the script (matrix, then diurnal, then deadline), not by
+# the order names appear in CASES. Duplicates and surrounding whitespace are
+# tolerated. Figures are rendered only when at least one matrix case is
+# selected — `plots.load_results` reads the matrix directory, and there is
+# nothing to re-render for a deadline-only invocation.
+ALL_CASES="online_only,offline_only,naive,technique_a,technique_b,diurnal_technique_a,diurnal_technique_b,deadline_control,deadline_laxity"
+CASES="${CASES:-$ALL_CASES}"
+SELECTED_CASES=()
+
 PREWARM="${PREWARM:-1}"
 MAKE_TARBALL="${MAKE_TARBALL:-1}"
 # The 10-minute compat canary, run before any GPU time is spent. Set to 0 only
@@ -147,6 +183,9 @@ HARNESS_ENGINE_ARGS=(
 )
 if [ -n "$BATCH_CONCURRENCY" ]; then
   HARNESS_ENGINE_ARGS+=(--batch-concurrency "$BATCH_CONCURRENCY")
+fi
+if [ -n "$WARMUP_S" ]; then
+  HARNESS_ENGINE_ARGS+=(--warmup-s "$WARMUP_S")
 fi
 
 # --------------------------------------------------------------------------
@@ -217,9 +256,81 @@ die() {
 }
 
 # --------------------------------------------------------------------------
+# Case selection
+# --------------------------------------------------------------------------
+# Membership test against the parsed selection. Used as `if case_selected x`
+# rather than `case_selected x && ...`: under `set -e` a bare `&&` whose left
+# side is false is a failing compound, and as the last statement of a loop body
+# that aborts the script.
+case_selected() {
+  local needle="$1" name
+  for name in ${SELECTED_CASES[@]+"${SELECTED_CASES[@]}"}; do
+    [ "$name" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# CASES -> SELECTED_CASES, or die with the valid list. Every unknown name is
+# reported at once: fixing one typo only to hit the next one on the following
+# run is a bad trade when a run costs GPU-hours.
+parse_cases() {
+  local raw="$1" name wanted=","
+  local -a requested=() bad=()
+  SELECTED_CASES=()
+  IFS=',' read -r -a requested <<<"$raw"
+  for name in ${requested[@]+"${requested[@]}"}; do
+    name="$(printf '%s' "$name" | tr -d '[:space:]')"
+    [ -n "$name" ] || continue
+    case ",${ALL_CASES}," in
+      *",${name},"*) wanted="${wanted}${name}," ;;
+      *) bad+=("$name") ;;
+    esac
+  done
+  # Rebuilt in ALL_CASES order rather than in the order the operator typed, so
+  # `cases:` in MANIFEST.txt reads in the order the run will actually execute,
+  # and duplicates collapse for free.
+  for name in ${ALL_CASES//,/ }; do
+    case "$wanted" in
+      *",${name},"*) SELECTED_CASES+=("$name") ;;
+    esac
+  done
+  if [ "${#bad[@]}" -gt 0 ]; then
+    die "unknown case(s) in CASES: ${bad[*]} -- valid cases are: ${ALL_CASES//,/ } (the compat canary and the sizing probe always run and are not selectable)"
+  fi
+  if [ "${#SELECTED_CASES[@]}" -eq 0 ]; then
+    die "CASES selected nothing -- valid cases are: ${ALL_CASES//,/ }"
+  fi
+  log "cases: ${SELECTED_CASES[*]}"
+}
+
+# The /status denominator: the always-run sizing probe plus everything CASES
+# selected, less the technique-B cases a failed canary takes off the table.
+compute_total_cases() {
+  local total=$((1 + ${#SELECTED_CASES[@]}))
+  if [ "$CANARY_OK" != "1" ]; then
+    if case_selected technique_b; then total=$((total - 1)); fi
+    if case_selected diurnal_technique_b; then total=$((total - 1)); fi
+  fi
+  printf '%s\n' "$total"
+}
+
+# True when the figure step has something to render.
+any_matrix_case_selected() {
+  local name
+  for name in online_only offline_only naive technique_a technique_b; do
+    if case_selected "$name"; then return 0; fi
+  done
+  return 1
+}
+
+# --------------------------------------------------------------------------
 # Preflight
 # --------------------------------------------------------------------------
 preflight() {
+  # First, before anything else can cost time: a bad CASES must fail in
+  # seconds, not after the canary and a multi-GB weight download.
+  parse_cases "$CASES"
+
   log "run dir: ${RUN_DIR}"
   [ -n "$VLLM_BIN" ] || die "no 'vllm' on PATH; set VLLM_BIN. This script must run inside the engine image."
   [ -x "$VLLM_BIN" ] || die "VLLM_BIN=${VLLM_BIN} is not executable"
@@ -470,6 +581,22 @@ PY
 }
 
 # --------------------------------------------------------------------------
+# Test seam
+# --------------------------------------------------------------------------
+# `TIDAL_EVAL_SOURCE_ONLY=1 . run_gpu_eval.sh` stops here with every function
+# defined and nothing executed, so tests/unit/test_run_gpu_eval_cases.py can
+# call parse_cases / compute_total_cases directly instead of re-implementing
+# the selector in the test and asserting against a copy. Unset (the only way it
+# is ever run for real) this block does nothing.
+if [ "${TIDAL_EVAL_SOURCE_ONLY:-0}" = "1" ]; then
+  # `return` when sourced; `exit` if someone sets the variable while executing
+  # the script normally, where a top-level `return` is an error. shellcheck
+  # cannot see the sourced case, so the fallback looks unreachable to it.
+  # shellcheck disable=SC2317
+  return 0 2>/dev/null || exit 0
+fi
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 progress "booting"
@@ -478,12 +605,10 @@ preflight
 # take half an hour, and an operator watching /status wants the verdict early.
 run_compat_canary
 
-# Denominator for /status. 1 probe + 5 matrix + 2 diurnal + 2 deadline = 10,
-# less the two technique_b cases a failed canary takes off the table.
-TOTAL_CASES=10
-if [ "$CANARY_OK" != "1" ]; then
-  TOTAL_CASES=8
-fi
+# Denominator for /status. The always-run probe plus whatever CASES selected
+# (by default 5 matrix + 2 diurnal + 2 deadline = 10 in total), less the two
+# technique_b cases a failed canary takes off the table.
+TOTAL_CASES="$(compute_total_cases)"
 progress "total ${TOTAL_CASES}"
 
 prewarm_weights
@@ -526,6 +651,10 @@ log "deadline pair: ${DEADLINE_ITEMS} items, window ${DEADLINE_WINDOW_HOURS} h"
 # Identical flags across conditions; the condition name is the only variable.
 # Same seed everywhere, so every arm sees the same arrival trace.
 for condition in online_only offline_only naive technique_a technique_b; do
+  if ! case_selected "$condition"; then
+    log "SKIP ${condition} (not in CASES)"
+    continue
+  fi
   if [ "$condition" = "technique_b" ] && [ "$CANARY_OK" != "1" ]; then
     log "SKIP technique_b — the compat canary failed; the plugin's numbers would be meaningless"
     SKIPPED_CASES+=("technique_b(canary)")
@@ -548,6 +677,10 @@ done
 # The tide-filling claim: batch completions should anti-correlate with online
 # arrivals. Run both placements so the correlation can be compared.
 for condition in technique_a technique_b; do
+  if ! case_selected "diurnal_${condition}"; then
+    log "SKIP diurnal_${condition} (not in CASES)"
+    continue
+  fi
   if [ "$condition" = "technique_b" ] && [ "$CANARY_OK" != "1" ]; then
     SKIPPED_CASES+=("diurnal_technique_b(canary)")
     continue
@@ -588,25 +721,40 @@ DEADLINE_COMMON=(
   --seed "$SEED"
 )
 
-run_case "deadline_control" "${DEADLINE_DIR}/deadline_control.json" \
-  "TIDAL_COMPLETION_WINDOW_HOURS=${DEADLINE_WINDOW_HOURS};TIDAL_ESCALATION_HORIZON_S=1;TIDAL_FLOOR_URGENCY=2.0;TIDAL_ADMISSION_FEASIBILITY_MARGIN=0" \
-  "${DEADLINE_COMMON[@]}"
+if case_selected deadline_control; then
+  run_case "deadline_control" "${DEADLINE_DIR}/deadline_control.json" \
+    "TIDAL_COMPLETION_WINDOW_HOURS=${DEADLINE_WINDOW_HOURS};TIDAL_ESCALATION_HORIZON_S=1;TIDAL_FLOOR_URGENCY=2.0;TIDAL_ADMISSION_FEASIBILITY_MARGIN=0" \
+    "${DEADLINE_COMMON[@]}"
+else
+  log "SKIP deadline_control (not in CASES)"
+fi
 
-run_case "deadline_laxity" "${DEADLINE_DIR}/deadline_laxity.json" \
-  "TIDAL_COMPLETION_WINDOW_HOURS=${DEADLINE_WINDOW_HOURS};TIDAL_ESCALATION_HORIZON_S=600;TIDAL_FLOOR_URGENCY=0.9;TIDAL_ADMISSION_FEASIBILITY_MARGIN=0" \
-  "${DEADLINE_COMMON[@]}"
+if case_selected deadline_laxity; then
+  run_case "deadline_laxity" "${DEADLINE_DIR}/deadline_laxity.json" \
+    "TIDAL_COMPLETION_WINDOW_HOURS=${DEADLINE_WINDOW_HOURS};TIDAL_ESCALATION_HORIZON_S=600;TIDAL_FLOOR_URGENCY=0.9;TIDAL_ADMISSION_FEASIBILITY_MARGIN=0" \
+    "${DEADLINE_COMMON[@]}"
+else
+  log "SKIP deadline_laxity (not in CASES)"
+fi
 
 # -- 4. figures ------------------------------------------------------------
 # Only the matrix directory: plots.load_results keys by the payload's
 # `condition`, so the diurnal and deadline runs (all technique_a/technique_b)
 # would collide with the matrix arms if they shared a directory.
 progress "rendering"
-log "rendering figures"
-if ! "$PYTHON_BIN" -m tidal.eval.plots render \
-      --results-dir "$MATRIX_DIR" \
-      --out-dir "${MATRIX_DIR}/figures" >"${LOG_DIR}/plots.log" 2>&1; then
-  log "WARNING: figure rendering failed; see logs/plots.log"
-  FAILED_CASES+=("plots")
+if any_matrix_case_selected; then
+  log "rendering figures"
+  if ! "$PYTHON_BIN" -m tidal.eval.plots render \
+        --results-dir "$MATRIX_DIR" \
+        --out-dir "${MATRIX_DIR}/figures" >"${LOG_DIR}/plots.log" 2>&1; then
+    log "WARNING: figure rendering failed; see logs/plots.log"
+    FAILED_CASES+=("plots")
+  fi
+else
+  # Nothing in this invocation wrote to matrix/, so there is nothing new to
+  # draw, and a render over an empty directory would only manufacture a
+  # failure for a run that did exactly what it was asked to.
+  log "skipping figures — CASES selected no matrix case"
 fi
 
 # -- 5. manifest + tarball -------------------------------------------------
@@ -624,6 +772,8 @@ fi
   echo "engine_args:       ${HARNESS_ENGINE_ARGS[*]}"
   echo "tensor_parallel:   ${TENSOR_PARALLEL_SIZE}"
   echo "max_model_len:     ${MAX_MODEL_LEN}"
+  echo "cases:             ${SELECTED_CASES[*]}"
+  echo "cases_env:         ${CASES}"
   echo "canary:            ${CANARY_NOTE}"
   echo "items_per_s_probe: ${ITEMS_PER_S}"
   echo "batch_items:       ${BATCH_ITEMS}"
