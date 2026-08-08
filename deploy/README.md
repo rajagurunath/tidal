@@ -42,6 +42,8 @@ engine on the same GPU makes every latency number meaningless.
 | `Dockerfile.engine` | vLLM GPU image + Tidal. `BUILD_MODE=fast` (default) or `pinned`. |
 | `engine-entrypoint.sh` | `MODE=selfdrive` → the supervisor; `MODE=serve` → a `vllm serve` command line. Defaults to selfdrive when `CAAS=1`. |
 | `caas-payload.template.json` | io.net CaaS deploy payload for the self-driving eval, `${PLACEHOLDER}` form. |
+| `hire_and_run.sh` | The **marketplace** path: rent a GPU you do not own, run the eval on it, fetch the results, destroy the rental. See below. |
+| `test_hire_and_run_mock.sh` | End-to-end test of `hire_and_run.sh` against an inline stub of the CaaS API. No GPU, no network, no money. |
 | `run_gpu_eval.sh` | The evaluation itself: canary → probe → 5-condition matrix → diurnal → deadline pair → figures → tarball. Emits `PROGRESS` lines for the supervisor. |
 | `../src/tidal/eval/selfdrive.py` | The supervisor: runs the script, serves `/status`, `/log`, `/results*`, `/abort`. |
 | `docker-compose.gpu.yml` | The *serving* topology (engine + gateway) for a dev box. Not used by the eval. |
@@ -601,7 +603,7 @@ Two constraints remain, both benign because the kit already routes around them:
 | Constraint | Where | Why it is left alone |
 |---|---|---|
 | `DEFAULT_VLLM_BIN` is an absolute Mac path | `harness.py` | `run_gpu_eval.sh` passes `--vllm-bin "$(command -v vllm)"`. |
-| `OnlineLoadGen.run()` uses httpx's default 100-connection pool | `eval/loadgen.py` | Only bites if online concurrency exceeds 100 — at `ONLINE_RPS=20` that needs p99 above ~5 s. Watch for it in the `naive` arm, where a flooded engine is the point; if online p99 flattens suspiciously near a fixed value, this is the first suspect. |
+| `OnlineLoadGen.run()` pool cap was removed in 87174ce (unbounded connections) | `eval/loadgen.py` | Only bites if online concurrency exceeds 100 — at `ONLINE_RPS=20` that needs p99 above ~5 s. Watch for it in the `naive` arm, where a flooded engine is the point; if online p99 flattens suspiciously near a fixed value, this is the first suspect. |
 
 Also worth stating plainly: the technique-B numbers are only trustworthy if the
 capability probe came up clean and the compat canary is green — which is now
