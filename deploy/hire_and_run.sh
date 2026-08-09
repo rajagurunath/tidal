@@ -425,20 +425,15 @@ CMD_PARTS+=("set -euo pipefail")
 CMD_PARTS+=("mkdir -p /results")
 CMD_PARTS+=("export MODE=selfdrive CAAS=1 REPO_DIR=/opt/tidal EVAL_SCRIPT=/opt/tidal/deploy/run_gpu_eval.sh RESULTS_DIR=/results TIDAL_EVAL_VLLM_BIN=vllm PORT=8000 PYTHONPATH=/opt/tidal/src PYTHONUNBUFFERED=1")
 CMD_PARTS+=("export MODEL=${MODEL} TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN} ONLINE_RPS=${ONLINE_RPS} MINUTES=${MINUTES} CASES=${CASES} WARMUP_S=${WARMUP_S} BATCH_CONCURRENCY=${BATCH_CONCURRENCY} RUN_CANARY=${RUN_CANARY}")
-# git is not guaranteed in a stock vllm image, and both the pip install and the
-# asset checkout need it.
-CMD_PARTS+=("( command -v git >/dev/null 2>&1 || ( apt-get update -qq && apt-get install -y -qq --no-install-recommends git ) )")
-CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do pip install -q --no-cache-dir git+${TIDAL_REPO_URL}.git@${TIDAL_SHA} && exit 0; sleep \$(( i * 15 )); done; exit 1 )")
-# The eval extras (matplotlib, openai) are a separate line rather than a
-# [eval] marker so the install URL above stays quote-free.
-CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do pip install -q --no-cache-dir matplotlib openai && exit 0; sleep \$(( i * 15 )); done; exit 1 )")
-# The pip install gives us the importable package; the clone gives us the
-# script assets (run_gpu_eval.sh and friends) that live outside the wheel.
-CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do git clone --depth 1 ${TIDAL_REPO_URL} /opt/tidal && exit 0; rm -rf /opt/tidal; sleep \$(( i * 15 )); done; exit 1 )")
+# git and apt are BOTH unreliable in marketplace containers (live autopsy:
+# apt-get exit 100 crash-looped a node for 45 min). Nothing here needs either:
+# pip installs straight from the GitHub tarball of the pinned SHA, and the
+# script assets come from the same tarball via python stdlib + tar.
+CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do pip install -q --no-cache-dir ${TIDAL_REPO_URL}/archive/${TIDAL_SHA}.tar.gz && break; if [ \$i -eq ${INSTALL_RETRIES} ]; then exit 1; fi; sleep \$(( i * 15 )); done )")
+CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do pip install -q --no-cache-dir matplotlib openai && break; if [ \$i -eq ${INSTALL_RETRIES} ]; then exit 1; fi; sleep \$(( i * 15 )); done )")
+CMD_PARTS+=("( for i in \$(seq 1 ${INSTALL_RETRIES}); do python3 -c \"import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])\" ${TIDAL_REPO_URL}/archive/${TIDAL_SHA}.tar.gz /tmp/tidal.tar.gz && break; if [ \$i -eq ${INSTALL_RETRIES} ]; then exit 1; fi; sleep \$(( i * 15 )); done )")
+CMD_PARTS+=("mkdir -p /opt && tar -xzf /tmp/tidal.tar.gz -C /opt && mv /opt/tidal-${TIDAL_SHA} /opt/tidal")
 CMD_PARTS+=("cd /opt/tidal")
-# --depth 1 only fetches the default branch tip, so an arbitrary SHA needs a
-# targeted fetch before it can be checked out.
-CMD_PARTS+=("( git checkout ${TIDAL_SHA} || ( git fetch --depth 1 origin ${TIDAL_SHA} && git checkout FETCH_HEAD ) )")
 CMD_PARTS+=("chmod +x /opt/tidal/deploy/run_gpu_eval.sh")
 CMD_PARTS+=("exec python3 -m tidal.eval.selfdrive")
 
