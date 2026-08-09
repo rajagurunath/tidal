@@ -32,10 +32,14 @@ cross-node (no paired within-node baseline exists) — labeled as such.
 | technique_a | 0.886s | 1.927s | 1.18× / 1.23× (cross-node) | 1408 | **69.3%** of steady-state ceiling |
 | technique_a (diurnal, 20-min) | 0.85s | 1.90s | ~1.13×/1.21× (cross-node) | 1607 | **78.1%** of steady-state ceiling |
 
-Diurnal detail (n=14498 online, 0 errors): the flat-load vs diurnal harvest
-difference (1408 vs 1607 otok/s) partly reflects the diurnal pool's longer
-completions (54.8 vs 44.0 mean tokens); on total tokens/s the diurnal run is
-at 100.2% of the whole-burst probe. corr(online/min, batch/min) = **−0.85**
+Diurnal detail (n=14498 online, 0 errors): mean offered load is 12.1 req/s
+(14498/1200s) vs the flat arm's 20 — the rows are different regimes, not a
+dose-response. CORRECTION (2026-08-09, v2 figure audit): the earlier
+"longer diurnal completions (54.8 vs 44.0)" explanation conflated the flat
+matrix pool with the probe pool; recomputed from completion records the
+means are nearly identical (diurnal 56.0 vs flat 54.8), so offered load is
+the honest explanation. On total tokens/s the diurnal run is at 100.2% of
+the whole-burst probe. corr(online/min, batch/min) = **−0.85**
 once the first-minute pipeline-fill bin is excluded (the raw −0.38 is a
 startup artifact: minute 0 completes 771 items vs 1667–1894 thereafter) —
 i.e., the GPU tide AGREES with the CPU tide (−0.95). Load-split with the
