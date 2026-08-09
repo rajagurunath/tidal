@@ -14,7 +14,7 @@ import logging
 import httpx
 import openai
 import pytest
-from fakes import FakeRepository
+from tests.unit.fakes import FakeRepository
 from openai import AsyncOpenAI
 
 from tidal.api.app import create_app
