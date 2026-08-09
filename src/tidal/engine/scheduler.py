@@ -195,6 +195,7 @@ class TidalScheduler(_UpstreamScheduler):  # type: ignore[misc,valid-type]
         #: Waiting batch requests hidden from the current ``super().schedule()``,
         #: as ``(queue_they_came_from, request)``. Always empty between steps.
         self._tidal_held: list[tuple[RequestQueue, Request]] = []
+        self._preempt_takes_drop_stale: bool | None = None
         self._tidal_step = 0
         self._last_schedule_ts: float | None = None
         #: ``(P, C)`` of the step whose latency the next tick will measure.
@@ -404,11 +405,22 @@ class TidalScheduler(_UpstreamScheduler):  # type: ignore[misc,valid-type]
             removed = True
             # Upstream contract: pop from `running` outside, then call this. It
             # frees blocks, resets num_computed_tokens and prepends to `waiting`.
-            self._preempt_request(
-                victim,
-                time.monotonic(),
-                drop_stale_output=bool(getattr(self, "requires_kv_delivery", False)),
-            )
+            # Release builds (<= v0.26.0) predate the drop_stale_output kwarg;
+            # probe the signature once and call whichever shape this vLLM has.
+            if self._preempt_takes_drop_stale is None:
+                import inspect
+
+                self._preempt_takes_drop_stale = (
+                    "drop_stale_output" in inspect.signature(self._preempt_request).parameters
+                )
+            if self._preempt_takes_drop_stale:
+                self._preempt_request(
+                    victim,
+                    time.monotonic(),
+                    drop_stale_output=bool(getattr(self, "requires_kv_delivery", False)),
+                )
+            else:
+                self._preempt_request(victim, time.monotonic())
         except Exception:
             if removed:
                 self.running.append(victim)
