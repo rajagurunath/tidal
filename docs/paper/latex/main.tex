@@ -672,6 +672,17 @@ CPU experiment proves. Implementation: \code{fleet.py} placement (sticky prefix 
 $+$ least-loaded $+$ headroom filter), per-replica AIMD with replica-local circuits, 95 new
 tests (424 total), production-wired behind \code{TIDAL\_VLLM\_REPLICAS}.
 
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.88\linewidth]{figures/fleet_antiphase.png}
+\caption{\textbf{A-F mechanism, per replica.} Measured batch completions (bars) against
+each replica's own analytic online arrival rate (line; the seeded diurnal schedules,
+phases $0$ and $\pi$). Batch volume splits almost evenly across the replicas
+(1239\,/\,1255) but is \emph{timed} into each replica's trough --- correlation $-0.83$
+and $-0.56$. Raw data: \code{results/fleet\_a.json} in the repository.}
+\label{fig:fleet-antiphase}
+\end{figure}
+
 \begin{table}[!htbp]
 \centering
 \small
