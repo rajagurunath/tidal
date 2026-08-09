@@ -138,14 +138,13 @@ from the engine's own step timings. Neither placement forks the engine.
   \item \textbf{The measured price of the no-fork placement at GPU scale}
     (\cref{sec:gpu}): 69.3\% of a same-node steady-state offline ceiling at
     $1.18\times$/$1.23\times$ online p50/p99 under flat load, 78.1\% under a diurnal
-    trace at lower mean offered load --- inside the 78--88\% band the fork-based
+    trace at 12.1\,req/s mean offered load --- inside the 78--88\% band the fork-based
     literature reports, over an engine we never modified.
   \item \textbf{Placement as an empirical design axis} (\cref{sec:placement}): the same
     policy outside versus inside the engine on identical traces is a throughput/latency
     \emph{frontier}, not a ranking --- at capacity on the CPU testbed the gateway holds
     online p99 to $1.97\times$ where the in-engine scheduler reaches $9.9\times$ while
-    harvesting 26 more points of ceiling (at equal work the ratios are $1.76\times$ vs
-    $8.25\times$); the one GPU point shows the frontier moves with hardware (the
+    harvesting 26 more points of ceiling; the one GPU point shows the frontier moves with hardware (the
     $2.54\times$ CPU median tax is $1.18\times$ on the A6000).
   \item \textbf{An audited measurement discipline for co-serving harvest}
     (\cref{sec:ceiling}): normalize to a \emph{steady-state-tail} offline denominator,
@@ -297,9 +296,9 @@ entirely (offline mode: fill $\tau$). A KV guardband (EWMA of online demand, cla
 5--30\%) stops batch admission before online bursts can starve, and proactive eviction
 picks the batch victim with the least non-prefix-cached work. Enforcement is at chunk
 granularity --- we bound which requests the stock scheduler sees, not its inner token
-loop --- which is what keeps the wrapper robust to upstream drift (it survived a
-1{,}682-commit jump during development; porting to release v0.26.0 required one keyword
-argument) at the interference cost \cref{sec:placement} quantifies. Per-iteration
+loop --- which is what keeps the wrapper robust to upstream drift (it survived an
+upstream jump of roughly 1{,}700 commits during development; porting to release v0.26.0
+required one keyword argument) at the interference cost \cref{sec:placement} quantifies. Per-iteration
 overhead: one closed-form cap solve and two list partitions; the least-squares refit is
 periodic and off the step path.
 
@@ -390,7 +389,7 @@ metric & total request latency & total request latency (non-streaming) \\
 
 \Cref{tab:testbeds} fixes both rigs. Requests are short chat completions; we measure
 total non-streaming request latency (on these configurations a request is a short prefill
-plus a short decode; a TTFT/TPOT split is the top harness roadmap item).
+plus a short decode; a TTFT/TPOT split is not measured here).
 
 \paragraph{Defining the ceiling.} Every ``\% of ceiling'' below divides by the same
 node's \emph{dedicated-offline} rate --- and how that denominator is measured decides the
@@ -432,7 +431,7 @@ ConServe   & --- & --- & \checkmark & fork ($\sim$9.2k LOC) & 1 / 78--88\%$^{*}$
 BlendServe & window only & --- & --- & modified backend & 1 / 86.6--90.8\% of $T_o$ \\
 Niyama     & per-request (s--min) & degrades & QoS classes & fork & 1 / --- \\
 \textbf{Tidal} & \textbf{24\,h, per job} & \textbf{refuses} & \checkmark &
-  \textbf{none (plugin/sidecar)} & \textbf{2} / 69.3--78.1\%$^{\dagger}$ \\
+  \textbf{none (plugin/sidecar)} & \textbf{2} / 69.3\%; 78.1\%$^{\dagger}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -490,8 +489,8 @@ items against 1667--1894 in every later minute; including it drags the correlati
 $-0.38$, a startup artifact). The GPU tide is in \emph{phase} with the CPU tide
 ($-0.85$ vs $-0.95$; \cref{fig:tides}) but much shallower: batch completions split
 $-6.4\%$ between above- and below-mean-load minutes on GPU against $-22\%$ on CPU ---
-consistent with the GPU having more absolute headroom at 78\% of its ceiling than the CPU
-box had at 45\%.
+consistent with the GPU having more absolute headroom at the diurnal run's 78.1\%
+ceiling point (12.1\,req/s mean offered load) than the CPU box had at 45\%.
 
 \begin{figure}[t]
 \centering
@@ -565,10 +564,11 @@ never bind here: peak KV usage stayed below 0.5\%, so eviction never fired, and 
 resident batch request decodes every iteration regardless of the admission cap. The
 binding channel is \emph{resident-decode contention}, and only sub-iteration
 participation control --- precisely ConServe's layer-wise mechanism, which our
-no-fork constraint excludes --- could bound it. Technique A holds latency
-($1.76\times$ vs $8.25\times$ p99 at equal work) because its control point --- how many
-batch requests exist at all --- is upstream of residency; technique B converts that
-residency into 26 more points of ceiling instead (71.2\% vs 45.1\%). Placement is a
+no-fork constraint excludes --- could bound it. Technique A holds latency in both
+regimes ($1.76\times$ vs $8.25\times$ p99 at equal work; $1.97\times$ vs $9.9\times$ at
+capacity) because its control point --- how many batch requests exist at all --- is
+upstream of residency. In the capacity regime, technique B converts that residency into
+26 more points of ceiling (71.2\% vs 45.1\%). Placement is a
 frontier (\cref{fig:frontier}): the gateway buys latency protection with throughput, the
 in-engine scheduler the reverse. The comparison is of two placements of \emph{one
 policy}, not of two systems --- and the GPU crossover remains unmeasured because the
@@ -677,9 +677,9 @@ offline metric is aggregate tokens per second, its \code{s} knob is an operator 
 nothing is ever refused. Tidal's contribution sits there (per-job windows, admission
 refusal, horizon-scaled escalation, a floor with laxity feedback). Second, ConServe is a
 $\sim$9.2k-LOC fork including in-model instrumentation; both our placements are
-unforked, and we treat that as a measured cost/benefit --- our wrapper survived a
-1,682-commit upstream jump at the price of chunk-granular enforcement, which is one side
-of our placement frontier. Third, ConServe evaluates one placement; we compare two.
+unforked, and we treat that as a measured cost/benefit --- our wrapper survived an
+upstream jump of roughly 1{,}700 commits at the price of chunk-granular enforcement,
+which is one side of our placement frontier. Third, ConServe evaluates one placement; we compare two.
 HyGen~\citep{hygen} shares ConServe's shape (profiled budget, prefix-aware offline
 order, starvation tempering) and the same three differences.
 OOCO~\citep{ooco} and Echo~\citep{echo} are contemporaneous co-scheduling work, also
@@ -733,9 +733,9 @@ implements its contract --- admission, escalation, floor --- over an unmodified
 open-source engine with classical real-time machinery, prices the no-fork placement at
 GPU scale, and is explicit about what remains undemonstrated. We offer it as usable
 infrastructure, a baseline for deadline-contracted serving, and a placement study whose
-GPU evidence currently covers the gateway but not the in-engine scheduler. The next
-steps are specific: the GPU placement matrix our harness defect blocked, and a load
-regime that discriminates escalation end-to-end.
+GPU evidence currently covers the gateway but not the in-engine scheduler. What is not
+measured here is equally specific: the in-engine GPU matrix, blocked by our harness
+defect, and a load regime that discriminates escalation end-to-end.
 
 \FloatBarrier
 \appendix
