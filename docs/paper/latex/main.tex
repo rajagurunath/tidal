@@ -65,8 +65,9 @@ binding interference channel (resident-decode contention) sits below the reach o
 admission-time control --- while the in-engine scheduler harvests 71\% of the offline
 throughput ceiling versus the gateway's 45\%, making placement a throughput/latency
 frontier rather than a ranking. A subsequent GPU validation (RTX A6000, Qwen2.5-7B, rented
-on the io.net marketplace) finds the gateway harvesting \textbf{69--78\% of the same node's
-steady-state offline ceiling at $1.18$--$1.23\times$ online latency (cross-node)}, with
+on the io.net marketplace) finds the gateway harvesting \textbf{69.3\% of the same node's
+steady-state offline ceiling at $1.18\times$/$1.23\times$ online p50/p99 under flat load,
+and 78.1\% at ${\sim}1.13\times$/$1.21\times$ under a diurnal trace (latency ratios cross-node)}, with
 per-minute batch completions anti-correlating with online load at $r = -0.85$ --- the same
 tide-filling the CPU testbed shows at $-0.95$. Those GPU figures are post-correction: an
 independent numerical audit rejected our first ceiling (a probe average that co-serving
@@ -163,9 +164,9 @@ Contributions:
   \item \textbf{The placement comparison}: the same policy externally vs in-engine on
     identical traces, revealing a throughput/latency frontier and an inversion the
     fork-based literature --- which evaluates only its own placement --- has not reported.
-    On rented A6000 GPUs the gateway then harvests 69--78\% of the same node's
-    \emph{steady-state} dedicated-offline ceiling at $1.18$--$1.23\times$ online latency
-    (cross-node): the median co-location tax that costs $2.54\times$ on the CPU box costs
+    On rented A6000 GPUs the gateway then harvests 69.3\% (flat load, at
+    $1.18\times$/$1.23\times$ online p50/p99) to 78.1\% (diurnal, at ${\sim}1.13\times$/$1.21\times$)
+    of the same node's \emph{steady-state} dedicated-offline ceiling (latency ratios cross-node): the median co-location tax that costs $2.54\times$ on the CPU box costs
     $1.18\times$ there, while the harvest itself lands in the band the co-location
     literature reports.
   \item \textbf{Deployability artifacts}: durable OpenAI-wire API, crash recovery,
