@@ -65,10 +65,14 @@ binding interference channel (resident-decode contention) sits below the reach o
 admission-time control --- while the in-engine scheduler harvests 71\% of the offline
 throughput ceiling versus the gateway's 45\%, making placement a throughput/latency
 frontier rather than a ranking. A subsequent GPU validation (RTX A6000, Qwen2.5-7B, rented
-on the io.net marketplace) finds the gateway harvesting \textbf{98.7\% of the same node's
-dedicated-offline ceiling at $1.18\times$ / $1.23\times$ online p50 / p99}: on
-under-utilized GPUs co-serving approaches free harvest, and the tide effect grows as
-utilization rises. We are explicit about what the testbed cannot show,
+on the io.net marketplace) finds the gateway harvesting \textbf{69--78\% of the same node's
+steady-state offline ceiling at $1.18$--$1.23\times$ online latency (cross-node)}, with
+per-minute batch completions anti-correlating with online load at $r = -0.85$ --- the same
+tide-filling the CPU testbed shows at $-0.95$. Those GPU figures are post-correction: an
+independent numerical audit rejected our first ceiling (a probe average that co-serving
+runs ``exceeded''), and we report the methodology point as a result in its own right,
+since any co-serving figure above 100\% is a tell that the denominator is not a ceiling.
+We are explicit about what the testbed cannot show,
 including that no tested load regime discriminated the escalation machinery end-to-end.
 The implementation, including a client that plans coding work onto batch APIs, is open
 source.
@@ -159,10 +163,11 @@ Contributions:
   \item \textbf{The placement comparison}: the same policy externally vs in-engine on
     identical traces, revealing a throughput/latency frontier and an inversion the
     fork-based literature --- which evaluates only its own placement --- has not reported.
-    On rented A6000 GPUs the gateway then harvests 98.7\% of the same node's
-    dedicated-offline ceiling at $1.18\times$ / $1.23\times$ online p50 / p99 --- on
-    under-utilized GPUs co-serving approaches free harvest, and the tide effect grows as
-    utilization rises.
+    On rented A6000 GPUs the gateway then harvests 69--78\% of the same node's
+    \emph{steady-state} dedicated-offline ceiling at $1.18$--$1.23\times$ online latency
+    (cross-node): the median co-location tax that costs $2.54\times$ on the CPU box costs
+    $1.18\times$ there, while the harvest itself lands in the band the co-location
+    literature reports.
   \item \textbf{Deployability artifacts}: durable OpenAI-wire API, crash recovery,
     idempotent state machines, metering, and a real client --- with the operational
     semantics (\cref{sec:impl}) a paper usually omits and an operator cannot.
@@ -293,8 +298,8 @@ placement result argues sub-iteration control is exactly what technique B lacks.
 \section{Implementation and operational semantics}
 \label{sec:impl}
 
-Tidal is a Python implementation over unmodified upstream vLLM (v0.26 series), with 240$+$
-unit tests and integration tests that drive a live engine; the API layer is wire-verified
+Tidal is a Python implementation over unmodified upstream vLLM (v0.26 series), with 424
+tests, including integration tests that drive a live engine; the API layer is wire-verified
 against the official OpenAI SDK. The operational semantics reviewers should hold us to:
 \textbf{idempotency} --- item claims are single atomic updates; terminal item transitions
 are idempotent, so a duplicate or late result never drifts \code{request\_counts};
@@ -495,28 +500,56 @@ near $t = 600$\,s the held set empties and batch work takes the whole budget ---
 \paragraph{Setup.} io.net dev CaaS marketplace, RTX A6000 48\,GB nodes (3 distinct physical
 nodes across hires), Qwen2.5-7B-Instruct, the \code{vllm/vllm-openai:v0.26.0} image plus
 tidal at a pinned SHA, $\tau = 2048$ default engine config, \code{MAX\_MODEL\_LEN} $= 8192$,
-online 20\,req/s Poisson (seed 7), 6-minute measured windows, warmup 45\,s. Total spend
-\$7.73 (6 hires including one 1-hour extension; every deployment torn down, teardown
-receipts in \code{evidence/*/driver.log}).
+online 20\,req/s Poisson (seed 7), 6-minute measured windows, warmup 45\,s.
 
-\paragraph{Instrument credibility.} Independent offline-ceiling probes on the 3 nodes
-returned 1438.3 / 1426.7 / 1467.6 output tok/s --- a $\pm 1.4\%$ band; cross-node
-comparisons are normalized per-node.
+\paragraph{Spend and teardown provenance.} Total spend $\approx$\,\$7.73: \$6.79 in
+archived price-quote receipts across six hires, plus a one-hour extension ($\approx$\$0.94)
+whose HTTP 200 we observed in-session but did not archive to \code{evidence/}. Teardown
+provenance is uneven and we state it rather than round it off: three of the six hires have
+archived DELETE HTTP 200 receipts; two were expiry-reclaimed or already deleted (the
+driver's DELETE returned 400 resource-not-found); the last was deleted manually, with the
+HTTP 200 seen in-session and a receipt note in \code{evidence/TEARDOWN\_NOTES.md}. A live
+check after close showed zero running deployments. \$1.98 of the spend --- the first two
+hires --- produced no data at all (marketplace node failures), and an honest
+cost-per-datapoint includes it.
+
+\paragraph{Instrument credibility, and a denominator that was not a ceiling.} Our first
+pass normalized batch throughput against each node's offline-probe \emph{whole-burst}
+average: 1438.3 / 1426.7 / 1467.6 output tok/s, a $\pm 1.4\%$ cross-node band. An
+independent numerical audit of these results rejected that denominator, and the tell was
+already in our own table --- the diurnal run ``harvested'' ${\sim}109\%$ of it.
+\textbf{Any co-serving figure above 100\% of a claimed ceiling is evidence that the
+denominator is not a ceiling}, and we record the point as a result because the mistake is
+easy to ship: the probe drains a 600-item pool at concurrency 512 with an 18.5\,s
+makespan, so roughly half of that window is pipeline fill, and its pool skews short
+(44.0 mean output tokens per completion versus 54.8 in the matrix pools). The corrected
+ceiling is the probe's \textbf{steady-state tail} --- output tokens completed in the last
+10\,s of the burst: 2049.6 / 2031.5 / 2057.0 tok/s, a $\pm 0.62\%$ cross-node band, which
+makes it a tighter instrument as well as a correct one. Every ``\% of ceiling'' figure
+below uses it; the whole-burst averages remain in \code{results/gpu\_figures/} for
+traceability, labeled ramp-dominated. Throughput is normalized per node. \textbf{Latency
+ratios, by contrast, are cross-node}: no within-node \code{online\_only} /
+\code{technique\_a} pair exists in the evidence, so we label the ratios as cross-node
+rather than implying a paired comparison.
 
 \begin{table}[!htbp]
 \centering
 \small
-\caption{GPU results (A6000, Qwen2.5-7B, online 20\,req/s Poisson). ``\% of node ceiling''
-is batch output throughput against that node's own independently probed dedicated-offline
-rate; the diurnal row is a 20-minute run with peak 20\,rps.}
+\caption{GPU results (A6000, Qwen2.5-7B, online 20\,req/s Poisson). ``\% of steady-state
+ceiling'' is batch output throughput against that node's own independently probed
+dedicated-offline rate over the last 10\,s of the probe burst (2031.5 and 2057.0\,tok/s
+respectively); the whole-burst probe averages are ramp-dominated and are not used as
+denominators. Latency ratios are cross-node --- no within-node baseline pair exists. The
+diurnal row is a 20-minute run with peak 20\,rps.}
 \label{tab:gpu}
 \begin{tabular}{lccccc}
 \toprule
-condition & online p50 & online p99 & vs baseline & batch otok/s & \% of node ceiling \\
+condition & online p50 & online p99 & vs baseline & batch otok/s & \% of steady-state ceiling \\
+ &  &  & (cross-node) &  &  \\
 \midrule
 online\_only (baseline) & 0.753\,s & 1.570\,s & $1.00\times$ & --- & --- \\
-technique\_a            & 0.886\,s & 1.927\,s & $1.18\times$\,/\,$1.23\times$ & 1408 & \textbf{98.7\%} \\
-technique\_a (diurnal)  & 0.85\,s  & 1.90\,s  & ${\sim}1.13\times$\,/\,$1.21\times$ & 1607 & ${\sim}109\%$ of flat probe$^{*}$ \\
+technique\_a            & 0.886\,s & 1.927\,s & $1.18\times$\,/\,$1.23\times$ & 1408 & \textbf{69.3\%} \\
+technique\_a (diurnal, 20-min)  & 0.85\,s  & 1.90\,s  & ${\sim}1.13\times$\,/\,${\sim}1.21\times$ & 1607 & \textbf{78.1\%} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -526,7 +559,8 @@ technique\_a (diurnal)  & 0.85\,s  & 1.90\,s  & ${\sim}1.13\times$\,/\,$1.21\tim
 \includegraphics[width=0.86\linewidth]{figures/gpu_latency_cdf.png}
 \caption{GPU online request latency, baseline versus technique A (A6000, Qwen2.5-7B,
 20\,req/s Poisson). The co-location tax that cost $2.54\times$ p50 on the CPU testbed is
-$1.18\times$ here.}
+$1.18\times$ here --- a cross-node comparison: the two arms ran on different (but
+$\pm 0.62\%$-matched) A6000 nodes.}
 \label{fig:gpu-cdf}
 \end{figure}
 
@@ -534,26 +568,37 @@ $1.18\times$ here.}
 \centering
 \includegraphics[width=0.80\linewidth]{figures/gpu_throughput.png}
 \caption{Batch output throughput recovered while online traffic is served, as a fraction of
-the same node's independently probed dedicated-offline ceiling: 98.7\%.}
+the same node's independently probed \emph{steady-state} dedicated-offline ceiling
+(last 10\,s of the probe burst): 69.3\% under flat load, 78.1\% under diurnal load.}
 \label{fig:gpu-throughput}
 \end{figure}
 
-\paragraph{Diurnal trace on GPU.} $^{*}$The diurnal run harvested \emph{more} than the
-flat-load run and than its own node probe (1467.6): deeper troughs supply more aggregate
-slack than constant mid-load; also $n = 14498$ online requests served.
-$\mathrm{corr}(\text{online/min}, \text{batch/min}) = -0.38$ --- weaker anti-phase than CPU
-($-0.95$) \emph{because} the GPU is over-provisioned at this load: batch flows near-ceiling
-in both tides (1836 versus 1624 items/min low/high) (\cref{fig:gpu-diurnal}). The claim
-shape this supports: on under-utilized GPUs co-serving approaches free harvest; the tide
-effect grows as utilization rises (the CPU testbed is the high-utilization regime).
+\paragraph{Diurnal trace on GPU.} Over a 20-minute sinusoidal load (peak 20\,req/s,
+$n = 14{,}498$ online requests, zero errors), technique A harvested 1607 output tok/s,
+78.1\% of that node's steady-state ceiling, against 69.3\% for the flat-load run. Part of
+that gap is pool composition rather than tide depth: on \emph{total} tokens per second the
+diurnal run sits at 100.2\% of the whole-burst probe average --- which is precisely the
+coincidence that made the discarded denominator look like a ceiling.
+
+The per-minute anti-correlation is $\mathrm{corr}(\text{online/min}, \text{batch/min}) =
+\mathbf{-0.85}$ \emph{with the first-minute bin excluded}. Minute 0 is pipeline fill: it
+completes 771 batch items against 1667--1894 in every subsequent minute, while online load
+is already climbing toward its first peak, and including it drags the correlation to
+$-0.38$. We reported that $-0.38$ in an earlier draft and explained it as the GPU being
+over-provisioned --- batch flowing near-ceiling in both tides. That explanation does not
+survive the audit and we withdraw it: it was a startup artifact of one bin, and at 78\% of
+steady state there is real headroom being contended for. With the fill bin removed the GPU
+tide agrees with the CPU tide ($-0.95$), and batch completions split 1718/min in
+above-mean-load minutes versus 1836/min in below-mean minutes ($-6.4\%$)
+(\cref{fig:gpu-diurnal}).
 
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.85\linewidth]{figures/gpu_diurnal_tide.png}
 \caption{GPU tide-filling under a sinusoidal online load (technique A, 20-minute window,
-peak 20\,req/s). Anti-correlation is only $r = -0.38$ because batch runs near the node
-ceiling in \emph{both} tides --- the head-room is so large that the trough is barely a
-constraint.}
+peak 20\,req/s). Per-minute batch completions anti-correlate with online arrivals at
+$r = -0.85$ once the first-minute pipeline-fill bin (shaded) is excluded; including that
+bin gives $-0.38$, which is a startup artifact rather than a weak tide.}
 \label{fig:gpu-diurnal}
 \end{figure}
 
@@ -604,8 +649,12 @@ tier separates them in time.''}
 \paragraph{A-F: fleet placement (local experiment).} Two CPU replicas (Mac M4 Pro,
 thread-count isolation \emph{only} --- macOS cannot pin cores, so shared memory bandwidth is
 a named confound), phase-shifted diurnal online load (period 600\,s, phases $0$ and $\pi$),
-20-minute window, seed 7, 4000-item pool identical in both arms;
-\code{placement=fleet} versus \code{placement=pinned} (all batch $\rightarrow$ replica 0).
+20-minute window, seed 7, 4000-item pool identical in both arms. \textbf{This is not the
+GPU setup of \cref{sec:gpu}} and its numbers are not comparable to it: Qwen2.5-0.5B, peak
+1\,req/s, 16-token online completions --- a deliberately small rig whose only job is to
+show the placement mechanism.
+The arms are \code{placement=fleet} versus \code{placement=pinned} (all batch
+$\rightarrow$ replica 0).
 Harvest: fleet 2494 in-window items (32.2\,tok/s) versus pinned 1884 (24.4) $=$
 \textbf{$+32\%$}. The mechanism is visible per replica: $\mathrm{corr}$(a replica's own
 analytic online rate, its batch completions per 2\,min) $=$ \textbf{$-0.83$ (replica 1),
@@ -617,7 +666,7 @@ pinning sacrifices one replica and spares the other). GPU fleets with real isola
 where the latency side resolves; the mechanism claim (placement follows slack) is what the
 CPU experiment proves. Implementation: \code{fleet.py} placement (sticky prefix affinity
 $+$ least-loaded $+$ headroom filter), per-replica AIMD with replica-local circuits, 95 new
-tests (422 total), production-wired behind \code{TIDAL\_VLLM\_REPLICAS}.
+tests (424 total), production-wired behind \code{TIDAL\_VLLM\_REPLICAS}.
 
 \begin{table}[!htbp]
 \centering
@@ -644,11 +693,17 @@ If the batch tier may defer work, it may also
 split a request's \emph{phases} across time. We ran the smallest experiment that could falsify this:
 vLLM CPU build, \code{ExampleConnector} (the renamed \code{SharedStorageConnector} --- the
 only device-agnostic in-tree connector), \code{kv\_role=kv\_both}, prefix caching disabled.
-Prefill in process 1 $\rightarrow$ KV persisted to disk (23\,MB for a 1973-token prompt $=$
-12\,KB/token at 0.5B) $\rightarrow$ process killed $\rightarrow$ a fresh process thaws
+Prefill in process 1 $\rightarrow$ KV persisted to disk (23.6\,MB for a 1973-token prompt:
+only whole 128-token blocks persist, so 1920 cached tokens at exactly 12{,}288\,B/token at
+0.5B) $\rightarrow$ process killed $\rightarrow$ a fresh process thaws
 $\rightarrow$ \textbf{bit-identical greedy decode}, with TTFT 7.277\,s $\rightarrow$
-0.229\,s $=$ \textbf{$31.8\times$} (median of 5). Short prompts (208 tokens) get only
-$1.9\times$ (fixed per-file read costs), putting the crossover at $\approx$1k tokens.
+0.229\,s $=$ \textbf{$31.8\times$} (median of 5). A duplicate arm that thawed from the
+in-engine prefix cache rather than across a process boundary measured $48.2\times$; we
+quote the smaller cross-process number as primary because it is the one that demonstrates
+\emph{durability} --- surviving process death is the property a deadline-deferred prefill
+actually needs. Short prompts (208 tokens) get only $1.9\times$ (just 128 of the 208
+tokens are cached, plus fixed per-file read costs), so the $\approx$1k-token crossover is
+an \emph{interpolation} between two measured points, not a measured crossover.
 Caveats, all of them load-bearing: a debug-grade connector; all-or-nothing
 exact-prompt-hash keying
 (no partial prefix reuse --- that is LMCache~\citep{lmcache} / Mooncake~\citep{mooncake}
@@ -736,7 +791,15 @@ unmeasured. \textbf{Tail metrics flatter co-location}; we report distributions. 
 placement comparison is CPU-only}: \cref{sec:gpu} validates technique A on GPU, but the
 A-vs-B inversion rests entirely on the CPU testbed. \textbf{Median tax}: even technique A
 costs $\sim$2.5$\times$ p50 on the CPU box; co-location is not free and we do not claim it
-is (on GPU the same tax is $1.18\times$). Single
+is (on GPU the same tax is $1.18\times$, cross-node). \textbf{The GPU ceiling is a
+steady-state tail, not a sustained dedicated run}: the \code{offline\_only} arm was lost to
+the harness defect below, so the denominator is a 10\,s window of an 18.5\,s probe burst
+rather than a 6-minute dedicated-offline run at the same window length as the co-serving
+arms --- the right denominator of the two available, still not the one we wanted.
+\textbf{GPU latency ratios are cross-node}: the \code{online\_only} baseline and the
+technique-A run were measured on different physical A6000 nodes; the $\pm 0.62\%$
+steady-state band across nodes suggests they are comparable, but no within-node pair
+exists and we do not claim one. Single
 engine, single model; one dispatcher per store (no lease); submission-time escalation cannot
 re-age already-queued items; step-time attribution is exact on the CPU build and approximate
 under GPU async scheduling; \code{scheduler\_cls} is not a stable interface (technique B pins
@@ -755,7 +818,12 @@ CPU-only result and the GPU column of the placement comparison is empty. (4) \te
 metrics evidence is our own instrumentation, not a production observability stack}:
 Grafana per-deployment dashboards do not exist on the dev cluster (Prometheus is behind a
 VPN), so what we archive is the harness's own 1\,Hz scrapes plus archived CaaS API
-responses and engine logs (all under \code{evidence/}).
+responses and engine logs (all under \code{evidence/}). (5) \textbf{Two analysis defects,
+found by an independent numerical audit after the first draft, not by us}: a
+ramp-dominated probe average used as a ceiling, and a pipeline-fill bin left inside a
+correlation. Both are corrected in \cref{sec:gpu} and in
+\code{scripts/gpu\_analysis.py}; both had a visible tell (a $>$100\% harvest, a first bin
+completing 771 items against 1667--1894) that we did not act on.
 
 \section{Conclusion}
 
