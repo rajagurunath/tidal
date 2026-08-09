@@ -104,7 +104,10 @@ PROBE_ITEMS="${PROBE_ITEMS:-600}"
 # guarantees the pool never drains, which is what makes batch throughput a
 # measurement of the scheduler rather than of the pool size. The harness prints
 # a NOTE when a pool drains; that NOTE means raise this.
-POOL_SAFETY="${POOL_SAFETY:-2.0}"
+POOL_SAFETY="${POOL_SAFETY:-1.15}"
+# 1.15x: never drains inside the window (probe error margin), while keeping the
+# post-window drain of direct-submission arms under a minute — a 2.0x pool live-
+# wedged offline_only for 80+ min (23k in-flight futures vs a 6-min window).
 MIN_BATCH_ITEMS="${MIN_BATCH_ITEMS:-500}"
 
 # Diurnal: two cycles inside the window (loadgen's default period), peak = ONLINE_RPS.
@@ -121,7 +124,7 @@ DEADLINE_TIGHTNESS="${DEADLINE_TIGHTNESS:-0.55}"
 DEADLINE_WINDOW_SLACK="${DEADLINE_WINDOW_SLACK:-1.15}"
 
 # Hard cap per case, so a wedged engine cannot hang an overnight run.
-CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-5400}"
+CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-$(( MINUTES * 60 + ${DRAIN_TIMEOUT_S:-900} + 900 ))}"
 
 # --------------------------------------------------------------------------
 # Case selector
