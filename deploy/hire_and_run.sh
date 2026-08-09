@@ -340,9 +340,7 @@ def n($v): ($v | tostring | tonumber?) // null;
     eligible: ($elig | length),
     with_vram: ($elig | map(select(.vram != null)) | length),
     too_small: ([ $elig[] | select(.vram != null and .vram < $minvram) ] | length),
-    choice: (if ($big | length) > 0 then $big[0]
-             elif ($unknown | length) > 0 then $unknown[0]
-             else null end)
+    candidates: (($big + $unknown)[0:6])
   }
 '
 
@@ -355,36 +353,43 @@ jq --arg prefer "$PREFER" \
 
 ELIGIBLE="$(jq -r '.eligible' "$HW_PICK")"
 TOO_SMALL="$(jq -r '.too_small' "$HW_PICK")"
-if [ "$(jq -r '.choice == null' "$HW_PICK")" = "true" ]; then
+if [ "$(jq -r '.candidates | length' "$HW_PICK")" = "0" ]; then
   log "catalogue rows: $(jq '[ .. | objects | select(has("hardware_id"))] | length' "$HW_RAW")"
   log "eligible after availability+PREFER+budget filters: ${ELIGIBLE} (of which ${TOO_SMALL} were under ${MIN_VRAM_GB}GB VRAM)"
   die 2 "no hardware matches PREFER='${PREFER}' with available>0 and ${INITIAL_HOURS}h under \$${SPEND_CAP}. Widen PREFER, raise BUDGET_USD, or lower INITIAL_HOURS. Catalogue saved to ${HW_RAW}."
 fi
 
-HW_ID_JSON="$(jq -c '.choice.hardware_id_raw' "$HW_PICK")"
-HW_ID="$(jq -r '.choice.id' "$HW_PICK")"
-HW_NAME="$(jq -r '.choice.name' "$HW_PICK")"
-HW_PRICE="$(jq -r '.choice.price' "$HW_PICK")"
-HW_VRAM="$(jq -r '.choice.vram // "unknown"' "$HW_PICK")"
-HW_LOC="$(jq -r '.choice.location' "$HW_PICK")"
-HW_COST="$(awk -v p="$HW_PRICE" -v h="$INITIAL_HOURS" 'BEGIN{printf "%.2f", p*h}')"
-
-log "chose hardware_id=${HW_ID} name='${HW_NAME}' price=\$${HW_PRICE}/hr vram=${HW_VRAM}GB location='${HW_LOC}'"
-log "  ${INITIAL_HOURS}h at that rate = \$${HW_COST} (cap \$${SPEND_CAP}, ${ELIGIBLE} eligible rows)"
-
-# --------------------------------------------------------------------------
-# Step 2 — Price it before hiring it
-# --------------------------------------------------------------------------
+# The /price endpoint wants location_ids as a JSON list (e.g. ["US"]) and
+# only knows marketplace SKUs — numeric fleet ids 422 with "No hardware
+# found". So: walk the ranked candidates and take the first that prices.
+LOCATION_IDS_JSON="$(printf '%s' "$LOCATION_IDS" | jq -R -c 'split(",") | map(select(length>0))')"
+N_CAND="$(jq -r '.candidates | length' "$HW_PICK")"
 PRICE_RAW="${EVIDENCE_DIR}/price.json"
-log "GET /price"
-PRICE_CODE="$(api GET "/price" "$PRICE_RAW" \
-  -G \
-  --data-urlencode "location_ids=${LOCATION_IDS}" \
-  --data-urlencode "hardware_id=${HW_ID}" \
-  --data-urlencode "duration_hours=${INITIAL_HOURS}" \
-  --data-urlencode "gpus_per_container=1" \
-  --data-urlencode "replica_count=1")"
-guard "$PRICE_CODE" "$PRICE_RAW" "GET /price" 2
+CHOSEN=""
+for i in $(seq 0 $((N_CAND - 1))); do
+  HW_ID_JSON="$(jq -c ".candidates[$i].hardware_id_raw" "$HW_PICK")"
+  HW_ID="$(jq -r ".candidates[$i].id" "$HW_PICK")"
+  HW_NAME="$(jq -r ".candidates[$i].name" "$HW_PICK")"
+  HW_PRICE="$(jq -r ".candidates[$i].price" "$HW_PICK")"
+  HW_VRAM="$(jq -r ".candidates[$i].vram // \"unknown\"" "$HW_PICK")"
+  HW_LOC="$(jq -r ".candidates[$i].location" "$HW_PICK")"
+  HW_COST="$(awk -v p="$HW_PRICE" -v h="$INITIAL_HOURS" 'BEGIN{printf "%.2f", p*h}')"
+  log "candidate $((i+1))/${N_CAND}: hardware_id=${HW_ID} name='${HW_NAME}' \$${HW_PRICE}/hr vram=${HW_VRAM}GB (${INITIAL_HOURS}h = \$${HW_COST})"
+  log "GET /price"
+  PRICE_CODE="$(api GET "/price" "$PRICE_RAW" \
+    -G \
+    --data-urlencode "location_ids=${LOCATION_IDS_JSON}" \
+    --data-urlencode "hardware_id=${HW_ID}" \
+    --data-urlencode "duration_hours=${INITIAL_HOURS}" \
+    --data-urlencode "gpus_per_container=1" \
+    --data-urlencode "replica_count=1")"
+  if [ "$PRICE_CODE" = "200" ]; then CHOSEN="yes"; break; fi
+  log "  /price HTTP ${PRICE_CODE}: $(head -c 160 "$PRICE_RAW" | tr -d '\n') — trying next candidate"
+done
+if [ -z "$CHOSEN" ]; then
+  die 2 "none of the ${N_CAND} candidates priced successfully; last response in ${PRICE_RAW}"
+fi
+log "chose hardware_id=${HW_ID} name='${HW_NAME}' price=\$${HW_PRICE}/hr vram=${HW_VRAM}GB location='${HW_LOC}' (${ELIGIBLE} eligible rows)"
 
 # shellcheck disable=SC2016  # jq program: $re is a jq function parameter
 PRICE_JQ='
