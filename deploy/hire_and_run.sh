@@ -98,7 +98,8 @@ fi
 # Timing. Overridden wholesale by the mock test.
 : "${POLL_BOOT_S:=30}"
 : "${POLL_STATUS_S:=60}"
-: "${BOOT_TIMEOUT_S:=1200}"
+: "${BOOT_TIMEOUT_S:=2700}"
+: "${EMPTY_WORKERS_TIMEOUT_S:=900}"
 : "${HTTP_TIMEOUT_S:=60}"
 : "${EVAL_TIMEOUT_S:=0}"     # 0 = derive from INITIAL_HOURS
 : "${FETCH_RETRIES:=5}"
@@ -555,6 +556,7 @@ log "deployment_id=${DEPLOY_ID} — teardown is now armed (trap on EXIT/INT/TERM
 CONTAINERS_LOG="${EVIDENCE_DIR}/containers-log.jsonl"
 BOOT_START="$(date +%s)"
 LAST_WORKER_STATUS="none"
+WORKER_EVER_SEEN=0
 CONT_TMP="${EVIDENCE_DIR}/.containers.json"
 
 while :; do
@@ -564,6 +566,13 @@ while :; do
     FINAL_PHASE="boot-timeout"
     die 3 "no running container with a public_url after ${BOOT_TIMEOUT_S}s (last status: ${LAST_WORKER_STATUS}). Deployment will be destroyed."
   fi
+  # A node that never schedules ANY worker is dead — bail early rather than
+  # burning the full boot window (seen live: 20 min of status=running, workers=[]).
+  if [ "$WORKER_EVER_SEEN" = "0" ] && [ "$ELAPSED" -ge "$EMPTY_WORKERS_TIMEOUT_S" ]; then
+    log "no worker ever scheduled after ${ELAPSED}s — dead node, bailing early"
+    FINAL_PHASE="boot-timeout"
+    die 3 "platform scheduled zero workers in ${EMPTY_WORKERS_TIMEOUT_S}s (deployment status was '${LAST_WORKER_STATUS}'). Deployment will be destroyed; retry hires a different node."
+  fi
 
   CONT_CODE="$(api GET "/deployment/${DEPLOY_ID}/containers" "$CONT_TMP")"
   if [ "$CONT_CODE" != "000" ] && ! looks_like_html "$CONT_TMP" && jq -e . "$CONT_TMP" >/dev/null 2>&1; then
@@ -572,6 +581,8 @@ while :; do
                            | select(type == "string" and length > 0) ] | first // ""' "$CONT_TMP")"
     LAST_WORKER_STATUS="$(jq -r '[ .. | objects | select(has("public_url")) | (.status // "")
                                    | select(type == "string" and length > 0) ] | first // "unknown"' "$CONT_TMP")"
+    N_WORKERS="$(jq -r '[ .. | objects | select(has("public_url")) ] | length' "$CONT_TMP")"
+    [ "${N_WORKERS:-0}" -gt 0 ] && WORKER_EVER_SEEN=1
     if [ -n "$PUBLIC_URL" ] && printf '%s' "$LAST_WORKER_STATUS" | grep -qi 'running\|ready\|healthy'; then
       PUBLIC_URL="${PUBLIC_URL%/}"
       log "container running after ${ELAPSED}s: public_url=${PUBLIC_URL}"
