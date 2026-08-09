@@ -13,6 +13,10 @@ class TidalConfig:
     # -- wiring --
     vllm_base_url: str = "http://127.0.0.1:8000"
     vllm_metrics_url: str = "http://127.0.0.1:8000/metrics"
+    #: Comma-separated engine base URLs for a *fleet* deployment (technique A
+    #: across several replicas). Empty — the default — means the single engine
+    #: at ``vllm_base_url``, i.e. exactly the pre-fleet behaviour.
+    vllm_replicas: str = ""
     dsn: str = "sqlite:///tidal.db"
     blob_dir: str = "tidal_blobs"
     api_key: str = "tidal-dev-key"  # static bearer token for the Batch API
@@ -55,6 +59,39 @@ class TidalConfig:
 
     # -- metering --
     batch_discount: float = 0.5
+
+    # -- fleet helpers -----------------------------------------------------
+
+    @property
+    def replica_urls(self) -> list[str]:
+        """Engine base URLs, in declaration order; ``[vllm_base_url]`` if unset.
+
+        Blank entries and trailing slashes are tolerated (a comma list assembled
+        by a shell loop routinely has both). Duplicates are an *error* rather
+        than a silent dedupe: two entries for one engine would give it two AIMD
+        controllers, each unaware of the other's in-flight items, which is the
+        precise failure the fleet's per-replica control exists to prevent.
+        """
+        urls = [part.strip().rstrip("/") for part in self.vllm_replicas.split(",")]
+        urls = [url for url in urls if url]
+        if not urls:
+            return [self.vllm_base_url]
+        if len(set(urls)) != len(urls):
+            raise ValueError(f"duplicate replica URLs in vllm_replicas: {self.vllm_replicas!r}")
+        return urls
+
+    @property
+    def replica_metrics_urls(self) -> list[str]:
+        """``/metrics`` per replica, positionally aligned with ``replica_urls``.
+
+        The single-engine case returns ``vllm_metrics_url`` untouched, so a
+        deployment that scrapes somewhere other than ``${base}/metrics`` keeps
+        working; a fleet derives the URL, because there is no per-replica field
+        to put a hand-written one in.
+        """
+        if not self.replica_urls or self.replica_urls == [self.vllm_base_url]:
+            return [self.vllm_metrics_url]
+        return [f"{url}/metrics" for url in self.replica_urls]
 
     @classmethod
     def from_env(cls) -> TidalConfig:

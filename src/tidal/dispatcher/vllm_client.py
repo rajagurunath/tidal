@@ -18,12 +18,20 @@ Error taxonomy (spec §7): 5xx / timeouts / transport failures are
 :class:`RetryableUpstream` (the item goes back to PENDING until
 ``max_item_attempts``); 4xx is :class:`FatalUpstream` (the item fails
 immediately and lands in the batch's error file).
+
+:class:`ReplicaSet` is the same two calls across a *fleet* of engines: one
+``VllmClient`` per replica over one shared connection pool, a fan-out scrape
+that reports a dead replica as ``None`` instead of raising, and a ``chat`` that
+takes the replica to submit to. Nothing in it decides *which* replica — that is
+:mod:`tidal.dispatcher.fleet`, which is pure.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -33,11 +41,14 @@ __all__ = [
     "EngineDown",
     "EngineMetrics",
     "FatalUpstream",
+    "ReplicaSet",
     "RetryableUpstream",
     "UpstreamError",
     "VllmClient",
     "parse_metrics",
 ]
+
+log = logging.getLogger("tidal.dispatcher.vllm_client")
 
 #: Generation can legitimately take minutes on a CPU dev box.
 DEFAULT_TIMEOUT_S = 600.0
@@ -219,3 +230,101 @@ class VllmClient:
         if endpoint.startswith(("http://", "https://")):
             return endpoint
         return f"{self.cfg.vllm_base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+
+class ReplicaSet:
+    """One :class:`VllmClient` per engine in ``cfg.replica_urls``.
+
+    Two properties the fleet dispatcher relies on:
+
+    * **The scrape never raises.** ``scrape_all`` fans out concurrently and maps
+      a replica that is unreachable, slow or answering non-200 to ``None``. A
+      single dead engine must cost the fleet that engine's capacity and nothing
+      else, and an exception here would take the whole tick down with it.
+    * **Submission is addressed.** ``chat`` takes the replica URL, so placement
+      is a decision made (and unit-tested) elsewhere and merely *executed* here.
+      An unknown URL is a ``KeyError``: routing to a replica that does not exist
+      is a bug, and quietly falling back to some default one would hide it.
+
+    All replicas share one ``httpx.AsyncClient`` — connection pools are per
+    host, so one pool already keeps the replicas' connections separate, and one
+    client means one place to close.
+    """
+
+    def __init__(
+        self,
+        cfg: TidalConfig,
+        *,
+        client: httpx.AsyncClient | None = None,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        metrics_timeout: float = DEFAULT_METRICS_TIMEOUT_S,
+    ) -> None:
+        self.cfg = cfg
+        self._owns_http = client is None
+        self._http = client if client is not None else httpx.AsyncClient(timeout=timeout)
+        self._clients: dict[str, VllmClient] = {}
+        for url, metrics_url in zip(cfg.replica_urls, cfg.replica_metrics_urls, strict=True):
+            self._clients[url] = VllmClient(
+                replace(cfg, vllm_base_url=url, vllm_metrics_url=metrics_url),
+                client=self._http,
+                timeout=timeout,
+                metrics_timeout=metrics_timeout,
+            )
+
+    # -- topology ----------------------------------------------------------
+
+    @property
+    def urls(self) -> list[str]:
+        """Replica base URLs in configuration order (the fleet's stable keys)."""
+        return list(self._clients)
+
+    def client(self, replica_url: str) -> VllmClient:
+        """The client for one replica; ``KeyError`` if it is not in the fleet."""
+        return self._clients[replica_url]
+
+    def __len__(self) -> int:
+        return len(self._clients)
+
+    # -- metrics -----------------------------------------------------------
+
+    async def scrape_all(self) -> dict[str, EngineMetrics | None]:
+        """Scrape every replica concurrently. ``None`` = that replica is down."""
+        urls = self.urls
+        results = await asyncio.gather(
+            *(self._clients[url].scrape() for url in urls), return_exceptions=True
+        )
+        out: dict[str, EngineMetrics | None] = {}
+        for url, result in zip(urls, results, strict=True):
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):  # pragma: no cover - teardown
+                    raise result
+                log.warning("replica %s scrape failed: %s", url, result)
+                out[url] = None
+            else:
+                out[url] = result
+        return out
+
+    # -- submission --------------------------------------------------------
+
+    async def chat(
+        self,
+        replica_url: str,
+        body: dict,
+        priority: int,
+        *,
+        endpoint: str = "/v1/chat/completions",
+    ) -> tuple[dict, int, int]:
+        """Submit one item to one replica; same return and errors as ``VllmClient``."""
+        return await self._clients[replica_url].chat(body, priority, endpoint=endpoint)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def __aenter__(self) -> ReplicaSet:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
