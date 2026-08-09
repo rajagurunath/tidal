@@ -63,7 +63,7 @@ def serve(
     # Imported here (not at module scope) so ``tidal report`` works even when
     # the dispatcher's optional dependencies are unavailable.
     from tidal.dispatcher.loop import Dispatcher
-    from tidal.dispatcher.vllm_client import VllmClient
+    from tidal.dispatcher.vllm_client import make_client
 
     cfg = _config(dsn=dsn, blob_dir=blob_dir, host=host, port=port)
     _warn_on_default_key(cfg)
@@ -76,13 +76,16 @@ def serve(
         """Dispatcher hook: assemble results once a batch has drained."""
         return finalize_if_done(repo, batch_id)
 
+    # `make_client` returns a ReplicaSet when TIDAL_VLLM_REPLICAS names a fleet,
+    # and the dispatcher switches to per-replica control on that alone.
     dispatcher = Dispatcher(
-        cfg, repo, VllmClient(cfg), on_success=meter.on_success, finalize=finalize
+        cfg, repo, make_client(cfg), on_success=meter.on_success, finalize=finalize
     )
     api = create_app(cfg, repo)
     attach_dispatcher(api, dispatcher)
 
-    typer.echo(f"tidal gateway on http://{cfg.host}:{cfg.port} -> vLLM {cfg.vllm_base_url}")
+    engines = ", ".join(cfg.replica_urls)
+    typer.echo(f"tidal gateway on http://{cfg.host}:{cfg.port} -> vLLM {engines}")
     uvicorn.run(api, host=cfg.host, port=cfg.port)
 
 

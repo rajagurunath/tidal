@@ -20,6 +20,14 @@ batch item pool, so the only variable is how batch work reaches the engine:
     Stock vLLM + the Tidal **gateway**: batch goes into the store and the
     dispatcher injects it under AIMD watermarks and laxity escalation
     (external control, no engine changes).
+``technique_a_fleet``
+    ``technique_a`` across *N* engines: N stock vLLMs on consecutive ports with
+    disjoint CPU allocations, one phase-shifted online load generator per
+    engine, and a *single* store + dispatcher placing batch work across the
+    fleet. The condition exists to test the claim the product rests on — that
+    one replica's diurnal trough pays for another's peak — which is invisible
+    to any single-engine run. ``--fleet-placement pinned`` is its control: the
+    same fleet with all batch work nailed to replica 0.
 ``technique_b``
     vLLM launched with ``--scheduler-cls tidal.engine.scheduler.TidalScheduler``
     + the batch pool fired at once, exactly like ``naive``. The engine itself
@@ -78,6 +86,10 @@ from tidal.eval.loadgen import (
 __all__ = [
     "CONDITIONS",
     "CPU_DEFAULTS",
+    "FLEET_BASE_PORT",
+    "FLEET_KVCACHE_SPACE_GB",
+    "FLEET_PLACEMENTS",
+    "FLEET_RESERVED_CPUS",
     "GPU_PRESET",
     "BatchCompletion",
     "MetricSample",
@@ -86,18 +98,29 @@ __all__ = [
     "app",
     "batch_limits",
     "batch_summary",
+    "batch_summary_per_replica",
+    "diurnal_phases",
     "make_batch_items",
     "parse_tidal_stats",
     "percent_of_ceiling",
+    "replica_env",
     "resolve_preset",
     "run_condition",
     "run_warmup",
     "summarize_metrics",
+    "summarize_per_replica_ticks",
     "summarize_tick_reports",
     "write_logging_config",
 ]
 
-CONDITIONS = ("online_only", "offline_only", "naive", "technique_a", "technique_b")
+CONDITIONS = (
+    "online_only",
+    "offline_only",
+    "naive",
+    "technique_a",
+    "technique_a_fleet",
+    "technique_b",
+)
 
 #: The engine venv on the dev box. vLLM is *not* a dependency of tidal itself.
 DEFAULT_VLLM_BIN = os.environ.get(
@@ -127,6 +150,20 @@ CLIENT_CLOSE_TIMEOUT_S = 10.0
 
 DEFAULT_MAX_MODEL_LEN = 4096
 DEFAULT_TENSOR_PARALLEL = 1
+
+#: First port of a fleet; replica *i* gets ``FLEET_BASE_PORT + i``.
+FLEET_BASE_PORT = 8399
+#: Batch placement policies the fleet condition understands. ``pinned`` is the
+#: control arm: same fleet, same load, all batch work on replica 0.
+FLEET_PLACEMENTS = ("fleet", "pinned")
+#: Logical CPUs held back from the engines for the harness itself — the
+#: gateway's tick loop, N load generators and N metrics samplers all live in
+#: this process, and an engine that has taken every core measures the harness
+#: starving rather than the engines co-serving.
+FLEET_RESERVED_CPUS = 2
+#: Total ``VLLM_CPU_KVCACHE_SPACE`` (GiB) shared out across the fleet. One
+#: engine's worth, split — two replicas on one box have one box's memory.
+FLEET_KVCACHE_SPACE_GB = 4
 
 #: Hard cap on warm-up requests, whatever ``--warmup-s`` says. The warm-up
 #: exists to pay one-off costs, and those are paid within a handful of
@@ -188,6 +225,81 @@ def resolve_preset(
     if warmup_s is not None:
         resolved["warmup_s"] = float(warmup_s)
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# fleet topology
+# ---------------------------------------------------------------------------
+
+
+def replica_env(
+    index: int,
+    replicas: int,
+    *,
+    cpu_count: int | None = None,
+    reserved: int = FLEET_RESERVED_CPUS,
+    kvcache_space_gb: int = FLEET_KVCACHE_SPACE_GB,
+) -> dict[str, str]:
+    """Environment that keeps replica ``index`` out of its neighbours' way.
+
+    Two engines on one box will happily oversubscribe every core and then
+    measure each other's context switches, so each replica is given a disjoint
+    slice of the machine and a share of the KV budget:
+
+    * ``VLLM_CPU_OMP_THREADS_BIND`` — vLLM's own CPU-list format (``"2-7"``).
+    * ``OMP_NUM_THREADS`` — the width of that slice, set explicitly.
+    * ``VLLM_CPU_KVCACHE_SPACE`` — the fleet's total, divided.
+
+    **macOS caveat.** ``taskset`` does not exist on macOS, and neither does
+    user-level CPU affinity: vLLM's own CPU list builder says so in as many
+    words (``_get_cpu_list``: *"For MacOS, no user-level CPU affinity and SMT,
+    return all CPUs"*), and the binding it applies is a set of OpenMP
+    environment variables (``OMP_PLACES``/``OMP_PROC_BIND``, or
+    ``KMP_AFFINITY``/``GOMP_CPU_AFFINITY`` under an explicit libomp) that
+    Apple's libomp does not honour as pinning. What *does* carry over is the
+    thread count: vLLM derives ``OMP_NUM_THREADS`` from the width of the list,
+    so a disjoint range still stops two replicas from each spawning a full
+    machine's worth of OpenMP threads. So on macOS this is thread-count
+    isolation, not core isolation — the portable half of the intent — and on
+    Linux (every GPU box this will ever run on) it is both.
+    """
+    if replicas < 1:
+        raise ValueError("replicas must be >= 1")
+    if not 0 <= index < replicas:
+        raise ValueError(f"replica index {index} outside a fleet of {replicas}")
+    total = cpu_count or os.cpu_count() or 1
+    usable = total - reserved
+    if usable < replicas:
+        # Reserving cores is a nicety; starving a replica is not. On a box too
+        # small to do both, the engines get the whole machine.
+        reserved, usable = 0, total
+    per = max(1, usable // replicas)
+    low = reserved + index * per
+    high = low + per - 1
+    return {
+        "VLLM_CPU_OMP_THREADS_BIND": f"{low}-{high}",
+        "OMP_NUM_THREADS": str(per),
+        "VLLM_CPU_KVCACHE_SPACE": str(max(1, kvcache_space_gb // replicas)),
+    }
+
+
+def diurnal_phases(replicas: int, spec: str = "") -> list[float]:
+    """Phase offset (radians) for each replica's diurnal arrival process.
+
+    The default spreads the fleet evenly over one period, so two replicas peak
+    half a period apart — the arrangement the whole multi-replica thesis rests
+    on, since a fleet whose engines peak together has no trough to sell. An
+    explicit ``spec`` (``"0,3.14159"``) overrides it and must name every
+    replica: a short list would silently leave the tail in phase.
+    """
+    if replicas < 1:
+        raise ValueError("replicas must be >= 1")
+    if not spec.strip():
+        return [i * 2.0 * math.pi / replicas for i in range(replicas)]
+    values = [float(part) for part in spec.split(",") if part.strip()]
+    if len(values) != replicas:
+        raise ValueError(f"--diurnal-phase-list has {len(values)} phases for {replicas} replicas")
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +536,11 @@ def make_batch_items(
 
 @dataclass
 class BatchCompletion:
-    """One batch item's outcome, timed against the run's ``t0``."""
+    """One batch item's outcome, timed against the run's ``t0``.
+
+    ``replica`` is the engine that ran it — ``None`` for every single-engine
+    condition, where the question does not arise.
+    """
 
     index: int
     custom_id: str
@@ -434,6 +550,7 @@ class BatchCompletion:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     error: str | None = None
+    replica: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -786,6 +903,50 @@ def summarize_tick_reports(reports: Sequence[dict]) -> dict:
     }
 
 
+def batch_summary_per_replica(
+    completions: Sequence[BatchCompletion], window_s: float
+) -> dict[str, dict]:
+    """``batch_summary`` per engine, for the completions that name one.
+
+    A completion with no ``replica`` is not attributed to anybody: guessing
+    would put a single-engine condition's whole pool on whichever URL happened
+    to be first, and the per-replica breakdown exists to answer "did the fleet
+    actually spread the work", which a guess would always answer yes to.
+    """
+    grouped: dict[str, list[BatchCompletion]] = {}
+    for completion in completions:
+        if completion.replica is None:
+            continue
+        grouped.setdefault(completion.replica, []).append(completion)
+    return {url: batch_summary(group, window_s) for url, group in grouped.items()}
+
+
+def summarize_per_replica_ticks(reports: Sequence[dict]) -> dict[str, dict]:
+    """What each replica's controller did over a fleet run.
+
+    ``down_ticks`` counts the ticks a replica failed its scrape (``score`` is
+    ``None``); its target is still averaged in as the zero the circuit set it
+    to, because "this replica was contributing nothing" is the honest reading.
+    """
+    per_replica: dict[str, list[dict]] = {}
+    for report in reports:
+        for url, entry in (report.get("per_replica") or {}).items():
+            per_replica.setdefault(url, []).append(entry)
+    out: dict[str, dict] = {}
+    for url, entries in per_replica.items():
+        scores = [e["score"] for e in entries if e.get("score") is not None]
+        out[url] = {
+            "ticks": len(entries),
+            "target_mean": sum(e["target"] for e in entries) / len(entries),
+            "target_max": max(e["target"] for e in entries),
+            "inflight_mean": sum(e["inflight"] for e in entries) / len(entries),
+            "score_mean": (sum(scores) / len(scores)) if scores else None,
+            "score_max": max(scores) if scores else None,
+            "down_ticks": sum(1 for e in entries if e.get("score") is None),
+        }
+    return out
+
+
 def percent_of_ceiling(results: dict[str, dict], *, key: str = "output_tokens_per_s") -> dict:
     """Each condition's batch throughput as a percentage of ``offline_only``.
 
@@ -838,6 +999,13 @@ class RunConfig:
     #: Seconds of unmeasured traffic between ``/health`` and ``t0``. Zero (the
     #: CPU default) reproduces every number measured before the flag existed.
     warmup_s: float = CPU_DEFAULTS["warmup_s"]
+    #: -- fleet (``technique_a_fleet`` only; ignored by every other condition) --
+    replicas: int = 2
+    fleet_base_port: int = FLEET_BASE_PORT
+    fleet_placement: str = "fleet"
+    #: Comma-separated phase offsets, one per replica. Empty spreads them
+    #: evenly over the period (two replicas ⇒ half a period apart).
+    diurnal_phase_list: str = ""
 
     @property
     def duration_s(self) -> float:
@@ -847,10 +1015,19 @@ class RunConfig:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    @property
+    def replica_ports(self) -> list[int]:
+        return [self.fleet_base_port + i for i in range(self.replicas)]
+
+    @property
+    def replica_urls(self) -> list[str]:
+        return [f"http://127.0.0.1:{port}" for port in self.replica_ports]
+
 
 async def run_warmup(
     cfg: RunConfig,
     *,
+    base_url: str | None = None,
     client: httpx.AsyncClient | None = None,
     clock: Callable[[], float] = time.perf_counter,
     max_requests: int = WARMUP_MAX_REQUESTS,
@@ -874,15 +1051,17 @@ async def run_warmup(
     This is engine warm-up, not load shape, so it applies to every condition
     that boots an engine — including ``offline_only``, whose ceiling would
     otherwise be measured against a colder engine than the conditions it is the
-    divisor for.
+    divisor for. ``base_url`` aims it at one replica of a fleet; every engine in
+    a fleet needs its own, for the same reason a single engine does.
     """
     if cfg.warmup_s <= 0:
         return {"requests": 0, "elapsed_s": 0.0}
 
+    target = base_url or cfg.base_url
     gen = OnlineLoadGen(
-        base_url=cfg.base_url, model=cfg.model, max_tokens=cfg.online_max_tokens, priority=0
+        base_url=target, model=cfg.model, max_tokens=cfg.online_max_tokens, priority=0
     )
-    url = f"{cfg.base_url.rstrip('/')}/v1/chat/completions"
+    url = f"{target.rstrip('/')}/v1/chat/completions"
     owns = client is None
     http = client or httpx.AsyncClient(timeout=cfg.warmup_s)
 
@@ -913,11 +1092,15 @@ async def run_condition(cfg: RunConfig, *, log_dir: str | None = None) -> dict:
     if cfg.condition not in CONDITIONS:
         raise ValueError(f"unknown condition {cfg.condition!r}; want one of {CONDITIONS}")
 
-    flavor = "tidal" if cfg.condition == "technique_b" else "stock"
     log_dir_path = Path(log_dir or tempfile.mkdtemp(prefix="tidal-eval-"))
     log_dir_path.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir_path / f"vllm-{cfg.condition}.log"
     logging_config = write_logging_config(log_dir_path / "logging.json")
+
+    if cfg.condition == "technique_a_fleet":
+        return await _run_fleet_condition(cfg, log_dir_path, logging_config)
+
+    flavor = "tidal" if cfg.condition == "technique_b" else "stock"
+    log_path = log_dir_path / f"vllm-{cfg.condition}.log"
 
     server = VllmServer(
         port=cfg.port,
@@ -945,6 +1128,58 @@ async def run_condition(cfg: RunConfig, *, log_dir: str | None = None) -> dict:
         text = server.log_text()
         result["tidal_probe"] = tidal_probe_line(text)
         result["tidal_stats"] = parse_tidal_stats(text, epoch0=result["epoch0"])
+    return result
+
+
+async def _run_fleet_condition(cfg: RunConfig, log_dir: Path, logging_config: str) -> dict:
+    """Boot ``cfg.replicas`` stock engines side by side and measure the fleet.
+
+    The engines are started and health-checked one at a time: two cold vLLMs
+    loading weights simultaneously on one box is a memory spike for no benefit,
+    and a fleet where the second engine never came up must fail loudly at
+    launch rather than halfway through a measured window.
+    """
+    if cfg.replicas < 1:
+        raise ValueError(f"a fleet needs at least one replica; got replicas={cfg.replicas}")
+    if cfg.fleet_placement not in FLEET_PLACEMENTS:
+        raise ValueError(
+            f"unknown fleet placement {cfg.fleet_placement!r}; want one of {FLEET_PLACEMENTS}"
+        )
+
+    servers = [
+        VllmServer(
+            port=port,
+            flavor="stock",
+            log_path=str(log_dir / f"vllm-{cfg.condition}-{index}.log"),
+            model=cfg.model,
+            vllm_bin=cfg.vllm_bin,
+            max_model_len=cfg.max_model_len,
+            enforce_eager=cfg.enforce_eager,
+            tensor_parallel=cfg.tensor_parallel,
+            hf_offline=cfg.hf_offline,
+            env_extra={
+                "VLLM_LOGGING_CONFIG_PATH": logging_config,
+                **replica_env(index, cfg.replicas),
+            },
+        )
+        for index, port in enumerate(cfg.replica_ports)
+    ]
+    typer.echo(
+        f"[{cfg.condition}] launching {cfg.replicas} stock vLLM(s) on "
+        f"ports {cfg.replica_ports} ({cfg.fleet_placement} placement) ..."
+    )
+    started_at = datetime.now(UTC).isoformat()
+    with contextlib.ExitStack() as stack:
+        for server in servers:
+            stack.enter_context(server)
+        typer.echo(f"[{cfg.condition}] fleet ready; running {cfg.minutes:g} min")
+        result = await _measure_fleet(cfg, servers)
+    result["condition"] = cfg.condition
+    result["config"] = asdict(cfg)
+    result["started_at"] = started_at
+    result["finished_at"] = datetime.now(UTC).isoformat()
+    result["engine_logs"] = [server.log_path for server in servers]
+    result["engine_log"] = servers[0].log_path
     return result
 
 
@@ -1011,7 +1246,9 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
                     f"salvaged {len(completions)}/{len(items)} completions"
                 )
         else:  # technique_a
-            completions, tick_reports = await _run_technique_a(cfg, items, gen, offsets, t0)
+            completions, tick_reports, _placement = await _run_technique_a(
+                cfg, items, [gen], [offsets], t0
+            )
             online = list(gen.records)
     finally:
         stop.set()
@@ -1044,30 +1281,148 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
     }
 
 
+async def _measure_fleet(cfg: RunConfig, servers: Sequence[VllmServer] | None) -> dict:
+    """Run ``technique_a_fleet`` against an already-healthy fleet.
+
+    Structure of the document it returns: every key a single-engine result has,
+    with fleet-wide meaning (``batch`` is the fleet's throughput, ``online`` is
+    every replica's requests merged and each tagged with its ``replica``), plus
+    a ``*_per_replica`` sibling for each so nothing is lost to the aggregate.
+    The exception is ``metrics``/``metrics_summary``, which stay *one* engine's
+    gauges — summing KV usage across engines would be meaningless — with the
+    rest in ``metrics_per_replica``.
+    """
+    urls = list(cfg.replica_urls)
+    phases = diurnal_phases(cfg.replicas, cfg.diurnal_phase_list)
+    # Seeds differ per replica so the fleet is not N copies of one arrival
+    # process merely shifted; the phase is what staggers the *shape*.
+    offsets_list = [
+        schedule(cfg.arrival, cfg.online_rps, cfg.duration_s, cfg.seed + i, phase=phase)
+        for i, phase in enumerate(phases)
+    ]
+    items = make_batch_items(cfg.batch_items, model=cfg.model, max_tokens=cfg.batch_max_tokens)
+    gens = [
+        OnlineLoadGen(base_url=url, model=cfg.model, max_tokens=cfg.online_max_tokens, priority=0)
+        for url in urls
+    ]
+
+    # Strictly before t0, and per engine: a cold replica's first-request costs
+    # would otherwise be charged to whichever replica the fleet placed work on.
+    warmup = {url: await run_warmup(cfg, base_url=url) for url in urls}
+
+    t0 = time.perf_counter()
+    epoch0 = time.time()
+    samples: dict[str, list[MetricSample]] = {url: [] for url in urls}
+    stop = asyncio.Event()
+    samplers = [
+        asyncio.create_task(
+            sample_metrics(f"{url}/metrics", stop, samples[url], t0=t0), name=f"metrics-{i}"
+        )
+        for i, url in enumerate(urls)
+    ]
+    try:
+        completions, tick_reports, replica_of = await _run_technique_a(
+            cfg, items, gens, offsets_list, t0, replicas=urls, placement=cfg.fleet_placement
+        )
+    finally:
+        stop.set()
+        for sampler in samplers:
+            with contextlib.suppress(Exception):
+                await sampler
+
+    window = (
+        cfg.duration_s
+        if any(offsets_list)
+        else max((c.finished_at for c in completions), default=0.0)
+    )
+
+    online_records: list[dict] = []
+    online_per_replica: dict[str, dict] = {}
+    latencies: list[float] = []
+    errors = 0
+    for url, gen, phase in zip(urls, gens, phases, strict=True):
+        online_records.extend({**r.as_dict(), "replica": url} for r in gen.records)
+        latencies.extend(gen.latencies())
+        replica_errors = sum(1 for r in gen.records if not r.ok)
+        errors += replica_errors
+        online_per_replica[url] = {
+            "phase": phase,
+            "requests": len(gen.records),
+            "summary": summarize_latencies(gen.latencies()),
+            "errors": replica_errors,
+            "achieved_rps": (len(gen.records) / window) if window > 0 else 0.0,
+        }
+
+    batch = batch_summary(completions, window, pool_size=len(items))
+    batch["drain_timed_out"] = False
+    primary = urls[0]
+    return {
+        "epoch0": epoch0,
+        "window_s": window,
+        "warmup": warmup,
+        "replicas": urls,
+        "placement": cfg.fleet_placement,
+        "online": {
+            "requests": online_records,
+            "summary": summarize_latencies(latencies),
+            "errors": errors,
+            "achieved_rps": (len(online_records) / window) if window > 0 else 0.0,
+        },
+        "online_per_replica": online_per_replica,
+        "batch": batch,
+        "batch_per_replica": batch_summary_per_replica(completions, window),
+        "batch_completions": [c.as_dict() for c in completions],
+        "replica_of": replica_of,
+        "metrics": [s.as_dict() for s in samples[primary]],
+        "metrics_summary": summarize_metrics(samples[primary]),
+        "metrics_per_replica": {url: [s.as_dict() for s in rows] for url, rows in samples.items()},
+        "metrics_summary_per_replica": {
+            url: summarize_metrics(rows) for url, rows in samples.items()
+        },
+        "tick_reports": tick_reports,
+        "tick_summary": summarize_tick_reports(tick_reports),
+        "tick_per_replica": summarize_per_replica_ticks(tick_reports),
+    }
+
+
 async def _run_technique_a(
     cfg: RunConfig,
     items: Sequence[dict],
-    gen: OnlineLoadGen,
-    offsets: Sequence[float],
+    gens: Sequence[OnlineLoadGen],
+    offsets_list: Sequence[Sequence[float]],
     t0: float,
-) -> tuple[list[BatchCompletion], list[dict]]:
+    *,
+    replicas: Sequence[str] | None = None,
+    placement: str = "fleet",
+) -> tuple[list[BatchCompletion], list[dict], dict[str, str]]:
     """Batch through the gateway store + dispatcher; online straight to vLLM.
 
     The dispatcher is driven in-process rather than through ``tidal serve``: the
     HTTP surface adds nothing to the measurement (it is exercised by the
     integration tests) and this way every ``TickReport`` — the controller's
     entire observable state — lands in the result file.
+
+    One code path serves both the single engine and the fleet. ``replicas``
+    ``None`` is the single-engine run: one ``VllmClient`` at ``cfg.base_url``,
+    one load generator, and the same decisions the condition has always made.
+    A list of URLs swaps in a ``ReplicaSet`` and one generator per engine, all
+    driven concurrently against a single store.
+
+    Returns ``(completions, tick_reports, replica_of)`` where ``replica_of``
+    maps ``custom_id`` to the engine that ran it (empty for a single engine).
     """
     from tidal.api.assembler import finalize_if_done
     from tidal.api.jsonl import parse_batch_input
     from tidal.dispatcher.loop import Dispatcher
-    from tidal.dispatcher.vllm_client import VllmClient
+    from tidal.dispatcher.vllm_client import ReplicaSet, VllmClient
     from tidal.store.interfaces import BatchStatus, ItemState, make_repository
 
     workdir = Path(tempfile.mkdtemp(prefix="tidal-eval-store-"))
     tcfg = TidalConfig.from_env()
-    tcfg.vllm_base_url = cfg.base_url
-    tcfg.vllm_metrics_url = f"{cfg.base_url}/metrics"
+    primary = replicas[0] if replicas else cfg.base_url
+    tcfg.vllm_base_url = primary
+    tcfg.vllm_metrics_url = f"{primary}/metrics"
+    tcfg.vllm_replicas = ",".join(replicas) if replicas else ""
     tcfg.dsn = f"sqlite:///{workdir / 'tidal.db'}"
     tcfg.blob_dir = str(workdir / "blobs")
     tcfg.max_inflight = cfg.max_inflight
@@ -1081,8 +1436,14 @@ async def _run_technique_a(
         source.id, "/v1/chat/completions", tcfg.completion_window_hours, {"eval": "1"}, parsed
     )
 
-    client = VllmClient(tcfg)
-    dispatcher = Dispatcher(tcfg, repo, client, finalize=lambda r, bid: finalize_if_done(r, bid))
+    client = ReplicaSet(tcfg) if replicas else VllmClient(tcfg)
+    dispatcher = Dispatcher(
+        tcfg,
+        repo,
+        client,
+        finalize=lambda r, bid: finalize_if_done(r, bid),
+        placement=placement,
+    )
     reports: list[dict] = []
     stop = asyncio.Event()
 
@@ -1099,6 +1460,7 @@ async def _run_technique_a(
                     "escalated_priorities": dict(report.escalated_priorities),
                     "expired_batches": list(report.expired_batches),
                     "circuit_open": report.circuit_open,
+                    "per_replica": {k: dict(v) for k, v in report.per_replica.items()},
                 }
             )
             with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
@@ -1106,7 +1468,9 @@ async def _run_technique_a(
 
     controller = asyncio.create_task(control(), name="dispatcher")
     try:
-        await gen.run(offsets, t0=t0)
+        await asyncio.gather(
+            *(gen.run(offsets, t0=t0) for gen, offsets in zip(gens, offsets_list, strict=True))
+        )
         # Let the batch drain past the online window so the pool's makespan is
         # a real number, bounded so a wedged engine cannot hang the harness.
         deadline = time.perf_counter() + cfg.drain_timeout_s
@@ -1137,6 +1501,7 @@ async def _run_technique_a(
     # direct-submission conditions measure it properly and are the ones to
     # compare item latency across.
     epoch_t0 = time.time() - (time.perf_counter() - t0)
+    replica_of = dict(dispatcher.replica_of)
     completions = []
     for item in await asyncio.to_thread(repo.list_items, batch.id, None):
         if item.state is not ItemState.SUCCEEDED or item.finished_at is None:
@@ -1152,10 +1517,11 @@ async def _run_technique_a(
                 latency_s=(finished - started) if item.submitted_at else float("nan"),
                 prompt_tokens=item.usage_prompt_tokens or 0,
                 completion_tokens=item.usage_completion_tokens or 0,
+                replica=replica_of.get(item.custom_id) if replicas else None,
             )
         )
     completions.sort(key=lambda c: c.index)
-    return completions, reports
+    return completions, reports, replica_of
 
 
 def _jsonable(value):
@@ -1247,6 +1613,24 @@ def run(
             f"capped at {WARMUP_MAX_REQUESTS} requests. Default: 0 (45 under --gpu-preset)."
         ),
     ),
+    replicas: int = typer.Option(2, help="technique_a_fleet: how many engines the fleet has."),
+    fleet_base_port: int = typer.Option(
+        FLEET_BASE_PORT, help="technique_a_fleet: replica i listens on this port + i."
+    ),
+    fleet_placement: str = typer.Option(
+        "fleet",
+        help=(
+            "technique_a_fleet batch placement: 'fleet' (load-aware) or "
+            "'pinned' (everything on replica 0 — the control arm)."
+        ),
+    ),
+    diurnal_phase_list: str = typer.Option(
+        "",
+        help=(
+            "technique_a_fleet: comma-separated diurnal phase per replica, e.g. "
+            "'0,3.14159'. Default: spread evenly over the period."
+        ),
+    ),
 ) -> None:
     """Run one condition end to end and write ``<out>``."""
     engine = resolve_preset(
@@ -1277,6 +1661,10 @@ def run(
         hf_offline=engine["hf_offline"],
         batch_concurrency=engine["batch_concurrency"],
         warmup_s=engine["warmup_s"],
+        replicas=replicas,
+        fleet_base_port=fleet_base_port,
+        fleet_placement=fleet_placement,
+        diurnal_phase_list=diurnal_phase_list,
     )
     result = asyncio.run(run_condition(cfg, log_dir=log_dir or None))
 

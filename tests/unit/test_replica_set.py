@@ -194,3 +194,21 @@ async def test_an_injected_http_client_is_left_open_for_its_owner():
 async def test_replica_set_is_an_async_context_manager():
     async with ReplicaSet(TidalConfig(vllm_replicas=A)) as fleet:
         assert fleet.urls == [A]
+
+
+# -- the factory ------------------------------------------------------------
+
+
+def test_make_client_gives_a_plain_client_when_no_fleet_is_configured():
+    from tidal.dispatcher.vllm_client import VllmClient, make_client
+
+    assert isinstance(make_client(TidalConfig()), VllmClient)
+    assert isinstance(make_client(TidalConfig(vllm_replicas="  ")), VllmClient)
+
+
+def test_make_client_gives_a_replica_set_as_soon_as_replicas_are_named():
+    from tidal.dispatcher.vllm_client import make_client
+
+    client = make_client(TidalConfig(vllm_replicas=f"{A},{B}"))
+    assert isinstance(client, ReplicaSet)
+    assert client.urls == [A, B]

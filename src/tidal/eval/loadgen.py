@@ -134,16 +134,20 @@ def schedule(
     *,
     period_s: float = 600.0,
     trough_frac: float = 0.2,
+    phase: float = 0.0,
 ) -> list[float]:
     """Dispatch to an arrival shape by name (``"poisson"`` | ``"diurnal"``).
 
     For ``diurnal``, ``rps`` is the *peak* rate and the trough is
-    ``trough_frac · rps``.
+    ``trough_frac · rps``. ``phase`` offsets the sine, which is how a fleet
+    gives each replica a peak at a different time of "day" — the whole point of
+    a multi-replica run being that one engine's trough pays for another's peak.
+    It has no meaning for ``poisson`` and is ignored there.
     """
     if shape == "poisson":
         return poisson_schedule(rps, duration_s, seed)
     if shape == "diurnal":
-        return diurnal_schedule(rps * trough_frac, rps, duration_s, period_s, seed)
+        return diurnal_schedule(rps * trough_frac, rps, duration_s, period_s, seed, phase)
     raise ValueError(f"unknown arrival shape {shape!r} (want 'poisson' or 'diurnal')")
 
 

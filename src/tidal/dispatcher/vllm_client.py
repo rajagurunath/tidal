@@ -45,6 +45,7 @@ __all__ = [
     "RetryableUpstream",
     "UpstreamError",
     "VllmClient",
+    "make_client",
     "parse_metrics",
 ]
 
@@ -328,3 +329,17 @@ class ReplicaSet:
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.aclose()
+
+
+def make_client(cfg: TidalConfig, **kwargs) -> VllmClient | ReplicaSet:
+    """The right client for this configuration.
+
+    ``vllm_replicas`` unset is a single engine and a plain :class:`VllmClient` —
+    the deployment Tidal has always been. Set, it is a :class:`ReplicaSet`, and
+    the dispatcher switches to per-replica control on the strength of that
+    alone. Callers should not have to know which they got: both are accepted by
+    ``Dispatcher``.
+    """
+    if not cfg.vllm_replicas.strip():
+        return VllmClient(cfg, **kwargs)
+    return ReplicaSet(cfg, **kwargs)
