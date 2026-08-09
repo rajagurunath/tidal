@@ -149,6 +149,7 @@ def diurnal(data: dict, out: Path, evidence_dirs: list[str]) -> None:
     files = []
     for ev in evidence_dirs:
         files += glob.glob(f"{ev}/**/matrix/diurnal_technique_*.json", recursive=True)
+        files += glob.glob(f"{ev}/**/diurnal/diurnal_technique_*.json", recursive=True)
     if not files:
         return
     d = json.load(open(sorted(files)[-1]))
