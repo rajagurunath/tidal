@@ -7,6 +7,8 @@ wrong, and no amount of live-vLLM testing would catch it.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -650,3 +652,230 @@ def test_warmup_never_reaches_the_engine_command_line():
     ):
         assert not any("warmup" in arg for arg in server.command())
         assert not any("warmup" in key.lower() for key in server.environment())
+
+
+# -- bounded direct submission ----------------------------------------------
+#
+# The drain wedge: a >10k-item pool submitted directly runs until the external
+# case timeout kills the process (exit 124) and every completed item is lost
+# with it. Bounding the wait is only half the fix — the completed work has to
+# survive the cancellation, or a salvaged run reports nothing.
+
+
+def wedging_handler(fast: int):
+    """A stub engine that answers ``fast`` requests and then never answers."""
+    seen = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal seen
+        seen += 1
+        if seen > fast:
+            await asyncio.Event().wait()  # pragma: no cover - cancelled, never resumes
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1, "completion_tokens": 2}})
+
+    return handler
+
+
+async def settled(predicate, *, timeout: float = 5.0) -> None:
+    """Poll until ``predicate`` holds. Bounded, so a wedge fails rather than hangs."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+async def test_direct_submission_returns_the_work_it_finished_when_cancelled():
+    """Cancelling a `gather` over 10k items used to throw away every completed
+    item. The salvaged list is the entire point of bounding the drain."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(wedging_handler(3)))
+    sink: list[BatchCompletion] = []
+    task = asyncio.create_task(
+        harness.submit_batch_direct(
+            "http://engine", make_batch_items(10), t0=0.0, client=client, sink=sink
+        )
+    )
+    await settled(lambda: len(sink) >= 3)
+    task.cancel()
+    async with asyncio.timeout(10):
+        salvaged = await task
+    assert [c.index for c in salvaged] == sorted(c.index for c in salvaged)
+    assert len(salvaged) == 3
+    assert all(c.ok for c in salvaged)
+    await client.aclose()
+
+
+async def test_direct_submission_still_returns_every_item_when_nothing_wedges():
+    """Small pools — every CPU result ever measured — must be untouched."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(wedging_handler(1000)))
+    done = await harness.submit_batch_direct(
+        "http://engine", make_batch_items(5), t0=0.0, client=client
+    )
+    assert [c.index for c in done] == [0, 1, 2, 3, 4]
+    assert all(c.ok and c.completion_tokens == 2 for c in done)
+    await client.aclose()
+
+
+async def test_direct_submission_closes_a_client_it_owns_even_when_cancelled(monkeypatch):
+    """The wedge was observed *inside* httpx teardown, so the close is guarded
+    and the salvaged completions are returned regardless of how it goes."""
+    made: list[httpx.AsyncClient] = []
+    real_client = httpx.AsyncClient
+
+    def factory(**_kwargs):
+        client = real_client(transport=httpx.MockTransport(wedging_handler(2)))
+        made.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    sink: list[BatchCompletion] = []
+    task = asyncio.create_task(
+        harness.submit_batch_direct("http://engine", make_batch_items(8), t0=0.0, sink=sink)
+    )
+    await settled(lambda: len(sink) >= 2)
+    task.cancel()
+    async with asyncio.timeout(10):
+        salvaged = await task
+    assert len(salvaged) == 2
+    assert made and made[0].is_closed
+
+
+async def test_direct_submission_bounds_each_item_by_its_own_timeout():
+    """One wedged item must not outlive the window plus the drain."""
+    seen: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout", {}).get("read"))
+        return httpx.Response(200, json={"usage": {}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await harness.submit_batch_direct(
+        "http://engine", make_batch_items(2), t0=0.0, client=client, per_request_timeout_s=42.0
+    )
+    assert seen == [42.0, 42.0]
+    await client.aclose()
+
+
+# -- the drain helper --------------------------------------------------------
+
+
+async def test_drain_returns_the_full_result_and_no_timeout_flag_when_it_finishes():
+    done = [completion(0, finished=1.0)]
+    task = asyncio.create_task(asyncio.sleep(0, result=done))
+    assert await harness.drain_batch_task(task, budget_s=5.0, sink=[]) == (done, False)
+
+
+async def test_drain_salvages_the_partial_result_after_the_budget():
+    """Some items complete fast, some never do: the wait is bounded and what
+    finished comes back, flagged."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(wedging_handler(4)))
+    sink: list[BatchCompletion] = []
+    task = asyncio.create_task(
+        harness.submit_batch_direct(
+            "http://engine", make_batch_items(50), t0=0.0, client=client, sink=sink
+        )
+    )
+    await settled(lambda: len(sink) >= 4)
+    async with asyncio.timeout(10):
+        salvaged, timed_out = await harness.drain_batch_task(task, budget_s=0.05, sink=sink)
+    assert timed_out is True
+    assert len(salvaged) == 4
+    await client.aclose()
+
+
+async def test_drain_falls_back_to_the_sink_when_the_teardown_itself_wedges():
+    """The worst path: the coordinator swallows the cancel and hangs anyway.
+    Reading the caller-owned sink is what makes data loss impossible."""
+    salvage = [completion(0, finished=1.0)]
+
+    async def wedged() -> list[BatchCompletion]:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()  # a teardown that never returns
+        return []  # pragma: no cover
+
+    task = asyncio.create_task(wedged())
+    await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        out, timed_out = await harness.drain_batch_task(
+            task, budget_s=0.02, sink=salvage, salvage_timeout_s=0.05
+        )
+    assert (out, timed_out) == (salvage, True)
+    assert not task.done()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+# -- the conditions ----------------------------------------------------------
+
+
+async def test_offline_only_is_bounded_by_the_window_plus_the_drain(monkeypatch):
+    """`offline_only` had no timeout at all: a wedged 10k pool ran until the
+    external case timeout killed it (exit 124)."""
+
+    async def fake_submit(_base_url, _items, *, t0, sink=None, **_kwargs):
+        sink.append(completion(0, finished=1.0))
+        await asyncio.Event().wait()  # pragma: no cover
+
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    cfg = RunConfig(condition="offline_only", batch_items=4, minutes=0.001, drain_timeout_s=0.05)
+    async with asyncio.timeout(10):
+        result = await harness._measure(cfg, server=None)
+    assert result["batch"]["drain_timed_out"] is True
+    assert result["batch"]["completed"] == 1
+    assert len(result["batch_completions"]) == 1
+
+
+async def test_naive_reports_the_partial_drain_instead_of_losing_it(monkeypatch):
+    async def fake_submit(_base_url, _items, *, t0, sink=None, **_kwargs):
+        sink.append(completion(0, finished=1.0))
+        await asyncio.Event().wait()  # pragma: no cover
+
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    monkeypatch.setattr(harness, "schedule", lambda *_a, **_k: [])
+    cfg = RunConfig(condition="naive", batch_items=4, minutes=0.001, drain_timeout_s=0.05)
+    async with asyncio.timeout(10):
+        result = await harness._measure(cfg, server=None)
+    assert result["batch"]["drain_timed_out"] is True
+    assert result["batch"]["completed"] == 1
+
+
+async def test_a_pool_that_completes_is_not_flagged_as_salvaged(monkeypatch):
+    """The flag exists to mark degraded runs; a healthy run must never carry it."""
+    done = [completion(i, finished=float(i)) for i in range(2)]
+
+    async def fake_submit(_base_url, _items, *, t0, sink=None, **_kwargs):
+        return done
+
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    cfg = RunConfig(condition="offline_only", batch_items=2, port=9)
+    async with asyncio.timeout(10):
+        result = await harness._measure(cfg, server=None)
+    assert result["batch"]["drain_timed_out"] is False
+    assert result["batch"]["completed"] == 2
+
+
+async def test_the_online_only_condition_reports_a_clean_drain_flag(monkeypatch):
+    monkeypatch.setattr(harness, "schedule", lambda *_a, **_k: [])
+    async with asyncio.timeout(10):
+        result = await harness._measure(RunConfig(condition="online_only", port=9), server=None)
+    assert result["batch"]["drain_timed_out"] is False
+
+
+async def test_offline_only_gets_the_window_as_well_as_the_drain(monkeypatch):
+    """`offline_only` has no online window to wait through, so the batch *is*
+    the window: bounding it by the drain alone would kill every healthy run."""
+    captured: dict = {}
+
+    async def fake_submit(_base_url, _items, *, t0, sink=None, **kwargs):
+        captured.update(kwargs)
+        await asyncio.sleep(0.1)
+        return [completion(0, finished=0.1)]
+
+    monkeypatch.setattr(harness, "submit_batch_direct", fake_submit)
+    cfg = RunConfig(condition="offline_only", batch_items=1, minutes=0.02, drain_timeout_s=0.01)
+    async with asyncio.timeout(10):
+        result = await harness._measure(cfg, server=None)
+    assert result["batch"]["drain_timed_out"] is False
+    # And one item can never outlive the window plus the drain.
+    assert captured["per_request_timeout_s"] == pytest.approx(cfg.duration_s + 0.01)

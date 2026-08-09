@@ -113,6 +113,18 @@ BATCH_PRIORITY = 100
 HEALTH_TIMEOUT_S = float(os.environ.get("TIDAL_EVAL_HEALTH_TIMEOUT_S", "300"))
 METRICS_INTERVAL_S = 1.0
 
+#: How long a cancelled direct submission waits for its in-flight item tasks to
+#: unwind before it returns what it has. Seconds, not minutes: by this point the
+#: run is already over budget and the only remaining job is to not lose data.
+CANCEL_GRACE_S = 15.0
+#: …and how long the *caller* waits for that unwind, teardown included. Beyond
+#: it the caller reads the sink directly, so even a wedged httpx close cannot
+#: take the completed items down with it.
+SALVAGE_TIMEOUT_S = 30.0
+#: Closing an httpx client with hundreds of half-open connections to a saturated
+#: engine is itself a place the harness has been observed to wedge.
+CLIENT_CLOSE_TIMEOUT_S = 10.0
+
 DEFAULT_MAX_MODEL_LEN = 4096
 DEFAULT_TENSOR_PARALLEL = 1
 
@@ -445,6 +457,65 @@ def batch_limits(max_connections: int) -> httpx.Limits:
     )
 
 
+async def _close_quietly(
+    http: httpx.AsyncClient, timeout_s: float = CLIENT_CLOSE_TIMEOUT_S
+) -> None:
+    """Close a client without letting the close become the new hang.
+
+    ``aclose`` is run as its own task and merely *waited on*: a close that is
+    still going after ``timeout_s`` is abandoned rather than awaited, which is
+    the difference between a run that reports salvaged results and one that gets
+    killed by the external case timeout with its results still in memory.
+    """
+    closing = asyncio.ensure_future(http.aclose())
+    with contextlib.suppress(Exception):
+        await asyncio.wait({closing}, timeout=timeout_s)
+    if not closing.done():
+        closing.cancel()
+
+
+async def drain_batch_task(
+    batch_task: asyncio.Task,
+    *,
+    budget_s: float,
+    sink: Sequence[BatchCompletion] = (),
+    salvage_timeout_s: float = SALVAGE_TIMEOUT_S,
+) -> tuple[list[BatchCompletion], bool]:
+    """Wait ``budget_s`` for a batch submission; salvage what it did on timeout.
+
+    Returns ``(completions, drain_timed_out)``. Three layers, because each one
+    has been seen to fail on a GPU with a five-figure pool:
+
+    1. the bounded wait itself — ``asyncio.wait`` rather than ``wait_for``, so a
+       coordinator that returns partial results on cancellation is read as a
+       result and not as a swallowed timeout;
+    2. the cancel, after which the coordinator hands back everything it
+       finished (see ``submit_batch_direct``);
+    3. ``sink`` — the same list the coordinator appends to — read directly if
+       even the cancelled coordinator does not come back in time. Completed work
+       cannot be lost to a teardown.
+    """
+    _, pending = await asyncio.wait({batch_task}, timeout=max(0.0, budget_s))
+    if not pending:
+        if batch_task.cancelled():
+            return _by_index(sink), True
+        # `.result()` re-raises: a submission that failed for its own reasons is
+        # a bug in the harness or the engine, and has always aborted the run.
+        return list(batch_task.result()), False
+
+    batch_task.cancel()
+    with contextlib.suppress(Exception):
+        await asyncio.wait({batch_task}, timeout=salvage_timeout_s)
+    if batch_task.done() and not batch_task.cancelled() and batch_task.exception() is None:
+        return list(batch_task.result()), True
+    return _by_index(sink), True
+
+
+def _by_index(completions: Sequence[BatchCompletion]) -> list[BatchCompletion]:
+    """Item order, not completion order: the result file has always been sorted."""
+    return sorted(completions, key=lambda c: c.index)
+
+
 async def submit_batch_direct(
     base_url: str,
     items: Sequence[dict],
@@ -454,7 +525,9 @@ async def submit_batch_direct(
     concurrency: int | None = None,
     max_connections: int = CPU_DEFAULTS["batch_concurrency"],
     timeout_s: float = 900.0,
+    per_request_timeout_s: float | None = None,
     client: httpx.AsyncClient | None = None,
+    sink: list[BatchCompletion] | None = None,
 ) -> list[BatchCompletion]:
     """Fire the whole pool straight at vLLM (the ``naive``/``technique_b`` path).
 
@@ -463,10 +536,27 @@ async def submit_batch_direct(
     ceiling is then ``max_connections``, the size of the HTTP pool — an
     unavoidable one, but it must be a stated number rather than an httpx
     default nobody chose.
+
+    **Cancellation returns the work already done.** A pool of tens of thousands
+    of items against a saturated engine will not finish inside any drain the
+    harness is willing to wait for, and a `gather` that is cancelled discards
+    every completed item with it — the run then reports nothing at all rather
+    than the hours of measurement it actually holds. So each completion is
+    appended to a list as it lands (``sink``, if the caller wants to watch it
+    from outside), outstanding items are cancelled and briefly awaited, the
+    client is closed under a guard, and the salvaged completions are *returned*
+    rather than lost to the ``CancelledError``.
+
+    ``per_request_timeout_s`` bounds one item; it defaults to ``timeout_s`` so
+    an unset caller measures exactly what it did before. Callers that know the
+    run's shape pass the window plus the drain, which is the longest an item can
+    matter for.
     """
     owns = client is None
     http = client or httpx.AsyncClient(timeout=timeout_s, limits=batch_limits(max_connections))
     gate = asyncio.Semaphore(concurrency) if concurrency else None
+    request_timeout = timeout_s if per_request_timeout_s is None else per_request_timeout_s
+    done: list[BatchCompletion] = sink if sink is not None else []
 
     async def one(index: int, body: dict) -> BatchCompletion:
         if gate is not None:
@@ -478,7 +568,7 @@ async def submit_batch_direct(
             response = await http.post(
                 f"{base_url.rstrip('/')}/v1/chat/completions",
                 json={**body, "stream": False, "priority": priority},
-                timeout=timeout_s,
+                timeout=request_timeout,
             )
             if response.status_code == 200:
                 usage = (response.json() or {}).get("usage") or {}
@@ -492,7 +582,7 @@ async def submit_batch_direct(
             if gate is not None:
                 gate.release()
         ended = time.perf_counter()
-        return BatchCompletion(
+        completion = BatchCompletion(
             index=index,
             custom_id=f"item-{index}",
             started_at=began - t0,
@@ -502,12 +592,26 @@ async def submit_batch_direct(
             completion_tokens=ctoks,
             error=error,
         )
+        # Recorded before the coordinator sees it, so a cancellation that lands
+        # between "response parsed" and "gather returns" still keeps the item.
+        done.append(completion)
+        return completion
 
+    tasks = [asyncio.create_task(one(i, b), name=f"batch-item-{i}") for i, b in enumerate(items)]
     try:
-        return list(await asyncio.gather(*(one(i, b) for i, b in enumerate(items))))
+        return list(await asyncio.gather(*tasks))
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        # Not `gather(..., return_exceptions=True)`: this task is already
+        # cancelling, and `wait` neither re-raises the children's errors nor
+        # waits past the grace period for one that ignores its cancel.
+        with contextlib.suppress(Exception):
+            await asyncio.wait(tasks, timeout=CANCEL_GRACE_S)
+        return sorted(done, key=lambda c: c.index)
     finally:
         if owns:
-            await http.aclose()
+            await _close_quietly(http)
 
 
 # ---------------------------------------------------------------------------
@@ -869,24 +973,43 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
     )
 
     completions: list[BatchCompletion] = []
+    drain_timed_out = False
     tick_reports: list[dict] = []
     online: list[RequestRecord] = []
     try:
         if cfg.condition == "online_only":
             online = await gen.run(offsets, t0=t0)
-        elif cfg.condition == "offline_only":
-            completions = await submit_batch_direct(
-                cfg.base_url, items, t0=t0, max_connections=cfg.batch_concurrency
-            )
-        elif cfg.condition in ("naive", "technique_b"):
+        elif cfg.condition in ("offline_only", "naive", "technique_b"):
+            # One code path for all three direct-submission arms. `offline_only`
+            # used to have no timeout at all — its window *is* the batch, which
+            # is not the same thing as unbounded, and a five-figure pool against
+            # a saturated engine ran until the external case timeout killed the
+            # process and every completed item with it.
+            sink: list[BatchCompletion] = []
+            budget = cfg.drain_timeout_s
+            if cfg.condition == "offline_only":
+                budget += cfg.duration_s
             batch_task = asyncio.create_task(
                 submit_batch_direct(
-                    cfg.base_url, items, t0=t0, max_connections=cfg.batch_concurrency
+                    cfg.base_url,
+                    items,
+                    t0=t0,
+                    max_connections=cfg.batch_concurrency,
+                    per_request_timeout_s=cfg.duration_s + cfg.drain_timeout_s,
+                    sink=sink,
                 ),
                 name="batch",
             )
-            online = await gen.run(offsets, t0=t0)
-            completions = await asyncio.wait_for(batch_task, timeout=cfg.drain_timeout_s)
+            if cfg.condition != "offline_only":
+                online = await gen.run(offsets, t0=t0)
+            completions, drain_timed_out = await drain_batch_task(
+                batch_task, budget_s=budget, sink=sink
+            )
+            if drain_timed_out:
+                typer.echo(
+                    f"[{cfg.condition}] drain timed out after {budget:g}s; "
+                    f"salvaged {len(completions)}/{len(items)} completions"
+                )
         else:  # technique_a
             completions, tick_reports = await _run_technique_a(cfg, items, gen, offsets, t0)
             online = list(gen.records)
@@ -897,6 +1020,11 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
 
     window = cfg.duration_s if offsets else max((c.finished_at for c in completions), default=0.0)
     latencies = gen.latencies()
+    batch = batch_summary(completions, window, pool_size=len(items))
+    # Salvaged runs are still runs — the throughput inside the window is real —
+    # but the makespan and `drained` are not, so analysis has to be able to tell
+    # them apart from a pool that finished on its own.
+    batch["drain_timed_out"] = drain_timed_out
     return {
         "epoch0": epoch0,
         "window_s": window,
@@ -907,7 +1035,7 @@ async def _measure(cfg: RunConfig, server: VllmServer) -> dict:
             "errors": sum(1 for r in online if not r.ok),
             "achieved_rps": (len(online) / window) if window > 0 else 0.0,
         },
-        "batch": batch_summary(completions, window, pool_size=len(items)),
+        "batch": batch,
         "batch_completions": [c.as_dict() for c in completions],
         "metrics": [s.as_dict() for s in samples],
         "metrics_summary": summarize_metrics(samples),
@@ -1172,6 +1300,11 @@ def run(
         typer.echo(
             "  NOTE: the batch pool drained inside the window — raise --batch-items "
             "so the batch tier is never idle, otherwise throughput is under-reported."
+        )
+    if batch.get("drain_timed_out"):
+        typer.echo(
+            "  NOTE: the drain timed out — these are the completions salvaged from a "
+            "pool that never finished. In-window throughput stands; makespan does not."
         )
     if result.get("tidal_stats") is not None:
         typer.echo(f"  tidal   {len(result['tidal_stats'])} scheduler telemetry lines")
