@@ -14,9 +14,9 @@ import logging
 import httpx
 import openai
 import pytest
-from tests.unit.fakes import FakeRepository
 from openai import AsyncOpenAI
 
+from tests.unit.fakes import FakeRepository
 from tidal.api.app import create_app
 from tidal.config import TidalConfig
 from tidal.store.interfaces import BatchStatus, ItemState

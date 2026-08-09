@@ -16,10 +16,10 @@ import pytest
 
 pytest.importorskip("vllm", reason="engine tests require vLLM in the environment")
 
-from tests.unit.engine_fixtures import create_requests, create_scheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
+from tests.unit.engine_fixtures import create_requests, create_scheduler
 from tidal.engine.latency_model import NotReadyError
 from tidal.engine.scheduler import TidalScheduler
 
