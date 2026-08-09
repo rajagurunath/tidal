@@ -1,0 +1,1 @@
+Deployment 83a72464 (hire 6 / evidence gpu-20260809-1333): manually deleted via DELETE /deployment/83a72464-3d37-4c23-833b-c9aa32f1bb26 at ~2026-08-09T11:20Z, HTTP 200 (driver was SIGKILLed to protect the extension; teardown taken over manually). Post-close check: GET /deployments?status=running returned 0 rows.
