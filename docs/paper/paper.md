@@ -1,5 +1,7 @@
 # Tidal: An SLA-Contracted Batch Tier for LLM Serving Engines
 
+> **NOTE:** the canonical, current version of this paper is the LaTeX build (`latex/main.tex` → `tidal-paper-arxiv.pdf`), which additionally contains the GPU validation, fleet-placement, and phase-decoupling sections with audit-corrected numbers. This markdown predates those sections.
+
 **Gurunath Lunkupali Venugopal**
 
 ## Abstract
