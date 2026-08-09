@@ -1,0 +1,1031 @@
+% ---------------------------------------------------------------------------
+% IEEE conference version of the Tidal paper.
+% Reformatted from ../latex/main.tex (arXiv version, v2). Text and numbers are
+% unchanged; only the layout (two columns, float spans, float placement) differs.
+% ---------------------------------------------------------------------------
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,shapes.geometric,
+                patterns,decorations.pathreplacing}
+\usepackage[hidelinks,breaklinks=true]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\definecolor{accent}{HTML}{1F6F8B}
+
+\hypersetup{
+  pdftitle={Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines},
+  pdfauthor={Gurunath Lunkupali Venugopal},
+}
+
+% IEEEtran sets its own float fractions; loosen them a little so the many
+% double-column floats in this paper can share pages with body text.
+\renewcommand{\topfraction}{0.92}
+\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.06}
+\renewcommand{\floatpagefraction}{0.72}
+\renewcommand{\dbltopfraction}{0.92}
+\renewcommand{\dblfloatpagefraction}{0.6}
+\setcounter{topnumber}{3}
+\setcounter{dbltopnumber}{3}
+\setcounter{totalnumber}{5}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\circled}[1]{\tikz[baseline=(c.base)]%
+  \node[circle,draw=black!70,inner sep=0.6pt,font=\sffamily\tiny](c){#1};}
+
+\begin{document}
+
+\title{Tidal: A Deadline-Contracted Batch Tier for\\ Unmodified LLM Serving Engines%
+\thanks{Code, receipts, and raw evidence:
+\href{https://github.com/rajagurunath/tidal}{\code{github.com/\discretionary{}{}{}rajagurunath/\discretionary{}{}{}tidal}}}}
+
+\author{\IEEEauthorblockN{Gurunath Lunkupali Venugopal}
+\IEEEauthorblockA{gurunathrajagopal@gmail.com}}
+
+\maketitle
+
+\begin{abstract}
+Commercial LLM providers sell two products from one set of weights: online inference
+priced for latency, and a batch API at half the price with a 24-hour completion window.
+Self-hosted deployments have no second product, and the research systems that harvest
+idle serving capacity for offline work (HyGen, ConServe) fork the engine and expose no
+completion contract. Tidal adds the contract to unmodified vLLM: an OpenAI-wire
+\code{/v1/batches} front end, admission that \emph{refuses} windows the system's own
+observed rate cannot meet, and per-job least-laxity escalation that leaves on-track jobs
+at the lowest priority band regardless of elapsed time. On rented A6000 nodes serving
+Qwen2.5-7B under 20\,req/s Poisson load, the external gateway recovers \textbf{69.3\%} of
+the same node's steady-state dedicated-offline throughput at $1.18\times$/$1.23\times$
+online p50/p99 (cross-node) --- inside the band the fork-based literature reports --- and
+78.1\% under a diurnal trace at a lower mean offered load (12.1\,req/s), with batch
+completions anti-correlating with online load at $r=-0.85$. We implement the identical
+policy \emph{inside} the engine as a scheduler plugin and compare the two placements on
+identical traces, an axis prior systems do not evaluate: on a CPU testbed, in-engine buys
+26 points of ceiling for $5\times$ the online p99. We also contribute a measurement
+rule for co-serving evaluation: any harvest above 100\% of a claimed ceiling proves the
+ceiling was measured during pipeline fill. Code, spend receipts, and raw evidence are
+open source.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LLM serving, batch inference, deadline scheduling, GPU utilization, vLLM
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+An engine serving interactive chat traffic runs its scheduler every few tens of
+milliseconds; in each iteration it may decode one token for each of a few dozen live
+requests while its token budget --- the number of tokens the hardware could process in
+that iteration at acceptable latency --- sits in the thousands. That slack is the margin
+commercial providers monetize as a second product: submit a file of requests, receive
+results within 24 hours, pay half the online price. Three gaps keep a self-hosted vLLM
+deployment from selling it:
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{The budget is perishable and mostly unspent.} Unused tokens in an
+    iteration are gone. Our in-engine instrumentation shows online-only traffic on our
+    testbed leaving most of $\tau=2048$ tokens idle in a typical iteration
+    (\cref{sec:tech-b-eval}); vLLM ships no surface that sells the remainder --- its
+    offline runner requires dedicating the machine, and an SLA-tier proposal for its
+    scheduler was closed without adoption~\citep{vllm-rfc-30256}.
+  \item \textbf{Best-effort co-location is not a product.} Harvesting systems ---
+    HyGen~\citep{hygen} and ConServe~\citep{conserve} recover 78--88\% of
+    dedicated-offline throughput behind online traffic --- expose no per-job deadline, no
+    admission decision, and no promise a customer can plan around; both are forks of the
+    engine. Deadline-aware schedulers (Niyama~\citep{niyama}) target second-to-minute
+    horizons and degrade rather than refuse.
+  \item \textbf{The naive path is catastrophic.} vLLM's own priority field, used alone,
+    costs $27.3\times$/$22.6\times$ online p50/p99 on our testbed
+    (\cref{sec:placement}): admission priority does not bound resident-request
+    contention. Something must meter how much batch work exists at all.
+\end{itemize}
+
+The missing piece is not a better preemption mechanism --- ConServe's layer-wise
+safepoints already yield in single-digit milliseconds --- but a \emph{contract}: a
+specific job, a specific deadline, admission that refuses infeasible work, and scheduling
+that spends exactly as much online headroom as that deadline requires. The contract is
+what makes the tier sellable. A customer submits an overnight batch because ``done by
+morning'' is dependable enough to plan around; our motivating client,
+lazycode~\citep{lazycode,lazycode-paper} --- a coding agent that plans work with a
+realtime model and executes it on provider batch APIs at the discount --- exists only
+because that window is dependable. And the contract changes what the scheduler may do:
+where disaggregation separates prefill from decode in \emph{space}, a
+deadline-contracted tier may separate work in \emph{time} (\cref{sec:discussion}).
+
+Tidal implements the contract with deliberately classical machinery. Per batch job it
+tracks \emph{laxity} --- time remaining minus work remaining at the observed completion
+rate~\citep{llf}. At admission, a job whose projected completion exceeds its window is
+refused with an error naming the arithmetic. In scheduling, urgency ramps only inside a
+short escalation horizon of remaining \emph{slack}: an on-track job never rises above the
+lowest priority band no matter how long it has run, an at-risk job escalates early,
+continuously, and independently of other jobs, and a token-bucket floor guarantees
+forward progress at maximum urgency --- progress that feeds back into laxity and
+stabilizes the job at the floor rather than oscillating.
+
+We implement this policy at two placements and compare them --- the axis no prior
+co-serving system evaluates, since each evaluates only its own. \emph{Technique A} is a
+sidecar gateway over a stock engine: batch items enter as low-priority requests,
+throttled at 1\,Hz by AIMD over public metrics. \emph{Technique B} moves admission into
+the engine through vLLM's pluggable scheduler interface: a subclass wraps the stock
+scheduler and caps batch tokens per iteration against a latency model fitted continuously
+from the engine's own step timings. Neither placement forks the engine.
+
+\smallskip
+\noindent Contributions:
+\begin{enumerate}\itemsep2pt
+  \item \textbf{A customer-facing batch contract for self-hosted serving}
+    (\cref{sec:contract}): OpenAI-wire \code{/v1/batches} with durable per-job state,
+    laxity-based admission refusal, horizon-scaled escalation, and a progress floor ---
+    semantics neither the co-serving nor the deadline-scheduling literature exposes.
+    The contract is validated in mechanism but not in outcome: no load regime we
+    constructed discriminates escalation end-to-end (\cref{sec:contract-eval}).
+  \item \textbf{The measured price of the no-fork placement at GPU scale}
+    (\cref{sec:gpu}): 69.3\% of a same-node steady-state offline ceiling at
+    $1.18\times$/$1.23\times$ online p50/p99 under flat load, 78.1\% under a diurnal
+    trace at 12.1\,req/s mean offered load --- inside the 78--88\% band the fork-based
+    literature reports, over an engine we never modified.
+  \item \textbf{Placement as an empirical design axis} (\cref{sec:placement}): the same
+    policy outside versus inside the engine on identical traces is a throughput/latency
+    \emph{frontier}, not a ranking --- at capacity on the CPU testbed the gateway holds
+    online p99 to $1.97\times$ where the in-engine scheduler reaches $9.9\times$ while
+    harvesting 26 more points of ceiling; the one GPU point shows the frontier moves with hardware (the
+    $2.54\times$ CPU median tax is $1.18\times$ on the A6000).
+  \item \textbf{An audited measurement discipline for co-serving harvest}
+    (\cref{sec:ceiling}): normalize to a \emph{steady-state-tail} offline denominator,
+    and treat any harvest above 100\% of a claimed ceiling as a failed ceiling, not a
+    system win. This rule changed our own reported result.
+\end{enumerate}
+
+\section{Motivation}
+\label{sec:motivation}
+
+\subsection{One budget, two products}
+\label{sec:budget}
+
+A vLLM V1 iteration schedules up to \code{max\_num\_\discretionary{}{}{}batched\_tokens} ($\tau$) tokens
+across running and waiting requests; $\tau$ is sized so an iteration's latency fits the
+inter-token target. A running decode consumes one token per iteration, a prefill up to a
+chunk; the KV cache separately bounds how many requests may be resident. The token budget
+is the perishable good.
+
+Two distinct mechanisms make the slack harvestable. Filling residual budget with batch
+\emph{prefill} chunks spends idle \emph{compute}: prefill is compute-bound, and
+chunked-prefill schedulers already interleave it under a latency
+budget~\citep{sarathi}. Co-batching batch \emph{decodes} alongside online decodes spends
+idle \emph{memory bandwidth}: with $B$ concurrent decodes, one HBM traversal of the
+weight matrices serves $B$ tokens, so a thicker decode batch moves the projection and MLP
+multiplies from thin, GEMV-like shapes toward higher-arithmetic-intensity GEMM regimes
+--- throughput rises with $B$ at nearly flat iteration latency until compute, or the
+KV-cache reads that do \emph{not} amortize (each request reads its own history), bind
+instead. Neither effect is monotonic or free; both are bounded by the online latency
+budget. Our GPU result --- 1{,}408 batch output tok/s added at $1.18\times$ online p50
+--- is \emph{consistent with} this arithmetic; we have not run the controlled batch-size
+sweep that would demonstrate it mechanistically.
+
+\subsection{Why best-effort is not a product}
+\label{sec:why-contract}
+
+Best-effort co-location delivers whatever slack happens to exist; the customer learns at
+hour 24 how much that was. The obvious repair --- ``priority rises every hour, parity at
+hour 24'' --- fails twice: it escalates small on-track jobs pointlessly and escalates
+large at-risk jobs too late, with full service beginning exactly when time has run out.
+Feasibility is a relation between remaining work and remaining capacity --- which is
+laxity, and which is why the same arithmetic serves as the admission test. We require of
+a contract: (R1) urgency is a function of remaining work versus remaining capacity, never
+of the clock alone; (R2) infeasible work is refused at submission, not accepted and
+missed; (R3) escalation is per-job and continuous, so at-risk jobs neither wait for a
+synchronized threshold nor flood the online tier together.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/v2/f1_motivation.png}
+\caption{\textbf{The budget is mostly unspent --- and spending it naively is
+catastrophic.} Left: resident online requests ($\approx$ decode tokens per iteration)
+under online-only traffic on our testbed --- mean 0.41, i.e.\ 0.02\% of the
+$\tau = 2048$ budget. Right: the online latency price of naive
+co-location (vLLM's priority field alone), $27.3\times$/$22.6\times$ p50/p99
+(\cref{sec:placement}) --- admission priority does not bound resident-request
+contention, which is why something must meter how much batch work exists at all.}
+\label{fig:motivation}
+\end{figure*}
+
+\subsection{The placement question}
+\label{sec:placement-q}
+
+Engine schedulers act per iteration ($\sim$10--100\,ms) with exact visibility of the
+token budget and KV state; an external controller acts at 1\,Hz on aggregate metrics.
+Intuition says in-engine must dominate. But the engine's own priority preemption already
+covers token-granularity interference between controller ticks, and an external
+controller survives engine upgrades untouched. No prior co-location work isolates this
+variable; \cref{sec:placement} measures it, and the intuition does not survive contact.
+
+\section{Design}
+\label{sec:design}
+
+\input{fig-overview}
+
+\subsection{Overview}
+
+\Cref{fig:overview} shows the datapath. Batch jobs enter through an OpenAI-wire
+\code{/v1/files}$+$\code{/v1/batches} API (any OpenAI SDK works with a changed
+\code{base\_url}), are validated line-by-line, checked for feasibility, and stored
+durably (SQLite WAL; the store is a repository interface, so Postgres is a DSN change).
+Items progress \code{pending} $\rightarrow$ \code{inflight} $\rightarrow$
+\code{succeeded}/\code{failed} with idempotent terminal transitions. Online traffic never
+traverses the gateway. Placement A stops at the engine's public API; placement B adds an
+in-engine scheduler plugin. Both placements run the same contract arithmetic.
+
+\subsection{The contract: laxity at admission and in scheduling}
+\label{sec:contract}
+
+For each active batch $b$ with deadline $D_b$, remaining items $R_b$, and observed
+completion rate $r_b$ (sliding window; with no completion history the drain term is
+dropped --- jobs escalate on evidence or deadline proximity, never on a missing
+denominator):
+\begin{align}
+  \mathrm{laxity}(b)   &= (D_b - \mathrm{now}) - R_b / r_b \\
+  \mathrm{urgency}(b)  &= \mathrm{clamp}\!\left(1 - \frac{\mathrm{laxity}(b)}{H},\,0,\,1\right) \\
+  \mathrm{priority}(b) &= 100 \rightarrow 1 \ \text{linearly with urgency}
+\end{align}
+\noindent with $H = \text{escalation horizon } (6\,\mathrm{h} \ll 24\,\mathrm{h}\ \text{window})$
+and $(\text{online} = 0;\ \code{sla\_strict}\ \text{allows}\ 0\ \text{at urgency}\ 1)$.
+
+\paragraph{Admission (R2).} At \code{POST /v1/batches}, projected completion
+$R/r_{\mathrm{global}}$ is checked against the window with a configurable margin;
+infeasible jobs are rejected with an error naming the arithmetic. No history
+$\rightarrow$ accept (the system cannot judge).
+
+\paragraph{Scheduling (R1, R3).} An on-track job ($\mathrm{laxity} \ge H$) never rises
+above priority 100 --- it exerts no \emph{escalation} pressure whatever the clock says.
+The horizon, not the window, scales urgency: scaling by the window is wall-clock aging in
+disguise. Escalated jobs climb independently; above urgency 0.9 a token bucket guarantees
+a minimum admission rate, and the floor's assured progress feeds back into laxity,
+stabilizing the job at the floor. Escalation applies at submission time (vLLM fixes a
+request's priority at admission); the backlog, where laxity lives, is by construction the
+unsubmitted portion. \Cref{fig:priority} contrasts the resulting curves with wall-clock
+aging. Co-location has a latency price even at the lowest band ---
+\cref{sec:eval} measures it; the contract's property is never spending \emph{more}
+online headroom than the deadline requires, not zero cost.
+
+\input{fig-priority}
+
+\subsection{Technique A: external control}
+\label{sec:tech-a}
+
+A 1\,Hz loop scrapes three public metrics (waiting count, KV usage, completion rate),
+smooths them, and adjusts a target in-flight batch count by AIMD: halve on detected
+online queueing or a high KV watermark, increment below a low watermark. The waiting
+metric is not priority-partitioned, so the halving conservatively assumes every queued
+request is ours. Items are claimed in deadline order, grouped by shared prompt prefix to
+recover some prefix-cache locality through arrival order (unablated against HyGen's
+engine-side ordering~\citep{hygen}), and submitted at their batch's current laxity
+priority. Engine unavailability opens a circuit; in-flight items re-queue idempotently.
+Cost: one metrics scrape and one $O(\text{jobs})$ laxity pass per second --- negligible
+beside a single decode step.
+
+\subsection{Technique B: in-engine work conservation}
+\label{sec:tech-b}
+
+\code{TidalScheduler} subclasses the V1 scheduler behind \code{--scheduler-cls} and wraps
+--- never reimplements --- the stock \code{schedule()} (\cref{alg:pregate}). Requests
+with priority $\ge 1$ are the batch class. Each iteration solves for the largest batch
+admission $x$ with $\hat{T}(P_{\mathrm{on}} + x, C) \le \mathrm{TBT}_{\mathrm{budget}}$,
+where $\hat{T}(P,C) = k_1 P + k_2 P(P{+}C) + k_4 (P{+}C) + k_5$ is ConServe's
+context-aware form~\citep{conserve} --- it prices the attention cost a pure token count
+misses --- but fitted \emph{continuously} from the engine's own $(P, C,
+\text{step-time})$ stream: ring buffer, periodic least squares, non-negativity clamps,
+and an $R^2$ gate with a conservative static fallback, removing the offline profiling
+sweep HyGen and ConServe require. With zero online requests resident the cap lifts
+entirely (offline mode: fill $\tau$). A KV guardband (EWMA of online demand, clamped
+5--30\%) stops batch admission before online bursts can starve, and proactive eviction
+picks the batch victim with the least non-prefix-cached work. Enforcement is at chunk
+granularity --- we bound which requests the stock scheduler sees, not its inner token
+loop --- which is what keeps the wrapper robust to upstream drift (it survived an
+upstream jump of roughly 1{,}700 commits during development; porting to release v0.26.0
+required one keyword argument) at the interference cost \cref{sec:placement} quantifies. Per-iteration
+overhead: one closed-form cap solve and two list partitions; the least-squares refit is
+periodic and off the step path.
+
+\begin{algorithm}[t]
+\small
+\caption{TidalScheduler pre-gate (one iteration)}
+\label{alg:pregate}
+\begin{algorithmic}[1]
+\State $x \gets \max\{x : \hat{T}(P_{\mathrm{on}}{+}x,\,C) \le \mathrm{TBT}_{\mathrm{budget}}\}$
+  \Statex \hfill \Comment{$x \gets \infty$ if no online resident}
+\State hide batch waiters beyond $x$; hide all batch if KV $> 1{-}H_{\mathrm{kv}}$
+\State $\textit{out} \gets$ stock \code{schedule()}
+  \Statex \hfill \Comment{unmodified upstream pass}
+\State restore hidden waiters (exception-safe)
+\State if KV $> 1 - H_{\mathrm{kv}}/2$: evict cheapest batch victim
+\State record $(P, C, \text{step time})$; periodically refit $\hat{T}$, gate on $R^2$
+\end{algorithmic}
+\end{algorithm}
+
+\input{fig-lifecycle-b}
+
+\subsection{Robustness}
+\label{sec:robustness}
+
+The failure paths are part of the design, consolidated here. \emph{Model misfit}: if
+$\hat{T}$'s fit fails its $R^2$ gate, the cap falls back to a conservative static value.
+\emph{Cold start}: with no completion history the laxity drain term is dropped ---
+escalate on evidence, never on a missing denominator. \emph{Engine loss}: the circuit
+opens, in-flight items re-queue idempotently, and a restarted dispatcher re-claims
+resultless items (re-execution rides the prefix cache). \emph{Duplicate control}: a
+second dispatcher against one store is data-safe but duplicates work; there is no
+ownership lease (roadmap). \emph{Late results} for cancelled or expired items are
+recorded-then-discarded without corrupting counts. \emph{Non-stable interfaces}:
+\code{scheduler\_cls} is not a stable vLLM interface; technique B pins a version and
+probes signatures. What we deliberately did not build: ConServe's layer-wise safepoint
+preemption and incremental KV checkpointing address unbounded iteration times; chunked
+prefill bounds ours to one $\tau$-sized step, and \cref{sec:placement} argues
+sub-iteration control is exactly what technique B lacks.
+
+\section{Implementation}
+\label{sec:impl}
+
+Tidal is Python over unmodified upstream vLLM (v0.26 series): 424 tests including
+integration tests against a live engine, with the API layer wire-verified against the
+official OpenAI SDK. Item claims are single atomic updates; terminal transitions are
+idempotent, so duplicate or late results never drift \code{request\_counts};
+result-file attachment is first-writer-wins, so concurrent finalization cannot split a
+batch's outputs. Metering prices batch tokens at a configurable discount against an
+online price table; we make no claim about what discount a marginal-cost model would
+justify. The strongest wire-compatibility evidence is external: lazycode's Tidal adapter
+mirrors its Anthropic batch adapter nearly line-for-line --- an existing batch-API client
+adopted the self-hosted tier as just another provider~\citep{lazycode-paper}. One
+obligation a fork never meets: vLLM attaches log handlers only to its own logger tree and
+runs the scheduler in a forked process, so an engine plugin injects logging configuration
+or runs blind. Operational semantics in full: \cref{app:ops}.
+
+\section{Evaluation}
+\label{sec:eval}
+
+Five questions, in order of weight: \textbf{Q1} what does the no-fork gateway cost and
+recover at GPU scale (\cref{sec:gpu})? \textbf{Q2} does harvest follow the online tide
+(\cref{sec:gpu})? \textbf{Q3} how does placement change the price of the same policy
+(\cref{sec:placement})? \textbf{Q4} does the contract machinery change deadline outcomes
+(\cref{sec:contract-eval})? \textbf{Q5} does the in-engine model calibrate itself
+(\cref{sec:tech-b-eval})?
+
+\subsection{Testbeds, and defining the ceiling}
+\label{sec:ceiling}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Testbeds. The CPU rig is for controlled mechanism and placement comparisons
+only; the GPU rig carries the capacity and latency claims.}
+\label{tab:testbeds}
+\begin{tabular}{lll}
+\toprule
+ & CPU (mechanism/placement) & GPU (capacity/latency) \\
+\midrule
+hardware & Apple M4 Pro, CPU-only build & RTX A6000 48\,GB $\times$ 3 nodes (io.net) \\
+model & Qwen2.5-0.5B-Instruct & Qwen2.5-7B-Instruct \\
+engine & vLLM v0.26.1 @ \code{e6d67fdd} & \code{vllm/vllm-openai:v0.26.0} image \\
+budget, policy & $\tau{=}2048$, priority, eager & $\tau{=}2048$, priority \\
+online load & Poisson, seeded, 1--3\,req/s & Poisson, seeded, 20\,req/s \\
+windows & 10 min & 6 min flat; 20 min diurnal; warmup 45\,s \\
+metric & total request latency & total request latency (non-streaming) \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\Cref{tab:testbeds} fixes both rigs. Requests are short chat completions; we measure
+total non-streaming request latency (on these configurations a request is a short prefill
+plus a short decode; a TTFT/TPOT split is not measured here).
+
+\paragraph{Defining the ceiling.} Every ``\% of ceiling'' below divides by the same
+node's \emph{dedicated-offline} rate --- and how that denominator is measured decides the
+result. A burst probe's whole-burst average is ramp-dominated: our probe drains 600 items
+at concurrency 512 with an 18.5\,s makespan, so roughly half the window is pipeline fill,
+and the whole-burst figure (1438, 1427, and 1468 output tok/s across the three nodes)
+understates the node by 43\%. The correct denominator is the probe's
+\textbf{steady-state tail} (last 10\,s): 2049.6, 2031.5, and 2057.0 tok/s, a
+$\pm 0.62\%$ cross-node band --- a tighter
+instrument as well as a correct one. We learned this by being wrong: an independent
+numerical audit of our first draft rejected the whole-burst denominator, and the tell was
+in our own table --- a diurnal run ``harvesting'' 109\% of it. The rule this yields is
+free to apply and the field does not apply it: \textbf{any co-serving harvest above
+100\% of a claimed ceiling is proof the denominator is not a ceiling.} The prior
+literature does not report how its ceilings were measured (\cref{sec:related}). Both
+denominators and the audit trail are archived in the repository. Throughput is
+normalized per node; \textbf{latency ratios are cross-node} (no within-node
+baseline/co-serving pair exists in the evidence) and are labeled as such throughout.
+
+\subsection{Comparison points}
+\label{sec:baselines}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{What each system exposes. $^{*}$as reported by those papers, for forked
+engines, denominator methodology unreported; $^{\dagger}$steady-state-tail denominator
+(\cref{sec:ceiling}), unmodified engine, diurnal row at lower mean offered load
+(12.1 vs 20\,req/s). BlendServe is offline-only; its number is \% of a profiled
+practical optimum, and its only deadline notion is a pool-wide blending window.}
+\label{tab:systems}
+\begin{tabular}{lccccc}
+\toprule
+ & per-job & admission & online & engine & placements \\
+ & deadline & refusal & tier & change & evaluated / harvest \\
+\midrule
+HyGen      & --- & --- & \checkmark & fork & 1 / 78--88\%$^{*}$ \\
+ConServe   & --- & --- & \checkmark & fork ($\sim$9.2k LOC) & 1 / 78--88\%$^{*}$ \\
+BlendServe & window only & --- & --- & modified backend & 1 / 86.6--90.8\% of $T_o$ \\
+Niyama     & per-request (s--min) & degrades & QoS classes & fork & 1 / --- \\
+\textbf{Tidal} & \textbf{24\,h, per job} & \textbf{refuses} & \checkmark &
+  \textbf{none (plugin/sidecar)} & \textbf{2} / 69.3\%; 78.1\%$^{\dagger}$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\Cref{tab:systems} makes the positioning checkable rather than asserted. Our evaluation
+arms: \code{online\_only} (baseline), \code{naive} (vLLM priority field alone --- the
+policy-free control), technique A, technique B, and \code{offline\_only} (the ceiling
+probe).
+
+\subsection{Q1--Q2: the no-fork price at GPU scale}
+\label{sec:gpu}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{GPU results (A6000, Qwen2.5-7B, online 20\,req/s Poisson). ``\% of ceiling''
+uses each node's own steady-state-tail probe (\cref{sec:ceiling}). Latency ratios are
+cross-node. The diurnal row is a 20-minute run, peak 20\,req/s, mean offered load
+12.1\,req/s ($n{=}14{,}498$, zero errors) --- not directly comparable to the flat row.}
+\label{tab:gpu}
+\begin{tabular}{lccccc}
+\toprule
+condition & online p50 & online p99 & vs baseline & batch otok/s & \% of ceiling \\
+\midrule
+online\_only (baseline) & 0.753\,s & 1.570\,s & $1.00\times$ & --- & --- \\
+technique\_a (flat)     & 0.886\,s & 1.927\,s & $1.18\times$/$1.23\times$ & 1408 & \textbf{69.3\%} \\
+technique\_a (diurnal)  & 0.85\,s  & 1.90\,s  & ${\sim}1.13\times$/${\sim}1.21\times$ & 1607 & \textbf{78.1\%} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/v2/f5_gpu_headline.png}
+\caption{\textbf{The headline trade at GPU scale.} Left: online request-latency CDF,
+baseline versus technique A (cross-node). Right: batch harvest as a fraction of the
+node's steady-state offline ceiling, with the band the fork-based literature reports
+shaded for reference.}
+\label{fig:gpu-headline}
+\end{figure*}
+
+The gateway recovers \textbf{69.3\% of the node's steady-state offline ceiling} while
+holding the online tax to $1.18\times$/$1.23\times$ p50/p99
+(\cref{tab:gpu}, \cref{fig:gpu-headline}) --- inside the 78--88\% band HyGen and
+ConServe report for forked engines, from a sidecar over a stock container image. Under
+the diurnal trace, harvest rises to 78.1\% --- but the diurnal run's mean offered load
+is 12.1\,req/s against the flat run's 20 (completion lengths are nearly identical, 56.0
+vs 54.8 mean output tokens), so the two rows are different regimes, not a
+dose-response, and we do not present 78.1\% as evidence that diurnal load helps
+per se.
+
+\paragraph{The tide (Q2).} Per-minute batch completions anti-correlate with online load
+at $r=-0.85$ with the first-minute pipeline-fill bin excluded (minute 0 completes 771
+items against 1667--1894 in every later minute; including it drags the correlation to
+$-0.38$, a startup artifact). The GPU tide is in \emph{phase} with the CPU tide
+($-0.85$ vs $-0.95$; \cref{fig:tides}) but much shallower: batch completions split
+$-6.4\%$ between above- and below-mean-load minutes on GPU against $-22\%$ on CPU ---
+consistent with the GPU having more absolute headroom at the diurnal run's 78.1\%
+ceiling point (12.1\,req/s mean offered load) than the CPU box had at 45\%.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.80\textwidth]{figures/v2/f7_tides.png}
+\caption{\textbf{Batch fills the trough on both testbeds.} Per-minute batch completions
+(bars) against online arrivals (line): CPU $r=-0.95$ (top), GPU $r=-0.85$ with the
+first-minute pipeline-fill bin shaded and excluded (bottom). On the CPU run the AIMD
+target never moved from its cap --- the tide is produced entirely by engine-level
+priority scheduling, the two-level division of labor observed directly.}
+\label{fig:tides}
+\end{figure*}
+
+\paragraph{What the GPU campaign did not produce.} Technique B's compatibility canary
+passed on release v0.26.0 (one keyword-argument fix; 14 engine tests pass against both
+release and dev vLLM), but its matrix measurement --- and the \code{offline\_only} and
+\code{naive} GPU arms --- were lost to a two-stage harness defect in the
+direct-submission path (\cref{app:provenance}). The placement comparison therefore
+remains CPU-only, and the CPU naive arm stands as the policy-free control.
+
+\subsection{Q3: placement, and an inversion}
+\label{sec:placement}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{CPU placement comparison, one table, two regimes: \emph{equal-work} (all
+conditions complete the identical 1{,}200-item batch; 10-min windows, 1\,req/s) and
+\emph{capacity} (non-draining 3{,}000-item pool). Ceiling: 4.43 items/s (68.5 output
+tok/s), dedicated-offline.}
+\label{tab:cpu}
+\begin{tabular}{llcccc}
+\toprule
+condition & regime & online p50 & online p99 & vs baseline (p50/p99) & \% of ceiling \\
+\midrule
+online\_only & equal-work & 0.44\,s & 1.43\,s & $1.00\times$/$1.00\times$ & --- \\
+naive        & equal-work & 11.97\,s & 32.24\,s & $27.3\times$/$22.6\times$ & --- \\
+technique A  & equal-work & 1.12\,s & 2.52\,s & $2.54\times$/$1.76\times$ & --- \\
+technique B  & equal-work & 1.26\,s & 11.80\,s & $2.86\times$/$8.25\times$ & --- \\
+\midrule
+technique A  & capacity & --- & --- & p99 $1.97\times$ & 45.1\% \\
+technique B  & capacity & --- & --- & p99 $9.9\times$ & 71.2\% \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/latency_cdf.png}
+\caption{Online request-latency distribution under each CPU condition. The medians
+degrade more than the tails everywhere --- co-serving adds a near-constant per-step cost
+that dominates fast requests --- so p99-only reporting, common in this literature,
+flatters every technique, including ours.}
+\label{fig:cdf}
+\end{figure}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.72\textwidth]{figures/v2/f6_frontier.png}
+\caption{\textbf{Placement is a frontier, not a ranking.} Online p99 ratio (log)
+against harvest, all measured arms, with the band the fork-based literature reports
+shaded. The same policy moves from the CPU point to the GPU point when the binding
+resource changes; technique B's GPU point was not obtained (open marker).}
+\label{fig:frontier}
+\end{figure*}
+
+Naive co-location is catastrophic despite correct priority ordering
+(\cref{tab:cpu}, \cref{fig:cdf}): admission priority does not bound resident-request
+contention. Between the two placements the naive expectation --- in-engine must dominate
+--- is wrong on this hardware. Technique B's cap and guardband address channels that
+never bind here: peak KV usage stayed below 0.5\%, so eviction never fired, and a
+resident batch request decodes every iteration regardless of the admission cap. The
+binding channel is \emph{resident-decode contention}, and only sub-iteration
+participation control --- precisely ConServe's layer-wise mechanism, which our
+no-fork constraint excludes --- could bound it. Technique A holds latency in both
+regimes ($1.76\times$ vs $8.25\times$ p99 at equal work; $1.97\times$ vs $9.9\times$ at
+capacity) because its control point --- how many batch requests exist at all --- is
+upstream of residency. In the capacity regime, technique B converts that residency into
+26 more points of ceiling (71.2\% vs 45.1\%). Placement is a
+frontier (\cref{fig:frontier}): the gateway buys latency protection with throughput, the
+in-engine scheduler the reverse. The comparison is of two placements of \emph{one
+policy}, not of two systems --- and the GPU crossover remains unmeasured because the
+direct-submission GPU arms failed (\cref{sec:gpu}). The one GPU point shows the frontier
+moves: the median tax that costs $2.54\times$ on CPU costs $1.18\times$ on the A6000.
+
+\subsection{Q4: the contract, honestly}
+\label{sec:contract-eval}
+
+We attempted to demonstrate end-to-end deadline discrimination --- a feasible-but-tight
+job that best-effort co-location misses and laxity escalation meets --- and did not find
+a load regime on this testbed that discriminates. At 3\,req/s with a 900-item/15-minute
+job, the batch completed with 3.5 minutes to spare under the heaviest online load we
+could apply; at 2--2.6\,req/s every configuration completed early for \emph{both} arms
+(\cref{tab:deadline}; full grid in \cref{app:deadline}). \textbf{We therefore do not
+claim demonstrated deadline improvement.} What the runs do establish: the escalation
+machinery operates (per-tick priority traces show laxity bands engaging, minimum priority
+66), the floor engages at its configured urgency, and admission refuses jobs the observed
+rate cannot serve. The A6000 runs validate slack harvesting under flat and diurnal load
+but still do not construct the discriminating regime; doing so --- bursty load with
+genuinely scarce slack --- remains the contract's open experiment.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Deadline-stress runs (technique A, 15-minute windows). Every feasible
+configuration completed inside the window for both arms; escalation engaged but was
+never the difference-maker. Full five-row grid: \cref{app:deadline}.}
+\label{tab:deadline}
+\setlength{\tabcolsep}{3.2pt}
+\footnotesize
+\begin{tabular}{lccccc}
+\toprule
+ & online & & & & min.\ \\
+run & load & items & completed & makespan & priority \\
+\midrule
+saturated, best-effort & 3.0\,req/s & 900 & 900/900 & 692\,s & 100 \\
+tight, best-effort     & 2.6\,req/s & 500 & 500/500 & 351\,s & 100 \\
+tight, laxity (+floor) & 2.6\,req/s & 500 & 500/500 & 328\,s & 66 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Q5: self-calibration}
+\label{sec:tech-b-eval}
+
+From cold start, $\hat{T}$ passed its $R^2$ gate within the first capped phase of the
+integration run and settled at MAPE $\approx 0.11$ on live traffic; the batch-token cap
+moved from the cold-start 40 to a converged 1 --- correctly tight, since at a 60\,ms
+budget with $\sim$25\,ms online-only steps this box has little slack to sell, and the
+model discovered that (\cref{fig:timeline}). The same trace shows the offline-mode
+transition: when online traffic stops, the held set empties and batch fills the whole
+budget. Regime-change adaptation (model swap, thermal drift) is untested.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/technique_b_timeline.png}
+\caption{Technique B, step by step: online and batch tokens scheduled per iteration
+(top) and batch requests held back by the pre-gate (bottom). Online traffic stops near
+$t = 600$\,s; the held set empties and batch takes the whole budget --- offline mode.}
+\label{fig:timeline}
+\end{figure}
+
+\section{Discussion: widening the control plane}
+\label{sec:discussion}
+
+Everything measured above places the batch tier against one aggregated engine. The same
+contract widens along three axes, for which we have local evidence only
+(details, tables, and figures in \cref{app:ladder}).
+\textbf{Fleets:} with two phase-shifted replicas, placement that follows slack harvested
+$+32\%$ over pinning all batch to one replica, with per-replica batch completions
+anti-correlating with that replica's own load ($r=-0.83$, $-0.56$) --- mechanism proven
+on a CPU rig whose shared memory bus is a named confound on the latency side.
+\textbf{Disaggregation:} the three signals technique A scrapes have direct counterparts
+in NVIDIA Dynamo~\citep{dynamo} (KVBM block metrics, router queue depth, per-worker
+throughput); the one non-rename nuance is that batch work is prefill-heavy, so the tier
+should target \emph{prefill-worker} troughs.
+\textbf{Phase splitting:} a deadline legalizes an arbitrary gap between a request's
+prefill and its decode. A freeze/thaw spike --- prefill in one process, KV persisted to
+disk, process killed, a fresh process thaws --- produced bit-identical greedy decode with
+TTFT $31.8\times$ faster than recomputing ($7.277 \rightarrow 0.229$\,s, median of 5).
+Total FLOPs are unchanged; only their placement in time moves, and the bill moves to
+storage (12{,}288\,B/token at 0.5B; $\sim$2 orders worse at 70B-class). Disaggregation
+separates prefill from decode in space; a deadline-contracted batch tier separates them
+in time.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Iteration-level scheduling.} Orca introduced iteration-level
+batching~\citep{orca}; Sarathi-Serve's chunked prefill and token budget are the
+structure vLLM V1 inherits~\citep{sarathi}; FastServe brought preemptive MLFQ to
+inference~\citep{fastserve}; InferCept's preemption taxonomy~\citep{infercept} underlies
+HyGen's KV handling. DistServe and Splitwise disaggregate phases in
+space~\citep{distserve,splitwise}; Llumnix rebalances by live migration~\citep{llumnix};
+LMCache and Mooncake~\citep{lmcache,mooncake} own the KV-persistence mechanics our
+freeze/thaw spike deliberately reuses rather than rebuilds.
+
+\textbf{Online/offline co-serving.} ConServe~\citep{conserve} is the closest system and
+the strongest published harvest--interference frontier: an offline-profiled context-aware
+latency model, layer-wise safepoint preemption, and incremental KV checkpointing, at
+78--88\% of ceiling within 25\% of online-only latency. We take its numbers as the
+target our in-engine placement should reach rather than a claim we contest, and we
+differ on exactly three axes, none of which is a better preemption mechanism. First,
+ConServe's offline pool has no per-job identity: its only SLO is the online one, its
+offline metric is aggregate tokens per second, its \code{s} knob is an operator dial ---
+nothing is ever refused. Tidal's contribution sits there (per-job windows, admission
+refusal, horizon-scaled escalation, a floor with laxity feedback). Second, ConServe is a
+$\sim$9.2k-LOC fork including in-model instrumentation; both our placements are
+unforked, and we treat that as a measured cost/benefit --- our wrapper survived an
+upstream jump of roughly 1{,}700 commits at the price of chunk-granular enforcement,
+which is one side of our placement frontier. Third, ConServe evaluates one placement; we compare two.
+HyGen~\citep{hygen} shares ConServe's shape (profiled budget, prefix-aware offline
+order, starvation tempering) and the same three differences.
+OOCO~\citep{ooco} and Echo~\citep{echo} are contemporaneous co-scheduling work, also
+contract-free.
+
+\textbf{Offline batch optimization.} BlendServe~\citep{blendserve} exploits the same
+physics from the opposite side: with \emph{no online tier}, it reorders an offline pool
+so compute-heavy and memory-heavy requests overlap, reaching 86.6--90.8\% of a profiled
+optimum. Tidal's setting inverts the degrees of freedom: the memory-bound side of our
+blend is pinned by an exogenous arrival process we cannot reorder, our control variable
+is an admission rate under a live latency constraint rather than a one-time request
+order, and where BlendServe's one deadline notion is a pool-wide blending window, our
+unit of promise is the individual job. The systems compose: BlendServe's
+compute-density order is the right \emph{intra-job} claim order for our dispatcher, and
+its density metric suggests selecting batch items whose resource shape complements the
+current online mix --- neither system implements that today.
+
+\textbf{Deadline-aware serving.} QLM~\citep{qlm} (ILP queue reordering),
+Ascendra~\citep{ascendra}, SCORPIO~\citep{scorpio}, and closest,
+Niyama~\citep{niyama}: per-request deadlines across QoS classes at second-to-minute
+horizons, degrading under overload. None exposes day-scale per-job windows or admission
+refusal. FREESH~\citep{freesh} runs true LLF inside an engine for energy-aware
+scheduling of one request class --- evidence the math runs in this setting, aimed at a
+different problem. Within vLLM itself: priority scheduling was motivated by
+batch/interactive co-location~\citep{vllm-rfc-6077}, an SLA-tier RFC was
+declined~\citep{vllm-rfc-30256}, and an online batch-API endpoint remains an open
+PR~\citep{vllm-pr-44445} --- demand without an assembled answer. Every individual
+mechanism here is published; the contribution is the contract, the placement
+measurement, and the audited synthesis.
+
+\section{Limitations}
+\label{sec:limitations}
+
+Six, one line each; full provenance in \cref{app:provenance}.
+(1) Technique B's admission gating does not bound resident-request inflation --- the
+dominant residual interference channel on the CPU testbed; bounding it requires
+sub-iteration control. (2) The contract is mechanism-validated, not
+outcome-demonstrated (\cref{sec:contract-eval}), and \code{sla\_strict}'s latency price
+is unmeasured. (3) The placement inversion is CPU-only; technique B's GPU arm was lost
+to a harness defect. (4) The GPU ceiling is a steady-state tail of a probe burst, not a
+6-minute dedicated run, and GPU latency ratios are cross-node. (5) The fleet experiment's
+latency side is confounded by shared memory bandwidth (thread-count isolation only).
+(6) Single engine, single model, one dispatcher per store (no lease);
+submission-time escalation cannot re-age already-queued items; \code{scheduler\_cls} is
+not a stable interface.
+
+\section{Conclusion}
+
+The batch API is the rare product where the entire margin is scheduling. Tidal
+implements its contract --- admission, escalation, floor --- over an unmodified
+open-source engine with classical real-time machinery, prices the no-fork placement at
+GPU scale, and is explicit about what remains undemonstrated. We offer it as usable
+infrastructure, a baseline for deadline-contracted serving, and a placement study whose
+GPU evidence currently covers the gateway but not the in-engine scheduler. What is not
+measured here is equally specific: the in-engine GPU matrix, blocked by our harness
+defect, and a load regime that discriminates escalation end-to-end.
+
+\appendices
+% IEEEtran's \appendices does not trip cleveref's article-class \appendix hook,
+% so name the type explicitly and keep the arXiv version's "Appendix A" wording.
+\crefalias{section}{appendix}
+
+\section{Artifact and provenance}
+\label{app:provenance}
+
+\paragraph{Spend and teardown.} Total GPU spend $\approx$\$7.73: \$6.79 in archived
+price-quote receipts across six hires plus a one-hour extension ($\approx$\$0.94) whose
+HTTP 200 was observed in-session but not archived. Three of six hires have archived
+DELETE receipts; two were expiry-reclaimed (DELETE returned 400 resource-not-found); the
+last was deleted manually with a receipt note in \code{evidence/\discretionary{}{}{}TEARDOWN\_NOTES.md}. A
+live check after close showed zero running deployments. \$1.98 of spend (the first two
+hires) produced no data --- marketplace node failures --- and an honest
+cost-per-datapoint includes it.
+
+\paragraph{Harness defects.} (1) The direct-submission path fails at GPU scale
+twice-over: an unbounded drain (fixed with bounded salvage, 12 tests) and a remaining
+stall-after-warmup mode; it cost the \code{offline\_only}, \code{naive}, and technique-B
+GPU arms. (2) macOS fleet isolation is thread-count only. (3) Diurnal-B and B-matrix GPU
+numbers are absent, blocked by (1). (4) Metrics evidence is our own 1\,Hz
+instrumentation plus archived CaaS API responses and engine logs (no production
+observability stack on the dev cluster). (5) Two analysis defects found by an
+independent audit, not by us: a ramp-dominated probe average used as a ceiling and a
+pipeline-fill bin left inside a correlation --- both corrected in \cref{sec:ceiling} and
+\cref{sec:gpu}, both with tells we did not act on (a $>$100\% harvest; a first bin
+completing 771 items against 1667--1894).
+
+\section{Operational semantics and the client}
+\label{app:ops}
+
+A restarted dispatcher re-queues resultless in-flight items; re-execution rides vLLM's
+prefix cache. Late results for cancelled or expired items are recorded-then-discarded
+without corrupting counts, and un-wedge finalization. One dispatcher per store is
+assumed; a second is safe for data, not for duplicated work (no ownership lease;
+roadmap). \Cref{fig:lifecycle-a} traces one batch through the gateway path end to end;
+\cref{fig:loop} closes the loop from client intent to applied code. The client's
+architecture --- the planning algebra, rewrite-rule optimizer, wave scheduler, and
+batch-vs-cached-realtime economics --- is the companion paper's
+subject~\citep{lazycode-paper}.
+
+\input{fig-lifecycle-a}
+\input{fig-loop}
+
+\section{The A-ladder: fleets, disaggregation, phase splitting}
+\label{app:ladder}
+
+\Cref{tab:taxonomy} lays out the ladder; \cref{fig:aladder} draws it. The ladder is the
+complement of technique B, not a competitor: B is maximum visibility over minimum scope
+(one engine's iteration); the ladder trades coarser signals for widening scope, ending
+in a decision B cannot express --- parking work in time.
+
+\begin{table}[!htbp]
+\centering
+\caption{The A-ladder: widening the scope over which the deadline-contracted tier
+places work, with the evidence status of each rung.}
+\label{tab:taxonomy}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{ll>{\raggedright\arraybackslash}p{3.15cm}}
+\toprule
+rung & scope & status \\
+\midrule
+A0  & single aggregated engine        & measured on GPU (\cref{sec:gpu}) \\
+A-F & fleet placement across replicas & mechanism proven locally (\cref{tab:fleet}) \\
+A-D & disaggregated-aware injection   & design $+$ Dynamo metric mapping (\cref{tab:dynamo}) \\
+A-P & phase-split freeze/thaw         & spike-proven locally ($31.8\times$ TTFT) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\input{fig-aladder}
+
+\paragraph{A-F: fleet placement.} Two CPU replicas (Mac M4 Pro; thread-count isolation
+only --- macOS cannot pin cores, so shared memory bandwidth is a named confound),
+phase-shifted diurnal load (period 600\,s, phases $0$/$\pi$), 20-minute window,
+identical 4000-item pool. \textbf{This is not the GPU setup} (Qwen2.5-0.5B, peak
+1\,req/s, 16-token completions); its only job is the placement mechanism. Fleet
+placement (sticky prefix affinity $+$ least-loaded $+$ headroom filter, per-replica AIMD
+with replica-local circuits; 95 of the 424 tests) harvested 2494 in-window items versus
+pinned 1884 ($+32\%$), with batch volume split nearly evenly (1239/1255) but \emph{timed}
+into each replica's trough --- per-replica correlation $-0.83$/$-0.56$
+(\cref{fig:fleet-antiphase}). The cost is real: blended online p50 3.41\,s vs 1.44\,s,
+p99 12.1 vs 3.7 --- attributed to the shared-substrate confound (spreading batch loads
+both replicas' shared memory bus). GPU fleets with real isolation are where the latency
+side resolves; the mechanism claim is what this rig proves.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\columnwidth]{figures/fleet_antiphase.png}
+\caption{A-F mechanism, per replica: measured batch completions (bars) against each
+replica's own analytic online rate (line). Volume splits evenly; \emph{timing} follows
+each replica's trough.}
+\label{fig:fleet-antiphase}
+\end{figure}
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{A-F fleet versus pinned placement, two phase-shifted CPU replicas.}
+\label{tab:fleet}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{l@{\hspace{4pt}}c@{\hspace{4pt}}c@{\hspace{4pt}}c}
+\toprule
+arm & batch items & batch & blended online \\
+    & in-window   & tok/s & p50 / p99 \\
+\midrule
+pinned (all batch $\rightarrow$ replica 0) & 1884 & 24.4 & 1.44\,s / 3.7\,s \\
+fleet (placement follows slack)            & 2494 & 32.2 & 3.41\,s / 12.1\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{A-P: freeze/thaw.} vLLM CPU build, \code{Example\discretionary{}{}{}Connector} (the renamed
+\code{Shared\discretionary{}{}{}Storage\discretionary{}{}{}Connector}), \code{kv\_role=\discretionary{}{}{}kv\_both}, prefix caching disabled.
+Prefill in process 1 $\rightarrow$ KV persisted (23.6\,MB for a 1973-token prompt: whole
+128-token blocks only, 1920 cached tokens at exactly 12{,}288\,B/token) $\rightarrow$
+process killed $\rightarrow$ fresh process thaws $\rightarrow$ bit-identical greedy
+decode, TTFT $7.277 \rightarrow 0.229$\,s $= 31.8\times$ (median of 5). A duplicate arm
+thawing from the in-engine prefix cache measured $48.2\times$; we quote the
+cross-process number because durability --- surviving process death --- is the property
+a deadline-deferred prefill needs. Short prompts (208 tokens) get $1.9\times$, so the
+$\approx$1k-token crossover is an interpolation between two measured points. Load-bearing
+caveats: debug-grade connector; all-or-nothing exact-prompt-hash keying (partial prefix
+reuse is LMCache/Mooncake territory~\citep{lmcache,mooncake}); GPU KV-connector mode
+forces piecewise cudagraphs.
+
+\paragraph{A-D: signal mapping.} \Cref{tab:dynamo}. A-D needs no new policy, only new
+signals; the non-rename nuance is targeting prefill-worker troughs.
+
+\begin{table}[!htbp]
+\centering
+\caption{A-D signal mapping to a Dynamo-style disaggregated deployment.}
+\label{tab:dynamo}
+\begin{tabular}{ll}
+\toprule
+tidal signal & Dynamo counterpart \\
+\midrule
+\code{kv\_usage}   & KVBM block metrics \\
+\code{waiting}     & router queue depth \\
+observed rate      & per-worker throughput \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Full deadline-stress grid}
+\label{app:deadline}
+
+% Pinned in place ([H], via the float package that algorithm.sty loads) so this
+% one-table appendix is not separated from its own heading.
+\begin{table}[H]
+\centering
+\caption{All deadline-stress runs (technique A, 15-minute windows).}
+\label{tab:deadline-full}
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{lccccc}
+\toprule
+ & online & & & & min.\ \\
+run & load & items & completed & makespan & priority \\
+\midrule
+saturated, best-effort & 3.0\,req/s & 900 & 900/900 & 692\,s & 100 \\
+easy, best-effort      & 2.0\,req/s & 350 & 350/350 & 204\,s & 100 \\
+easy, laxity           & 2.0\,req/s & 350 & 350/350 & 188\,s & 91 \\
+tight, best-effort     & 2.6\,req/s & 500 & 500/500 & 351\,s & 100 \\
+tight, laxity (+floor) & 2.6\,req/s & 500 & 500/500 & 328\,s & 66 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{Acknowledgment}
+
+Portions of this manuscript's text were drafted with the assistance of AI tools; the
+author reviewed all content and takes full responsibility for it.
+
+% IEEE reference style is numeric and sorted by first citation; the natbib
+% [numbers,sort&compress] setup below already produces exactly that form.
+\begin{thebibliography}{99}
+\small
+% Several entries end in long unbreakable URLs; ragged-right avoids the large
+% inter-word gaps those would otherwise force in a 3.5in column.
+\raggedright
+
+\bibitem{sarathi} A. Agrawal et al. Taming Throughput-Latency Tradeoff in LLM Inference with
+Sarathi-Serve. OSDI 2024. \href{https://arxiv.org/abs/2403.02310}{\code{arXiv:2403.02310}}.
+
+\bibitem{orca} G.-I. Yu et al. Orca: A Distributed Serving System for Transformer-Based
+Generative Models. OSDI 2022.
+
+\bibitem{fastserve} B. Wu et al. Fast Distributed Inference Serving for Large Language
+Models. \href{https://arxiv.org/abs/2305.05920}{\code{arXiv:2305.05920}}.
+
+\bibitem{llumnix} B. Sun et al. Llumnix: Dynamic Scheduling for Large Language Model
+Serving. OSDI 2024. \href{https://arxiv.org/abs/2406.03243}{\code{arXiv:2406.03243}}.
+
+\bibitem{distserve} Y. Zhong et al. DistServe: Disaggregating Prefill and Decoding for
+Goodput-optimized LLM Serving. OSDI 2024.
+\href{https://arxiv.org/abs/2401.09670}{\code{arXiv:2401.09670}}.
+
+\bibitem{splitwise} P. Patel et al. Splitwise: Efficient Generative LLM Inference Using
+Phase Splitting. ISCA 2024. \href{https://arxiv.org/abs/2311.18677}{\code{arXiv:2311.18677}}.
+
+\bibitem{hygen} T. Sun, P. Wang, F. Lai. HyGen: Efficient LLM Serving via Elastic
+Online-Offline Request Co-location.
+\href{https://arxiv.org/abs/2501.14808}{\code{arXiv:2501.14808}}.
+
+\bibitem{conserve} Y. Qiao et al. ConServe: Fine-Grained GPU Harvesting for LLM Online and
+Offline Co-Serving. \href{https://arxiv.org/abs/2410.01228}{\code{arXiv:2410.01228}}.
+
+\bibitem{blendserve} Y. Zhao et al. BlendServe: Optimizing Offline Inference for
+Auto-regressive Large Models with Resource-aware Batching.
+\href{https://arxiv.org/abs/2411.16102}{\code{arXiv:2411.16102}}.
+
+\bibitem{niyama} Niyama: Breaking the Silos of LLM Inference Serving.
+\href{https://arxiv.org/abs/2503.22562}{\code{arXiv:2503.22562}}.
+
+\bibitem{freesh} FREESH: Fair, Real-time, Energy-Efficient Scheduling for LLM Serving.
+\href{https://arxiv.org/abs/2511.00807}{\code{arXiv:2511.00807}}.
+
+\bibitem{qlm} QLM: Queue Management for SLO-Oriented Large Language Model Serving. SoCC
+2024. \href{https://arxiv.org/abs/2407.00047}{\code{arXiv:2407.00047}}.
+
+\bibitem{ascendra} Ascendra: Dynamic Request Prioritization for Efficient LLM Serving.
+\href{https://arxiv.org/abs/2504.20828}{\code{arXiv:2504.20828}}.
+
+\bibitem{scorpio} SCORPIO: Serving the Right Requests at the Right Time.
+\href{https://arxiv.org/abs/2505.23022}{\code{arXiv:2505.23022}}.
+
+\bibitem{ooco} Online-Offline Co-location for LLM Serving.
+\href{https://arxiv.org/abs/2511.21862}{\code{arXiv:2511.21862}}.
+
+\bibitem{echo} Echo: Efficient Co-scheduling of Hybrid Online-Offline Tasks.
+\href{https://arxiv.org/abs/2504.03651}{\code{arXiv:2504.03651}}.
+
+\bibitem{mooncake} R. Qin et al. Mooncake: A KVCache-centric Disaggregated Architecture for
+LLM Serving. \href{https://arxiv.org/abs/2407.00079}{\code{arXiv:2407.00079}}.
+
+\bibitem{lmcache} LMCache: a KV-cache layer for LLM serving (prefix reuse, tiered storage,
+transfer engine). \href{https://github.com/LMCache/LMCache}{\code{github.com/LMCache/LMCache}}.
+
+\bibitem{dynamo} NVIDIA Dynamo: a datacenter-scale distributed inference serving framework,
+2025. \href{https://github.com/ai-dynamo/dynamo}{\code{github.com/ai-dynamo/dynamo}}.
+
+\bibitem{llf} A. K. Mok. Fundamental Design Problems of Distributed Systems for the Hard-
+Real-Time Environment. MIT, 1983.
+
+\bibitem{vllm} W. Kwon et al. Efficient Memory Management for Large Language Model Serving
+with PagedAttention. SOSP 2023.
+\href{https://arxiv.org/abs/2309.06180}{\code{arXiv:2309.06180}}.
+
+\bibitem{infercept} R. Abhyankar et al. InferCept: Efficient Intercept Support for Augmented
+LLM Inference. ICML 2024. \href{https://arxiv.org/abs/2402.01869}{\code{arXiv:2402.01869}}.
+
+\bibitem{vllm-rfc-6077} vLLM RFC: Priority Scheduling.
+\href{https://github.com/vllm-project/vllm/issues/6077}{\code{github.com/vllm-project/vllm/issues/6077}}.
+
+\bibitem{vllm-rfc-30256} vLLM RFC: SLA-Tiered Scheduling (closed, not planned).
+\href{https://github.com/vllm-project/vllm/issues/30256}{\code{github.com/vllm-project/vllm/issues/30256}}.
+
+\bibitem{vllm-pr-44445} vLLM PR: OpenAI-compatible online Batch and Files API (open).
+\href{https://github.com/vllm-project/vllm/pull/44445}{\code{github.com/vllm-project/vllm/pull/44445}}.
+
+\bibitem{lazycode} lazycode: plan with a realtime LLM, execute on batch APIs.
+\href{https://github.com/rajagurunath/lazycode}{\code{github.com/rajagurunath/lazycode}}.
+
+\bibitem{lazycode-paper} G.~Lunkupali Venugopal. LazyCode: Compiling Interactive Intent
+into Batch Execution --- a Query-Optimizer Architecture, Its Economics, and the Limits of
+Overnight Coding Agents. Companion paper, 2026.
+
+\end{thebibliography}
+
+\end{document}

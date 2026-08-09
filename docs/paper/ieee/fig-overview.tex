@@ -1,0 +1,67 @@
+% One system diagram: the datapath, with BOTH placements of the same policy marked.
+% Circled stage numbers sit inline in the component that owns the stage.
+\begin{figure*}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  box/.style={draw=black!60, rounded corners=2pt, align=center, inner sep=4pt,
+              fill=white, line width=0.6pt},
+  major/.style={box, draw=accent, line width=0.9pt},
+  onl/.style={-{Stealth[length=1.8mm]}, draw=accent!80!black, line width=1.0pt},
+  bat/.style={-{Stealth[length=1.8mm]}, draw=accent, line width=0.9pt,
+              dash pattern=on 3.2pt off 2.2pt},
+  met/.style={-{Stealth[length=1.5mm]}, draw=black!50, line width=0.5pt, densely dotted},
+  lbl/.style={font=\sffamily\tiny, align=center},
+]
+
+% client
+\node[box] (client) at (0,0) {batch client\\ (any OpenAI SDK;\\ lazycode unchanged)};
+
+% gateway (placement A) -- stages live inline, one per row
+\node[major, right=15mm of client] (gw)
+  {\textbf{Tidal gateway \; (placement A)}\\[2pt]
+   \begin{tabular}{@{}l@{}}
+   \circled{1} admission: laxity refuses infeasible windows\\
+   \circled{2} durable store (\code{/v1/files}$+$\code{/v1/batches})\\
+   \circled{3} claim in deadline order at laxity priority\\
+   \circled{4} AIMD throttle at 1\,Hz on \code{/metrics}\\
+   \end{tabular}};
+
+% engine (with placement B inside)
+\node[major, right=17mm of gw] (engine)
+  {\textbf{unmodified vLLM}\\[1.5pt]
+   priority scheduling, chunked prefill, budget $\tau$\\[2.5pt]
+   \begin{tikzpicture}[inner sep=3pt]
+     \node[box, draw=accent!70!black, dash pattern=on 2.4pt off 1.8pt, align=left]
+       {\circled{5} \textbf{placement B}: \texttt{TidalScheduler}\\
+        \phantom{\circled{5} }plugin (\texttt{--scheduler-cls}): caps batch\\
+        \phantom{\circled{5} }tokens per iteration via self-calibrating\\
+        \phantom{\circled{5} }$\hat T$, KV guardband, cheapest-victim evict};
+   \end{tikzpicture}};
+
+% online users
+\node[box, above=6.5mm of engine.north, anchor=south, xshift=8mm] (online)
+  {online users};
+
+% flows
+\draw[bat] (client) -- node[lbl, above=2pt] {batch\\ jobs} (gw);
+\draw[bat] (gw) -- node[lbl, above=2pt] {items, prio\\ $100 \ldots 1$} (engine);
+\draw[onl] (online.south) -- node[lbl, right=3pt, yshift=0.5mm] {straight past\\ the gateway}
+  ($(engine.north)+(8mm,0)$);
+\draw[met] ($(engine.south)+(-4mm,0)$) to[out=245,in=-65]
+  node[lbl, below=2pt] {\code{/metrics}: waiting, KV usage, completion rate}
+  ($(gw.south)+(4mm,0)$);
+
+\end{tikzpicture}}
+\caption[System overview: one policy, two placements]{%
+  \textbf{One policy, two placements.} Batch jobs enter through an OpenAI-wire gateway
+  that \circled{1} refuses infeasible windows at admission, \circled{2} stores jobs
+  durably, \circled{3} claims items in deadline order at their laxity priority, and
+  \circled{4} throttles dispatch by AIMD over the engine's public metrics. Placement A
+  stops there: the engine is stock vLLM, and online traffic never traverses the gateway.
+  Placement B moves admission inside the engine \circled{5} as a scheduler plugin that
+  caps batch tokens per iteration against a self-calibrated latency model. Both are
+  plugins; neither forks the engine.}
+\label{fig:overview}
+\end{figure*}

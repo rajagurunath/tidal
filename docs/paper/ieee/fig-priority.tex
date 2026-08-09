@@ -1,0 +1,91 @@
+% The contract in one picture: three policies over a 24 h window.
+% Verified against src/tidal/dispatcher/laxity.py and src/tidal/config.py
+% (escalation_horizon_s = 6h, batch_priority_max = 100, batch_priority_min = 1,
+%  floor_urgency = 0.9, sla_strict reaches 0 at urgency exactly 1.0).
+% x = wall-clock hours since submission (0..24); y = vLLM priority (100..0).
+% At-risk job drawn with laxity crossing H at t = 14 h, exhausted at t = 20 h.
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  x=0.47cm, y=0.042cm,
+  font=\sffamily\scriptsize,
+  ann/.style={font=\sffamily\scriptsize, align=center, inner sep=1.5pt},
+  ptr/.style={-{Stealth[length=1.5mm,width=1.3mm]}, draw=black!55, line width=0.4pt},
+]
+
+% floor region: urgency > 0.9 for the at-risk job => t in (19.4, 20)..deadline
+\fill[accent!14] (19.4,0) rectangle (24,112);
+
+% axes
+\draw[-{Stealth[length=1.6mm]}, black!70] (-0.8,0) -- (25.2,0);
+\draw[-{Stealth[length=1.6mm]}, black!70] (-0.8,0) -- (-0.8,118);
+
+% x ticks
+\foreach \x/\t in {0/0, 6/6\,h, 12/12\,h, 18/18\,h, 24/24\,h}
+  \draw[black!70] (\x,0) -- (\x,-4) node[below, inner sep=2pt] {\t};
+% y ticks
+\draw[black!70] (-0.8,0)   -- (-1.04,0)   node[left, inner sep=2pt, yshift=-4pt] {0};
+\draw[black!70] (-0.8,1)   -- (-1.04,1)   node[left, inner sep=2pt, yshift=6pt]  {1};
+\draw[black!70] (-0.8,50)  -- (-1.04,50)  node[left, inner sep=2pt] {50};
+\draw[black!70] (-0.8,100) -- (-1.04,100) node[left, inner sep=2pt] {100};
+
+% axis labels
+\node[ann, anchor=north] at (12,-16) {wall-clock time since submission};
+\node[ann, rotate=90, anchor=south] at (-2.4,56)
+  {vLLM \texttt{priority}\\[-1pt] \emph{(lower $=$ scheduled sooner)}};
+
+% online reference line
+\draw[dotted, black!60] (-0.8,0) -- (25.2,0);
+\node[ann, anchor=west, black!60] at (0.2,7) {online $=0$};
+
+% deadline marker
+\draw[dashed, black!45] (24,0) -- (24,104);
+\node[ann, anchor=south, black!55] at (23.4,105) {deadline};
+
+% --- wall-clock aging strawman: linear 100 -> 0 across the window
+\draw[black!45, dash pattern=on 3pt off 2pt, line width=0.9pt] (0,100) -- (24,0);
+
+% --- laxity, on-track job: flat at 100 the whole window
+\draw[accent, line width=1.2pt] (0,100) -- (24,100);
+\fill[accent] (12,100) circle (1.7pt);
+
+% --- laxity, at-risk job: flat until laxity < H at t=14, ramp to 1 by t=20
+\draw[accent!70!black, densely dotted, line width=1.2pt]
+  (0,100) -- (14,100) -- (20,1) -- (24,1);
+\fill[accent!70!black] (14,100) circle (1.7pt);
+% sla_strict continuation at the deadline
+\draw[accent!70!black, dashed, line width=0.9pt] (24,1) -- (24,0);
+\fill[accent!70!black] (24,0) circle (1.6pt);
+
+% annotations
+\node[ann, anchor=west] (a1) at (2.2,80)
+  {\textcolor{accent}{\textbf{on-track job (laxity $\ge H$)}}: pinned at $100$\\
+   however deep into the window --- hour 12\\ exerts \emph{no} escalation pressure};
+\draw[ptr] (a1.east) -- (12,97);
+
+\node[ann, anchor=east] (a2) at (12.4,30)
+  {\textcolor{black!55}{\textbf{wall-clock aging}}: escalates on the\\
+   clock alone --- small on-track jobs rise\\ pointlessly, large at-risk jobs too late};
+\draw[ptr] (a2.east) -- (15.8,34);
+
+\node[ann, anchor=east] (a3) at (23.8,84)
+  {\textcolor{accent!70!black}{\textbf{at-risk job}}: ramps over its last\\
+   $H=6$\,h of \emph{slack}, not of the window\\ --- here laxity crosses $H$ at $t{=}14$\,h};
+\draw[ptr] (a3.south) -- (16.6,58);
+
+\node[ann, anchor=east] (a4) at (18.4,12)
+  {floor: token bucket\\ above urgency $0.9$};
+\draw[ptr] (a4.east) -- (19.9,7);
+
+\end{tikzpicture}
+\caption[Three escalation policies over one 24-hour window]{%
+  \textbf{The contract in one picture.} Wall-clock aging (gray dashes) escalates every
+  job on the clock alone. Laxity escalation separates the cases: an on-track job (solid)
+  stays at the lowest band for the entire window, while an at-risk job (dotted) ramps
+  linearly over its last $H = 6$\,h of \emph{slack} --- beginning when its laxity crosses
+  $H$, not at any fixed hour --- to one notch below online. Above urgency $0.9$ (shaded) a
+  token bucket guarantees a minimum admission rate, whose assured progress feeds back into
+  laxity and stabilizes the job at the floor; \texttt{sla\_strict} allows the dashed final
+  step to priority $0$ --- parity --- exactly at the deadline.}
+\label{fig:priority}
+\end{figure*}
