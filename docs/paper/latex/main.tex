@@ -64,7 +64,11 @@ $1.76\times$ baseline where the in-engine scheduler reaches $8.25\times$, becaus
 binding interference channel (resident-decode contention) sits below the reach of
 admission-time control --- while the in-engine scheduler harvests 71\% of the offline
 throughput ceiling versus the gateway's 45\%, making placement a throughput/latency
-frontier rather than a ranking. We are explicit about what the testbed cannot show,
+frontier rather than a ranking. A subsequent GPU validation (RTX A6000, Qwen2.5-7B, rented
+on the io.net marketplace) finds the gateway harvesting \textbf{98.7\% of the same node's
+dedicated-offline ceiling at $1.18\times$ / $1.23\times$ online p50 / p99}: on
+under-utilized GPUs co-serving approaches free harvest, and the tide effect grows as
+utilization rises. We are explicit about what the testbed cannot show,
 including that no tested load regime discriminated the escalation machinery end-to-end.
 The implementation, including a client that plans coding work onto batch APIs, is open
 source.
@@ -155,6 +159,10 @@ Contributions:
   \item \textbf{The placement comparison}: the same policy externally vs in-engine on
     identical traces, revealing a throughput/latency frontier and an inversion the
     fork-based literature --- which evaluates only its own placement --- has not reported.
+    On rented A6000 GPUs the gateway then harvests 98.7\% of the same node's
+    dedicated-offline ceiling at $1.18\times$ / $1.23\times$ online p50 / p99 --- on
+    under-utilized GPUs co-serving approaches free harvest, and the tide effect grows as
+    utilization rises.
   \item \textbf{Deployability artifacts}: durable OpenAI-wire API, crash recovery,
     idempotent state machines, metering, and a real client --- with the operational
     semantics (\cref{sec:impl}) a paper usually omits and an operator cannot.
@@ -481,6 +489,211 @@ near $t = 600$\,s the held set empties and batch work takes the whole budget ---
 \end{figure}
 
 \FloatBarrier
+\subsection{GPU validation (A6000, Qwen2.5-7B, io.net marketplace)}
+\label{sec:gpu}
+
+\paragraph{Setup.} io.net dev CaaS marketplace, RTX A6000 48\,GB nodes (3 distinct physical
+nodes across hires), Qwen2.5-7B-Instruct, the \code{vllm/vllm-openai:v0.26.0} image plus
+tidal at a pinned SHA, $\tau = 2048$ default engine config, \code{MAX\_MODEL\_LEN} $= 8192$,
+online 20\,req/s Poisson (seed 7), 6-minute measured windows, warmup 45\,s. Total spend
+\$7.73 (6 hires including one 1-hour extension; every deployment torn down, teardown
+receipts in \code{evidence/*/driver.log}).
+
+\paragraph{Instrument credibility.} Independent offline-ceiling probes on the 3 nodes
+returned 1438.3 / 1426.7 / 1467.6 output tok/s --- a $\pm 1.4\%$ band; cross-node
+comparisons are normalized per-node.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{GPU results (A6000, Qwen2.5-7B, online 20\,req/s Poisson). ``\% of node ceiling''
+is batch output throughput against that node's own independently probed dedicated-offline
+rate; the diurnal row is a 20-minute run with peak 20\,rps.}
+\label{tab:gpu}
+\begin{tabular}{lccccc}
+\toprule
+condition & online p50 & online p99 & vs baseline & batch otok/s & \% of node ceiling \\
+\midrule
+online\_only (baseline) & 0.753\,s & 1.570\,s & $1.00\times$ & --- & --- \\
+technique\_a            & 0.886\,s & 1.927\,s & $1.18\times$\,/\,$1.23\times$ & 1408 & \textbf{98.7\%} \\
+technique\_a (diurnal)  & 0.85\,s  & 1.90\,s  & ${\sim}1.13\times$\,/\,$1.21\times$ & 1607 & ${\sim}109\%$ of flat probe$^{*}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\linewidth]{figures/gpu_latency_cdf.png}
+\caption{GPU online request latency, baseline versus technique A (A6000, Qwen2.5-7B,
+20\,req/s Poisson). The co-location tax that cost $2.54\times$ p50 on the CPU testbed is
+$1.18\times$ here.}
+\label{fig:gpu-cdf}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.80\linewidth]{figures/gpu_throughput.png}
+\caption{Batch output throughput recovered while online traffic is served, as a fraction of
+the same node's independently probed dedicated-offline ceiling: 98.7\%.}
+\label{fig:gpu-throughput}
+\end{figure}
+
+\paragraph{Diurnal trace on GPU.} $^{*}$The diurnal run harvested \emph{more} than the
+flat-load run and than its own node probe (1467.6): deeper troughs supply more aggregate
+slack than constant mid-load; also $n = 14498$ online requests served.
+$\mathrm{corr}(\text{online/min}, \text{batch/min}) = -0.38$ --- weaker anti-phase than CPU
+($-0.95$) \emph{because} the GPU is over-provisioned at this load: batch flows near-ceiling
+in both tides (1836 versus 1624 items/min low/high) (\cref{fig:gpu-diurnal}). The claim
+shape this supports: on under-utilized GPUs co-serving approaches free harvest; the tide
+effect grows as utilization rises (the CPU testbed is the high-utilization regime).
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.85\linewidth]{figures/gpu_diurnal_tide.png}
+\caption{GPU tide-filling under a sinusoidal online load (technique A, 20-minute window,
+peak 20\,req/s). Anti-correlation is only $r = -0.38$ because batch runs near the node
+ceiling in \emph{both} tides --- the head-room is so large that the trough is barely a
+constraint.}
+\label{fig:gpu-diurnal}
+\end{figure}
+
+\paragraph{Technique B on GPU --- honest status.} The compatibility canary PASSED on release
+v0.26.0 after a version-tolerant \code{\_preempt\_request} fix (the only real drift: one
+kwarg), and 14 engine tests pass against \emph{both} release and dev vLLM. The matrix
+measurement was \textbf{not obtained}: the harness's direct-submission path fails at GPU
+scale twice-over --- (1) the original unbounded/hanging drain (fixed with bounded salvage,
+12 new tests), then (2) a second defect where the case stalls immediately after warmup (log:
+last line ``warmup: 30 requests in 23.4s''). The \code{offline\_only} and \code{naive} GPU
+arms were lost to the same path. The CPU naive arm ($22.6\times$ p99) stands as the
+policy-free control. This is a roadmap item, not a paper claim.
+
+\FloatBarrier
+\section{Widening the control plane: fleets and phase decoupling}
+\label{sec:widening}
+
+Everything measured so far places the batch tier against \emph{one} aggregated engine. That
+is the narrowest useful scope, not the only one. \Cref{tab:taxonomy} lays out the ladder we
+have started to climb, together with the evidence status of each rung --- A0 is what
+\cref{sec:gpu} measures on GPU; A-F and A-P are proven locally; A-D is design plus a metric
+mapping.
+
+\begin{table}[!htbp]
+\centering
+\caption{The A-ladder: widening the scope over which the deadline-contracted tier places
+work, with the evidence status of each rung.}
+\label{tab:taxonomy}
+\begin{tabular}{ll>{\raggedright\arraybackslash}p{7.4cm}}
+\toprule
+rung & scope & status \\
+\midrule
+A0  & single aggregated engine        & measured on GPU (\cref{sec:gpu}) \\
+A-F & fleet placement across replicas & mechanism proven locally (\cref{tab:fleet}) \\
+A-D & disaggregated-aware injection   & design $+$ Dynamo metric mapping (\cref{tab:dynamo}) \\
+A-P & phase-split freeze/thaw         & spike-proven locally ($31.8\times$ TTFT) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ladder is the complement of technique B, not a competitor to it. Technique B is
+\emph{maximum visibility over minimum scope}: it sees one engine's iteration exactly. The
+A-ladder trades that for coarser signals over widening scope, and ends at a decision B
+cannot express at all --- parking work in time. As the one-liner:
+\emph{``disaggregation separates prefill from decode in space; a deadline-contracted batch
+tier separates them in time.''}
+
+\paragraph{A-F: fleet placement (local experiment).} Two CPU replicas (Mac M4 Pro,
+thread-count isolation \emph{only} --- macOS cannot pin cores, so shared memory bandwidth is
+a named confound), phase-shifted diurnal online load (period 600\,s, phases $0$ and $\pi$),
+20-minute window, seed 7, 4000-item pool identical in both arms;
+\code{placement=fleet} versus \code{placement=pinned} (all batch $\rightarrow$ replica 0).
+Harvest: fleet 2494 in-window items (32.2\,tok/s) versus pinned 1884 (24.4) $=$
+\textbf{$+32\%$}. The mechanism is visible per replica: $\mathrm{corr}$(a replica's own
+analytic online rate, its batch completions per 2\,min) $=$ \textbf{$-0.83$ (replica 1),
+$-0.56$ (replica 2)}, with batch volume split roughly evenly (1239 / 1255) but \emph{timed}
+into each replica's trough. The cost is real and we do not hide it: blended online p50
+3.41\,s (fleet) versus 1.44\,s (pinned), p99 12.1 versus 3.7 --- attributed to the
+shared-substrate confound (spreading batch loads \emph{both} engines' shared memory bus;
+pinning sacrifices one replica and spares the other). GPU fleets with real isolation are
+where the latency side resolves; the mechanism claim (placement follows slack) is what the
+CPU experiment proves. Implementation: \code{fleet.py} placement (sticky prefix affinity
+$+$ least-loaded $+$ headroom filter), per-replica AIMD with replica-local circuits, 95 new
+tests (422 total), production-wired behind \code{TIDAL\_VLLM\_REPLICAS}.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{A-F fleet placement versus pinned placement, two phase-shifted CPU replicas,
+20-minute window, identical 4000-item pool.}
+\label{tab:fleet}
+\begin{tabular}{lccc}
+\toprule
+arm & batch items in-window & batch tok/s & blended online p50 / p99 \\
+\midrule
+pinned (all batch $\rightarrow$ replica 0) & 1884 & 24.4 & 1.44\,s / 3.7\,s \\
+fleet (placement follows slack)            & 2494 & 32.2 & 3.41\,s / 12.1\,s \\
+\midrule
+\multicolumn{4}{l}{harvest $+32\%$; per-replica corr(online rate, batch completions)
+$= -0.83$, $-0.56$; volume split 1239 / 1255} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{A-P: freeze/thaw, a spike.}%
+{\sloppy
+If the batch tier may defer work, it may also
+split a request's \emph{phases} across time. We ran the smallest experiment that could falsify this:
+vLLM CPU build, \code{ExampleConnector} (the renamed \code{SharedStorageConnector} --- the
+only device-agnostic in-tree connector), \code{kv\_role=kv\_both}, prefix caching disabled.
+Prefill in process 1 $\rightarrow$ KV persisted to disk (23\,MB for a 1973-token prompt $=$
+12\,KB/token at 0.5B) $\rightarrow$ process killed $\rightarrow$ a fresh process thaws
+$\rightarrow$ \textbf{bit-identical greedy decode}, with TTFT 7.277\,s $\rightarrow$
+0.229\,s $=$ \textbf{$31.8\times$} (median of 5). Short prompts (208 tokens) get only
+$1.9\times$ (fixed per-file read costs), putting the crossover at $\approx$1k tokens.
+Caveats, all of them load-bearing: a debug-grade connector; all-or-nothing
+exact-prompt-hash keying
+(no partial prefix reuse --- that is LMCache~\citep{lmcache} / Mooncake~\citep{mooncake}
+territory); \textbf{total FLOPs are unchanged --- only their placement in time moves}; at
+70B-class KV bytes/token this is $\sim$2 orders worse, making storage the binding economic
+constraint; and GPU KV-connector mode forces piecewise cudagraphs.\par}
+
+\paragraph{A-D: what the signals map to.} A-D needs no new policy, only new signals. On a
+disaggregated deployment the three metrics technique A already scrapes have direct
+counterparts in NVIDIA Dynamo~\citep{dynamo} (\cref{tab:dynamo}); the one nuance that is not
+a rename is that batch work is prefill-heavy, so the tier should target \emph{prefill-worker}
+troughs rather than aggregate troughs.
+
+\begin{table}[!htbp]
+\centering
+\caption{A-D signal mapping: the metrics technique A's control loop consumes, and their
+counterparts in a Dynamo-style disaggregated deployment.}
+\label{tab:dynamo}
+\begin{tabular}{ll}
+\toprule
+tidal signal & Dynamo counterpart \\
+\midrule
+\code{kv\_usage}   & KVBM block metrics \\
+\code{waiting}     & router queue depth \\
+observed rate      & per-worker throughput \\
+\midrule
+\multicolumn{2}{l}{disaggregation nuance: batch is prefill-heavy $\rightarrow$ target
+prefill-worker troughs} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Where this sits in the literature.} DistServe, Splitwise and
+Dynamo~\citep{distserve,splitwise,dynamo} disaggregate phases in \emph{space}, with the KV
+transferred immediately from prefill worker to decode worker; A-P adds the \emph{temporal}
+axis --- the same split, but with an arbitrary gap in between, which is only a sane thing to
+do when a deadline says it is. LMCache and Mooncake~\citep{lmcache,mooncake} have solved the
+KV-persistence \emph{mechanics} we are deliberately not rebuilding (partial prefix reuse,
+tiered stores, transfer engines); what we add on top is the \emph{deadline economics} that
+decides when parking a prefill is worth its storage bill. Llumnix~\citep{llumnix}
+rebalances online requests across instances by live migration; A-F is the same intuition
+applied to the tier that is allowed to wait --- we do not migrate what is already running,
+we schedule the deferrable tier into whichever replica has slack.
+
+\FloatBarrier
 \section{Related Work}
 
 Iteration-level scheduling and its descendants frame the mechanism space: Orca introduced
@@ -519,13 +732,30 @@ testbed. Bounding it requires per-iteration participation control (abandoning th
 upstream tolerance) or ConServe-style sub-iteration preemption. \textbf{The contract is
 mechanism-validated, not outcome-demonstrated}: no tested regime discriminated escalation
 end-to-end (\cref{sec:eval}, Q3), and the \code{sla\_strict} dial's latency price is
-unmeasured. \textbf{Tail metrics flatter co-location}; we report distributions. \textbf{CPU
-testbed}: no GPU claims are supported. \textbf{Median tax}: even technique A costs
-$\sim$2.5$\times$ p50 on this box; co-location is not free and we do not claim it is. Single
+unmeasured. \textbf{Tail metrics flatter co-location}; we report distributions. \textbf{The
+placement comparison is CPU-only}: \cref{sec:gpu} validates technique A on GPU, but the
+A-vs-B inversion rests entirely on the CPU testbed. \textbf{Median tax}: even technique A
+costs $\sim$2.5$\times$ p50 on the CPU box; co-location is not free and we do not claim it
+is (on GPU the same tax is $1.18\times$). Single
 engine, single model; one dispatcher per store (no lease); submission-time escalation cannot
 re-age already-queued items; step-time attribution is exact on the CPU build and approximate
 under GPU async scheduling; \code{scheduler\_cls} is not a stable interface (technique B pins
 a version; technique A does not).
+
+\paragraph{Known defects in the GPU harness.} We list these as defects rather than
+caveats because they are ours, and they bound what \cref{sec:gpu} may be read to say.
+(1) \textbf{Direct-submission arms fail at GPU scale} --- a two-stage defect: the salvage
+fix for the original unbounded/hanging drain is verified in unit tests, but a second
+stall-after-warmup mode remains, and it cost us the \code{offline\_only}, \code{naive} and
+technique-B GPU arms. (2) \textbf{macOS fleet isolation is thread-count only}
+(\cref{sec:widening}); shared memory bandwidth between the two replicas is unisolated and
+is a named confound on the fleet latency numbers. (3) \textbf{Diurnal-B and B-matrix GPU
+numbers are absent}, blocked by defect (1) --- so the placement inversion remains a
+CPU-only result and the GPU column of the placement comparison is empty. (4) \textbf{The
+metrics evidence is our own instrumentation, not a production observability stack}:
+Grafana per-deployment dashboards do not exist on the dev cluster (Prometheus is behind a
+VPN), so what we archive is the harness's own 1\,Hz scrapes plus archived CaaS API
+responses and engine logs (all under \code{evidence/}).
 
 \section{Conclusion}
 
@@ -586,6 +816,15 @@ Offline Co-Serving. \href{https://arxiv.org/abs/2410.01228}{\code{arXiv:2410.012
 
 \bibitem{echo} Echo: Efficient Co-scheduling of Hybrid Online-Offline Tasks.
 \href{https://arxiv.org/abs/2504.03651}{\code{arXiv:2504.03651}}.
+
+\bibitem{mooncake} R. Qin et al. Mooncake: A KVCache-centric Disaggregated Architecture for
+LLM Serving. \href{https://arxiv.org/abs/2407.00079}{\code{arXiv:2407.00079}}.
+
+\bibitem{lmcache} LMCache: a KV-cache layer for LLM serving (prefix reuse, tiered storage,
+transfer engine). \href{https://github.com/LMCache/LMCache}{\code{github.com/LMCache/LMCache}}.
+
+\bibitem{dynamo} NVIDIA Dynamo: a datacenter-scale distributed inference serving framework,
+2025. \href{https://github.com/ai-dynamo/dynamo}{\code{github.com/ai-dynamo/dynamo}}.
 
 \bibitem{llf} A. K. Mok. Fundamental Design Problems of Distributed Systems for the Hard-
 Real-Time Environment. MIT, 1983.
