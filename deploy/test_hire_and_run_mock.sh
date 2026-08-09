@@ -341,7 +341,7 @@ for f in driver.log hardware.json hardware-choice.json price.json \
   assert_nonempty_file "${EV1}/${f}" "evidence: ${f}"
 done
 
-CHOICE="$(jq -r '.choice.id' "${EV1}/hardware-choice.json")"
+CHOICE="$(jq -r '.candidates[0].id' "${EV1}/hardware-choice.json")"
 assert_eq "$CHOICE" "gpu_1x_a6000" "picks the cheapest available >=24GB card matching PREFER"
 
 PHASES="$(jq -r '.phase' "${EV1}/status-log.jsonl" | tr '\n' ' ')"
