@@ -1,0 +1,230 @@
+% Figure --- the A-ladder: the four deployment rungs of the deadline-contracted
+% batch tier, drawn as the visual companion to Table \ref{tab:taxonomy}.
+% Every number is transcribed from results/GPU_RESULTS_BRIEF.md:
+%   A0  69.3% of steady-state ceiling, 1.18x/1.23x online p50/p99 (GPU table)
+%   A-F +32% harvest, per-replica corr -0.83 (results/fleet_a.json)
+%   A-D design + Dynamo metric mapping (no measurement -- drawn dimmed)
+%   A-P TTFT 7.277s -> 0.229s = 31.8x, 12,288 B/token, bit-identical decode
+\begin{figure}[!htbp]
+\centering
+\definecolor{onl}{HTML}{17456E}
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize, x=1cm, y=1cm,
+  pan/.style={rounded corners=3pt, draw=black!22, fill=black!3, line width=0.5pt},
+  ttl/.style={font=\sffamily\scriptsize\bfseries, text=accent, anchor=west},
+  ttld/.style={font=\sffamily\scriptsize\bfseries, text=black!45, anchor=west},
+  tag/.style={font=\sffamily\tiny\itshape, text=black!50, anchor=west},
+  b/.style={rounded corners=2pt, draw=black!45, fill=white, align=center,
+            inner sep=2.5pt, font=\sffamily\scriptsize},
+  kb/.style={b, draw=accent, line width=0.7pt, fill=accent!10},
+  sb/.style={b, draw=black!40, fill=black!6, font=\sffamily\tiny},
+  db/.style={b, draw=black!35, fill=black!5, text=black!62},
+  on/.style={-{Stealth[length=1.5mm,width=1.4mm]}, draw=onl, line width=0.7pt},
+  ba/.style={-{Stealth[length=1.5mm,width=1.4mm]}, draw=accent, line width=0.7pt,
+             dash pattern=on 1.5pt off 1.2pt},
+  bathick/.style={ba, line width=1.6pt},
+  bathin/.style={ba, line width=0.35pt},
+  bad/.style={ba, draw=black!45},
+  metl/.style={draw=black!48, line width=0.4pt, dash pattern=on 0.4pt off 1.0pt},
+  met/.style={metl, -{Stealth[length=1.2mm,width=1.1mm]}},
+  kvf/.style={-{Stealth[length=1.5mm,width=1.4mm]}, draw=black!60, line width=0.6pt},
+  lb/.style={font=\sffamily\tiny, inner sep=1pt, text=black!68, align=center},
+  adv/.style={font=\sffamily\tiny, align=left, anchor=north west, text width=7.05cm},
+  mtag/.style={circle, draw=black!48, fill=white, inner sep=0pt, minimum size=3.1mm,
+               font=\sffamily\tiny\bfseries, text=black!62},
+]
+
+% ============================ shared legend =================================
+\begin{scope}[on background layer]
+  \fill[black!4, rounded corners=3pt] (0,0.20) rectangle (15.8,0.92);
+\end{scope}
+\draw[on]  (0.18,0.56) -- (0.78,0.56);
+\node[lb, anchor=west] at (0.86,0.56) {online traffic};
+\draw[ba]  (2.52,0.56) -- (3.12,0.56);
+\node[lb, anchor=west] at (3.20,0.56) {batch traffic};
+\node[cylinder, shape border rotate=90, aspect=0.32, draw=black!55, fill=black!12,
+      minimum width=0.30cm, minimum height=0.22cm, inner sep=0pt] at (5.00,0.56) {};
+\node[lb, anchor=west] at (5.24,0.56) {durable store};
+\node[mtag] at (7.18,0.56) {M};
+\node[lb, anchor=west] at (7.40,0.56) {metrics scraped by the gateway};
+\draw[draw=accent, fill=accent!25, line width=0.7pt, rounded corners=1pt]
+     (10.86,0.45) rectangle (11.14,0.67);
+\node[lb, anchor=west] at (11.24,0.56) {measured / proven};
+\draw[draw=black!35, fill=black!8, rounded corners=1pt] (13.28,0.45) rectangle (13.56,0.67);
+\node[lb, anchor=west] at (13.66,0.56) {design only};
+
+% ============================ panel frames ==================================
+\begin{scope}[on background layer]
+  \node[pan, fit={(0,0) (7.60,-4.95)}]      {};
+  \node[pan, fit={(8.20,0) (15.80,-4.95)}]  {};
+  \node[pan, fit={(0,-5.25) (7.60,-10.85)}] {};
+  \node[pan, fit={(8.20,-5.25) (15.80,-10.85)}] {};
+\end{scope}
+
+% ############################ PANEL A0 ######################################
+\node[ttl] (t0) at (0.20,-0.33) {A0\;\textperiodcentered\;one aggregated engine};
+\node[tag] at ($(t0.east)+(0.18,0)$) {measured on GPU};
+
+\node[sb, text width=1.45cm] (a0bs) at (1.40,-1.05) {batch jobs\\ (24\,h SLA)};
+\node[sb, text width=1.45cm] (a0os) at (5.20,-1.02) {online users};
+\node[kb, text width=1.60cm] (a0gw) at (1.40,-2.42) {Tidal gateway};
+\node[kb, text width=2.35cm] (a0en) at (5.20,-2.42)
+     {vLLM engine\\ prefill $+$ decode\\ together};
+
+\draw[ba] (a0bs) -- (a0gw);
+\draw[on] (a0os) -- (a0en);
+\node[lb, text width=1.55cm] at (6.62,-1.53) {straight past\\ the gateway};
+
+\draw[ba] (2.288,-2.16) -- (3.937,-2.16);
+\node[lb, text width=1.35cm] at (3.11,-1.78) {metered by\\ watermarks\\ $+$ laxity};
+\draw[met] (3.937,-2.68) -- (2.288,-2.68);
+\node[mtag] at (3.11,-2.68) {M};
+
+% ---- token-budget bar
+\node[lb, anchor=west, text width=2.05cm, align=left] at (0.25,-3.42)
+     {one engine's token budget $\tau$};
+\fill[accent!62] (2.40,-3.56) rectangle (4.35,-3.28);
+\fill[accent!24] (4.35,-3.56) rectangle (5.90,-3.28);
+\draw[pattern=north east lines, pattern color=black!25] (5.90,-3.56) rectangle (6.30,-3.28);
+\draw[black!55, line width=0.4pt] (2.40,-3.56) rectangle (6.30,-3.28);
+\node[lb, anchor=north] at (3.37,-3.76) {online};
+\node[lb, anchor=north] at (5.12,-3.76) {batch fill};
+\node[lb, anchor=west, text width=1.05cm, align=left] at (6.42,-3.42) {unfilled slack};
+
+\draw[black!22, line width=0.4pt] (0.22,-4.10) -- (7.38,-4.10);
+\node[adv] at (0.22,-4.17)
+  {\textbf{Harvests one engine's blended slack:} \textbf{69.3\%} of the node's
+   steady-state ceiling at \textbf{1.18$\times$\,/\,1.23$\times$} online p50\,/\,p99 (GPU).};
+
+% ############################ PANEL A-F #####################################
+\node[ttl] (tf) at (8.40,-0.33) {A-F\;\textperiodcentered\;fleet placement};
+\node[tag] at ($(tf.east)+(0.18,0)$) {mechanism proven locally};
+
+\node[kb, text width=1.60cm] (afgw) at (9.50,-2.18) {Tidal gateway};
+\node[kb, text width=1.70cm] (afr1) at (13.40,-1.20) {replica 1\\ \emph{at its trough}};
+\node[kb, text width=1.70cm] (afr2) at (13.40,-3.10) {replica 2\\ \emph{at its peak}};
+
+% anti-phase online waves, sampled at a common "now"
+\draw[onl, line width=0.55pt] plot[domain=0:360, samples=46, smooth]
+     ({12.50+\x/360*1.80}, {-1.858+0.13*sin(\x+90)});
+\draw[onl, line width=0.55pt] plot[domain=0:360, samples=46, smooth]
+     ({12.50+\x/360*1.80}, {-2.442+0.13*sin(\x+270)});
+\draw[black!45, line width=0.4pt, dash pattern=on 1pt off 1pt] (13.40,-1.68) -- (13.40,-2.62);
+\fill[onl] (13.40,-1.988) circle (0.055);
+\fill[onl] (13.40,-2.312) circle (0.055);
+\node[lb, anchor=east] at (13.31,-2.15) {now};
+
+\draw[bathick] (10.388,-1.90) -- (12.462,-1.30)
+      node[lb, midway, sloped, above=1.6pt] {most batch here};
+\draw[bathin]  (10.388,-2.46) -- (12.462,-2.96)
+      node[lb, midway, sloped, below=1.6pt] {little or none};
+
+\draw[metl] (12.462,-1.42) -- (12.30,-2.18);
+\draw[metl] (12.462,-2.98) -- (12.30,-2.18);
+\draw[met]  (12.30,-2.18) -- (10.388,-2.18);
+\node[mtag] at (11.30,-2.18) {M};
+
+\draw[on] (15.55,-1.20) -- (afr1.east);
+\draw[on] (15.55,-3.10) -- (afr2.east);
+\node[lb, anchor=south] at (14.94,-1.11) {online};
+\node[lb, anchor=south] at (14.94,-3.01) {online};
+
+\draw[black!22, line width=0.4pt] (8.42,-4.10) -- (15.58,-4.10);
+\node[adv] at (8.42,-4.17)
+  {\textbf{Chases uncorrelated troughs across replicas:} \textbf{$+32\%$} harvest,
+   per-replica anti-phase $r=\mathbf{-0.83}$ (local rig).};
+
+% ############################ PANEL A-D (dimmed) ############################
+\node[ttld] (td) at (0.20,-5.62) {A-D\;\textperiodcentered\;disaggregation-aware};
+\node[tag] at ($(td.east)+(0.18,0)$) {design $+$ Dynamo mapping};
+
+\node[db, text width=1.50cm] (adgw) at (1.42,-7.78) {Tidal gateway};
+\node[db, text width=1.70cm] (adpf) at (5.30,-6.95) {prefill workers};
+\node[db, text width=1.70cm] (addc) at (5.30,-8.60) {decode workers};
+
+\draw[kvf, draw=black!45] (adpf) -- (addc);
+\node[lb, anchor=west, text=black!58, align=left] at (5.48,-7.78) {KV,\\ immediate};
+
+\draw[bad] (1.42,-7.352) -- (1.42,-6.72) -- (4.362,-6.72);
+\node[lb, text width=2.10cm, text=black!58] at (2.90,-6.40)
+     {inject when the prefill pool idles};
+
+\draw[met] (4.362,-7.20) -- (2.258,-7.60);
+\node[mtag] at (3.30,-7.40) {M};
+\draw[met] (4.362,-8.60) -- (2.258,-7.95);
+\node[mtag] at (3.30,-8.28) {M};
+\node[lb, anchor=north, text width=1.95cm, text=black!55] at (1.42,-8.30)
+     {per-pool signals\\ (KVBM, queue depth,\\ per-worker rate)};
+
+\draw[on, draw=onl!55] (5.30,-6.15) -- (5.30,-6.52);
+\node[lb, anchor=west] at (5.48,-6.33) {online};
+
+\draw[black!22, line width=0.4pt] (0.22,-9.55) -- (7.38,-9.55);
+\node[adv] at (0.22,-9.62)
+  {\textbf{Targets phase-specific slack:} batch work is prefill-heavy while
+   steady-state online is decode-heavy, so the two are complementary
+   (design $+$ Dynamo mapping; not yet measured).};
+
+% ############################ PANEL A-P #####################################
+\node[ttl] (tp) at (8.40,-5.62) {A-P\;\textperiodcentered\;phase-split freeze\,/\,thaw};
+\node[tag] at ($(tp.east)+(0.18,0)$) {spike-proven locally};
+
+\node[kb, text width=1.20cm] (appf) at (9.20,-6.85) {prefill worker};
+\node[kb, text width=1.20cm] (apdc) at (13.85,-6.85) {decode worker};
+\node[cylinder, shape border rotate=90, aspect=0.30, draw=black!55, fill=black!12,
+      minimum width=1.30cm, minimum height=0.86cm, inner sep=1pt, align=center,
+      font=\sffamily\tiny] (apkv) at (11.50,-6.85)
+     {KV store\\[1pt]
+      \tikz[baseline=-0.35ex]{\draw[accent, line width=0.4pt]
+        (-0.055,0)--(0.055,0) (-0.028,-0.048)--(0.028,0.048)
+        (-0.028,0.048)--(0.028,-0.048);}\,\textbf{frozen}};
+
+\draw[kvf] (9.888,-6.85) -- (10.85,-6.85);
+\node[lb] at (10.35,-6.18) {KV: 12\,KiB/token};
+\draw[kvf] (12.15,-6.85) -- (13.162,-6.85);
+\node[lb] at (12.66,-6.18) {thaw};
+\draw[on] (14.538,-6.85) -- (15.55,-6.85);
+\node[lb] at (15.04,-6.18) {tokens out};
+
+\node[lb, anchor=north, text width=1.75cm] at (9.20,-7.38)
+     {runs at $t_1$ ---\\ a \emph{prefill}-slack window};
+\node[lb, anchor=north, text width=2.30cm] at (11.50,-7.38)
+     {held for hours; the 24\,h SLA legalizes the gap};
+\node[lb, anchor=north, text width=1.75cm] at (13.85,-7.38)
+     {runs at $t_2$ ---\\ a \emph{decode}-slack window};
+
+% ---- timeline
+\draw[decorate, decoration={brace, amplitude=3pt}, black!50] (9.60,-8.52) -- (14.10,-8.52);
+\node[lb, anchor=south] at (11.85,-8.38) {hours (deadline-funded)};
+\begin{scope}[on background layer]
+  \fill[accent!12] (9.60,-8.98) rectangle (14.10,-8.72);
+\end{scope}
+\draw[-{Stealth[length=1.5mm,width=1.4mm]}, black!55, line width=0.5pt]
+      (8.60,-8.85) -- (15.35,-8.85);
+\draw[accent, line width=0.9pt] (9.60,-9.02) -- (9.60,-8.68);
+\draw[accent, line width=0.9pt] (14.10,-9.02) -- (14.10,-8.68);
+\node[lb, anchor=north] at (9.60,-9.08) {$t_1$ prefill};
+\node[lb, anchor=north] at (14.10,-9.08) {$t_2$ decode};
+\node[lb, anchor=north west, text=black!50] at (14.98,-9.08) {time};
+
+\draw[black!22, line width=0.4pt] (8.42,-9.55) -- (15.58,-9.55);
+\node[adv] at (8.42,-9.62)
+  {\textbf{Prefill when prefill is free, decode when decode is free:} a thawed
+   TTFT is \textbf{31.8$\times$} faster than a cold one, with bit-identical output
+   (local spike). The bill moves to storage --- materialize-versus-recompute
+   economics.};
+
+\end{tikzpicture}
+\caption[The A-ladder]{%
+  \sloppy\textbf{The A-ladder, drawn.} The four rungs of \cref{tab:taxonomy}, in
+  order of widening scope: A0 places deferrable work inside one aggregated engine,
+  A-F across the replicas of a fleet, A-D into the idle \emph{phase pool} of a
+  disaggregated deployment, and A-P across \emph{time} itself, by freezing a
+  finished prefill's KV to a durable store and thawing it into a decode worker
+  hours later. Each panel carries the advantage that rung buys and the number that
+  evidences it; A-D is drawn dimmed because it is design plus a metric mapping
+  (\cref{tab:dynamo}) rather than a measurement. The last rung makes the section's
+  one-liner literal: \emph{disaggregation separates prefill from decode in space;
+  a deadline-contracted batch tier separates them in time.}}
+\label{fig:aladder}
+\end{figure}
