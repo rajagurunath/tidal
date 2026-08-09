@@ -66,6 +66,9 @@
   the adapter fetches the output and error files and reassembles the wave by union over
   \texttt{custom\_id}; the verifier runs the results and applies what passes into a git
   worktree, which feeds the next wave. This is the request lifecycle from client intent
-  to applied code, entirely on self-hosted capacity at batch pricing.}
+  to applied code, entirely on self-hosted capacity at batch pricing. The client-side
+  stages (planner, optimizer, waves, verifier) are detailed in the companion
+  paper~\citep{lazycode-paper}; this figure shows only their interface to the serving
+  tier.}
 \label{fig:loop}
 \end{figure}

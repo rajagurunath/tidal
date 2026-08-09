@@ -314,11 +314,14 @@ there is no ownership lease (a second dispatcher is safe for data, not for dupli
 configurable discount against an online price table; we deliberately make no claim about
 what discount a marginal-cost model would justify.
 
-The client side reuses lazycode's provider abstraction: its Tidal adapter mirrors its
-Anthropic batch adapter nearly line-for-line, with the remaining friction inherited from
-the OpenAI Batch wire itself (no per-item expired counts; results as two files needing a
-union by \code{custom\_id}; cancelled items silently absent). \Cref{fig:loop} closes the
-loop from client intent to applied code. An engine plugin also has an observability
+The client side is lazycode, whose Tidal adapter mirrors its Anthropic batch adapter
+nearly line-for-line --- the strongest evidence for the wire-compatibility claim: an
+existing batch-API client adopted the self-hosted tier as just another provider, with the
+only remaining friction inherited from the OpenAI Batch wire itself. \Cref{fig:loop}
+closes the loop from client intent to applied code; the client's architecture --- the
+planning algebra, rewrite-rule optimizer, wave scheduler, and batch-vs-cached-realtime
+economics --- is the subject of the companion paper~\citep{lazycode-paper} and is not
+duplicated here. An engine plugin also has an observability
 obligation a fork does not: vLLM's logging configuration attaches handlers only to its own
 logger tree, and scheduler telemetry is emitted from a forked EngineCore process ---
 technique B injects a logging configuration or runs blind.
@@ -919,6 +922,9 @@ LLM Inference. ICML 2024. \href{https://arxiv.org/abs/2402.01869}{\code{arXiv:24
 
 \bibitem{lazycode} lazycode: plan with a realtime LLM, execute on batch APIs.
 \href{https://github.com/rajagurunath/lazycode}{\code{github.com/rajagurunath/lazycode}}.
+\bibitem{lazycode-paper} G.~Lunkupali Venugopal. LazyCode: Compiling Interactive Intent
+into Batch Execution --- a Query-Optimizer Architecture, Its Economics, and the Limits of
+Overnight Coding Agents. Companion paper, 2026.
 
 \end{thebibliography}
 
