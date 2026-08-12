@@ -1,6 +1,86 @@
-<!doctype html><meta charset="utf-8"><title>Tidal — paper</title>
-<body style="font-family:system-ui;max-width:40rem;margin:4rem auto;line-height:1.6">
-<h1>Tidal: An SLA-Contracted Batch Tier for LLM Serving Engines</h1>
-<p><a href="tidal-paper-arxiv.pdf"><strong>Read the paper (PDF, arXiv-style preprint)</strong></a></p>
-<p>Source, LaTeX, and measured results: <a href="https://github.com/rajagurunath/tidal">github.com/rajagurunath/tidal</a></p>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</title>
+<meta name="description" content="A serving node sized for interactive traffic runs far below its throughput ceiling most of the time. Tidal is a deadline-contracted batch tier over unmodified vLLM that recovers 69.3% of the node's offline ceiling at 1.18x/1.23x online p50/p99.">
+
+<!-- Google Scholar / highwire citation metadata -->
+<meta name="citation_title" content="Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines">
+<meta name="citation_author" content="Lunkupali Venugopal, Gurunath">
+<meta name="citation_publication_date" content="2026/08/12">
+<meta name="citation_pdf_url" content="https://rajagurunath.github.io/tidal/paper/tidal-paper-arxiv.pdf">
+<meta name="citation_doi" content="10.5281/zenodo.21905462">
+<meta name="citation_abstract_html_url" content="https://rajagurunath.github.io/tidal/paper/">
+
+<style>
+  body{font-family:system-ui;max-width:40rem;margin:4rem auto;line-height:1.6;padding:0 1.25rem;color:#0C1E27}
+  @media (prefers-color-scheme:dark){ body{color:#DCE9EC;background:#071219} a{color:#6FD8CC} }
+  h1{font-size:1.5rem;line-height:1.25;margin-bottom:.25rem}
+  .byline{color:#555;margin:.25rem 0}
+  @media (prefers-color-scheme:dark){ .byline{color:#8FAAB4} }
+  .doi{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem}
+  .abstract{margin:1.75rem 0}
+  .abstract h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.08em;color:#666;margin-bottom:.5rem}
+  @media (prefers-color-scheme:dark){ .abstract h2{color:#8FAAB4} }
+  .links{margin:1.5rem 0;padding:0;list-style:none}
+  .links li{margin:.35rem 0}
+  pre{background:#F3F8F8;border:1px solid #C2D2D6;padding:1rem;overflow-x:auto;font-size:.82rem;border-radius:4px}
+  @media (prefers-color-scheme:dark){ pre{background:#0D1E26;border-color:#1C333D} }
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  footer{margin-top:3rem;font-size:.85rem;color:#777}
+</style>
+</head>
+<body>
+
+<p><a href="../">&larr; tidal</a></p>
+
+<h1>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</h1>
+<p class="byline">Gurunath Lunkupali Venugopal &middot; August 12, 2026</p>
+<p class="doi">DOI: <a href="https://doi.org/10.5281/zenodo.21905462">10.5281/zenodo.21905462</a></p>
+
+<div class="abstract">
+<h2>Abstract</h2>
+<p>A serving node sized for interactive traffic runs far below its throughput ceiling
+most of the time: our online-only GPU baseline emits a third of its node's offline
+ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
+its throughput saturated with offline work, co-serving batch behind live traffic, and
+serving live traffic alone. A batch tier can lift the node from the third toward the
+first without forking the engine. Commercial providers sell that gap as a second product,
+a batch API at half price with a 24-hour completion window; self-hosted deployments have
+none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
+promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
+<code>/v1/batches</code> front end, admission that <em>refuses</em> windows the system's own
+observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
+Qwen2.5-7B, a gateway sidecar recovers <strong>69.3%</strong> of the node's steady-state offline
+ceiling at 1.18&times;/1.23&times; online p50/p99 (flat 20&nbsp;req/s, cross-node); under a
+diurnal trace at 12.1&nbsp;req/s mean offered load it recovers 78.1%. We also implement the
+identical policy <em>inside</em> the engine as a scheduler plugin and compare both
+placements. Code and evidence are open source.</p>
+</div>
+
+<ul class="links">
+  <li><a href="tidal-paper-arxiv.pdf"><strong>PDF</strong></a> &mdash; arXiv-style preprint, 21pp</li>
+  <li><a href="https://doi.org/10.5281/zenodo.21905462"><strong>DOI</strong></a> &mdash; 10.5281/zenodo.21905462 (Zenodo)</li>
+  <li><a href="https://github.com/rajagurunath/tidal"><strong>Code</strong></a> &mdash; rajagurunath/tidal, Apache-2.0</li>
+</ul>
+
+<div class="abstract">
+<h2>BibTeX</h2>
+<pre><code>@misc{lunkupalivenugopal2026tidal,
+  title        = {Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines},
+  author       = {Lunkupali Venugopal, Gurunath},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.21905462},
+  url          = {https://doi.org/10.5281/zenodo.21905462}
+}</code></pre>
+</div>
+
+<footer>
+Source, LaTeX, and measured results: <a href="https://github.com/rajagurunath/tidal">github.com/rajagurunath/tidal</a>
+</footer>
+
 </body>
+</html>
