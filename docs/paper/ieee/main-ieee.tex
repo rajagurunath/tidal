@@ -57,25 +57,22 @@
 \maketitle
 
 \begin{abstract}
-Commercial LLM providers sell two products from one set of weights: online inference
-priced for latency, and a batch API at half the price with a 24-hour completion window.
-Self-hosted deployments have no second product, and the research systems that harvest
-idle serving capacity for offline work (HyGen, ConServe) fork the engine and expose no
-completion contract. Tidal adds the contract to unmodified vLLM: an OpenAI-wire
+A serving node sized for interactive traffic runs far below its throughput ceiling
+most of the time: our online-only GPU baseline emits a third of its node's offline
+ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
+its throughput saturated with offline work, co-serving batch behind live traffic, and
+serving live traffic alone. A batch tier can lift the node from the third toward the
+first without forking the engine. Commercial providers sell that gap as a second product,
+a batch API at half price with a 24-hour completion window; self-hosted deployments have
+none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
+promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
 \code{/v1/batches} front end, admission that \emph{refuses} windows the system's own
-observed rate cannot meet, and per-job least-laxity escalation that leaves on-track jobs
-at the lowest priority band regardless of elapsed time. On rented A6000 nodes serving
-Qwen2.5-7B under 20\,req/s Poisson load, the external gateway recovers \textbf{69.3\%} of
-the same node's steady-state dedicated-offline throughput at $1.18\times$/$1.23\times$
-online p50/p99 (cross-node) --- inside the band the fork-based literature reports --- and
-78.1\% under a diurnal trace at a lower mean offered load (12.1\,req/s), with batch
-completions anti-correlating with online load at $r=-0.85$. We implement the identical
-policy \emph{inside} the engine as a scheduler plugin and compare the two placements on
-identical traces, an axis prior systems do not evaluate: on a CPU testbed, in-engine buys
-26 points of ceiling for $5\times$ the online p99. We also contribute a measurement
-rule for co-serving evaluation: any harvest above 100\% of a claimed ceiling proves the
-ceiling was measured during pipeline fill. Code, spend receipts, and raw evidence are
-open source.
+observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
+Qwen2.5-7B, a gateway sidecar recovers \textbf{69.3\%} of the node's steady-state offline
+ceiling at $1.18\times$/$1.23\times$ online p50/p99 (flat 20\,req/s, cross-node); under a
+diurnal trace at 12.1\,req/s mean offered load it recovers 78.1\%. We also implement the
+identical policy \emph{inside} the engine as a scheduler plugin and compare both
+placements. Code and evidence are open source.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -192,6 +189,36 @@ instead. Neither effect is monotonic or free; both are bounded by the online lat
 budget. Our GPU result --- 1{,}408 batch output tok/s added at $1.18\times$ online p50
 --- is \emph{consistent with} this arithmetic; we have not run the controlled batch-size
 sweep that would demonstrate it mechanistically.
+
+\paragraph{A roofline reading.} The roofline model bounds attainable performance by the
+lower of a compute ceiling and a bandwidth ceiling selected by a kernel's arithmetic
+intensity~\citep{roofline}. The GEMV$\to$GEMM effect above is exactly a move rightward
+along that intensity axis, and co-batching is the only lever an unmodified engine offers
+for making it. Roofline is therefore the frame, GEMV$\to$GEMM the mechanism, and the
+following ordering the evidence:
+\begin{equation*}
+\begin{split}
+  \text{hardware roofline} \;&\ge\; \text{engine offline ceiling} \\
+  \;&\ge\; \text{co-serving} \;\ge\; \text{online-only}.
+\end{split}
+\end{equation*}
+We do not measure the leftmost term. That would require a validated compute-and-bandwidth
+model of the deployed A6000 at the engine's precision, which we did not build, and we make
+no claim about it beyond the inequality. The second term we do measure: the same engine,
+model, and node saturated with offline work and nothing else sustains 2049.6, 2031.5, and
+2057.0 output tok/s in steady state across our three nodes (\cref{sec:ceiling}). It is an
+operational stand-in --- a measured lower bound sitting under the hardware roofline, and
+the only denominator we are entitled to divide by. The distance below it is what this
+paper is about. Online-only traffic at 20\,req/s Poisson leaves the node emitting
+687.6 output tok/s --- its own completions summed over the baseline run's 6-minute
+window --- 33.5\% of that node's 2049.6\,tok/s offline ceiling, at a mean of 15.64
+resident requests; the CPU rig at chat-scale load is starker, a mean of 0.41
+(\cref{fig:motivation}). The gateway lifts harvested work to 1{,}408 batch output tok/s
+under that same flat load, and to 1{,}607 under the diurnal trace at 12.1\,req/s mean
+offered load (\cref{sec:gpu}). The chain is an ordering of regimes, not an additive
+budget: each term is measured on its own request mix, so the online and batch token rates
+are not summable, and the online rate is set by offered load rather than by capacity ---
+which is why co-serving's price shows up in latency and not in online throughput.
 
 \subsection{Why best-effort is not a product}
 \label{sec:why-contract}
@@ -942,6 +969,10 @@ author reviewed all content and takes full responsibility for it.
 
 \bibitem{sarathi} A. Agrawal et al. Taming Throughput-Latency Tradeoff in LLM Inference with
 Sarathi-Serve. OSDI 2024. \href{https://arxiv.org/abs/2403.02310}{\code{arXiv:2403.02310}}.
+
+\bibitem{roofline} S. Williams, A. Waterman, D. Patterson. Roofline: An Insightful Visual
+Performance Model for Multicore Architectures. \emph{Communications of the ACM}
+52(4):65--76, 2009.
 
 \bibitem{orca} G.-I. Yu et al. Orca: A Distributed Serving System for Transformer-Based
 Generative Models. OSDI 2022.
