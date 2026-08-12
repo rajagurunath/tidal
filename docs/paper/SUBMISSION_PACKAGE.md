@@ -1,5 +1,7 @@
 # Tidal — preprint / venue submission package
 
+**PUBLISHED preprint: DOI [10.5281/zenodo.21905462](https://doi.org/10.5281/zenodo.21905462) (Zenodo, 2026-08-12, CC BY 4.0)**
+
 Everything below is paste-ready for a preprint server (Zenodo; TechRxiv when it
 reopens) or a conference submission portal. Keep this file in sync with
 `latex/main.tex` — the abstract here must match the compiled PDF verbatim

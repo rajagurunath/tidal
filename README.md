@@ -1,5 +1,7 @@
 # Tidal 🌊
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21905462.svg)](https://doi.org/10.5281/zenodo.21905462)
+
 **Batch + online co-serving for vLLM** — an OpenAI-compatible Batch API (`/v1/batches`, 24h SLA, half price) that runs on the *same* GPU as your online traffic, filling every iteration's spare token budget with batch work.
 
 > Your GPU's decode iterations use ~1% of their token budget. Tidal sells the other 99%.
