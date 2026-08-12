@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</title>
 <meta name="description" content="A serving node sized for interactive traffic runs far below its throughput ceiling most of the time. Tidal is a deadline-contracted batch tier over unmodified vLLM that recovers 69.3% of the node's offline ceiling at 1.18x/1.23x online p50/p99.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#E7EDEE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#071219" media="(prefers-color-scheme: dark)">
 
 <!-- Google Scholar / highwire citation metadata -->
 <meta name="citation_title" content="Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines">
@@ -15,60 +18,210 @@
 <meta name="citation_abstract_html_url" content="https://rajagurunath.github.io/tidal/paper/">
 
 <style>
-  body{font-family:system-ui;max-width:40rem;margin:4rem auto;line-height:1.6;padding:0 1.25rem;color:#0C1E27}
-  @media (prefers-color-scheme:dark){ body{color:#DCE9EC;background:#071219} a{color:#6FD8CC} }
-  h1{font-size:1.5rem;line-height:1.25;margin-bottom:.25rem}
-  .byline{color:#555;margin:.25rem 0}
-  @media (prefers-color-scheme:dark){ .byline{color:#8FAAB4} }
-  .doi{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem}
-  .abstract{margin:1.75rem 0}
-  .abstract h2{font-size:.95rem;text-transform:uppercase;letter-spacing:.08em;color:#666;margin-bottom:.5rem}
-  @media (prefers-color-scheme:dark){ .abstract h2{color:#8FAAB4} }
-  .links{margin:1.5rem 0;padding:0;list-style:none}
-  .links li{margin:.35rem 0}
-  pre{background:#F3F8F8;border:1px solid #C2D2D6;padding:1rem;overflow-x:auto;font-size:.82rem;border-radius:4px}
-  @media (prefers-color-scheme:dark){ pre{background:#0D1E26;border-color:#1C333D} }
-  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  footer{margin-top:3rem;font-size:.85rem;color:#777}
+/* ══ tokens — identical to the landing page's marigram palette ══ */
+:root{
+  --paper:#E7EDEE; --panel:#F3F8F8; --sunk:#DEE8E9;
+  --ink:#0C1E27; --ink-2:#4A6672; --ink-3:#6E8894;
+  --rule:#C2D2D6; --rule-2:#AEC2C7;
+  --online:#C4301D; --online-t:#A5280F;
+  --batch:#0A8078;  --batch-t:#046158;
+  --risk:#A96C05;   --risk-t:#8A5804;
+  --edge:rgba(12,30,39,.20);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --paper:#071219; --panel:#0D1E26; --sunk:#0A1922;
+    --ink:#DCE9EC; --ink-2:#8FAAB4; --ink-3:#6E8894;
+    --rule:#1C333D; --rule-2:#274652;
+    --online:#FF6E52; --online-t:#FF8064;
+    --batch:#2ED3C0;  --batch-t:#48DFCC;
+    --risk:#E8A93A;   --risk-t:#F0BA5B;
+    --edge:rgba(0,0,0,.6);
+  }
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:var(--sans); font-size:16px; line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+:focus-visible{outline:2px solid var(--online); outline-offset:3px; border-radius:2px}
+
+/* ══ type ══ */
+h1,h2{font-family:var(--mono); font-weight:600; margin:0}
+h1{font-size:clamp(1.15rem,3.6vw,1.7rem); line-height:1.32; letter-spacing:-.03em}
+h2{font-size:1rem; letter-spacing:-.02em}
+p{margin:0 0 1rem}
+a{color:inherit; text-decoration-color:var(--rule-2); text-underline-offset:3px}
+a:hover{text-decoration-color:var(--online)}
+code,kbd{font-family:var(--mono); font-size:.88em}
+.eyebrow{
+  font-family:var(--mono); font-size:.66rem; font-weight:600;
+  letter-spacing:.2em; text-transform:uppercase; color:var(--ink-3);
+  margin:0 0 1rem;
+}
+.lede{font-size:clamp(1rem,1.9vw,1.12rem); color:var(--ink-2); max-width:62ch}
+.prose{max-width:64ch; color:var(--ink-2)}
+.prose strong,.prose em{color:var(--ink)}
+.byline{font-family:var(--mono); font-size:.85rem; color:var(--ink-2); margin:.9rem 0 .25rem}
+.byline .name{color:var(--ink); font-weight:600}
+.doi{font-family:var(--mono); font-size:.8rem; color:var(--ink-3)}
+.doi a{color:var(--batch-t)}
+.src{
+  font-family:var(--mono); font-size:.68rem; letter-spacing:.06em;
+  color:var(--ink-3); margin:.5rem 0 0;
+}
+
+/* ══ shell ══ */
+.wrap{max-width:1120px; margin:0 auto; padding:0 clamp(1rem,4vw,2.5rem)}
+.topbar{
+  position:sticky; top:0; z-index:10; background:var(--paper);
+  border-bottom:1px solid var(--rule);
+}
+.topbar .wrap{display:flex; align-items:center; gap:1rem; height:52px}
+.brand{font-family:var(--mono); font-weight:600; letter-spacing:-.03em; font-size:.95rem}
+.brand .mk{color:var(--batch-t)}
+.topnav{margin-left:auto; display:flex; align-items:center; gap:clamp(.6rem,2vw,1.2rem)}
+.topnav a{
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.06em;
+  color:var(--ink-2); text-decoration:none;
+}
+.topnav a:hover,.topnav a.current{color:var(--ink)}
+@media (max-width:560px){ .topnav a:not(.current):not(.gh){display:none} }
+
+/* ══ sections: same left-gutter mark system as the landing page ══ */
+section{border-top:1px solid var(--rule); padding:clamp(2.75rem,7vw,4.5rem) 0}
+section:first-of-type{border-top:0}
+.sec{display:grid; gap:clamp(1.25rem,3vw,2rem)}
+.sec>*{min-width:0}
+@media (min-width:880px){ .sec{grid-template-columns:5.5rem 1fr} }
+.mark{
+  font-family:var(--mono); font-size:clamp(1.5rem,3vw,2.4rem); font-weight:600;
+  letter-spacing:-.05em; color:var(--ink-3); line-height:1;
+  border-top:2px solid var(--ink); padding-top:.5rem; align-self:start;
+}
+.mark small{display:block; font-size:.6rem; letter-spacing:.16em; font-weight:600;
+  text-transform:uppercase; color:var(--ink-3); margin-top:.45rem; line-height:1.4}
+.mark.a{border-top-color:var(--batch-t)}
+.sechead{margin-bottom:1.5rem}
+.sechead h2{margin-bottom:.55rem}
+
+/* ══ links grid (matches the landing page's "read the rest" cards) ══ */
+.links{list-style:none; margin:0; padding:0; display:grid; gap:1px;
+  background:var(--rule); border:1px solid var(--rule)}
+@media (min-width:640px){ .links{grid-template-columns:repeat(3,1fr)} }
+.links a{display:block; background:var(--panel); padding:1rem 1.1rem; text-decoration:none; height:100%}
+.links a:hover{background:var(--sunk)}
+.links b{display:block; font-family:var(--mono); font-size:.9rem; letter-spacing:-.02em}
+.links span{display:block; font-size:.82rem; color:var(--ink-2); margin-top:.3rem}
+.links em{display:block; font-family:var(--mono); font-style:normal; font-size:.64rem;
+  letter-spacing:.12em; text-transform:uppercase; color:var(--ink-3); margin-top:.5rem}
+
+/* ══ code ══ */
+pre{
+  margin:0; padding:1rem 1.1rem; overflow-x:auto;
+  background:var(--panel); border:1px solid var(--rule);
+  font-family:var(--mono); font-size:.8rem; line-height:1.7; color:var(--ink);
+  tab-size:2;
+}
+
+/* ══ footer ══ */
+footer{border-top:1px solid var(--rule); padding:1.5rem 0 3rem; color:var(--ink-3);
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.04em}
+footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
+footer a{color:var(--ink-3)}
+footer a:hover{color:var(--ink)}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.001ms !important; animation-iteration-count:1 !important;
+    transition-duration:.001ms !important; scroll-behavior:auto !important}
+}
 </style>
 </head>
 <body>
+<a class="skip" href="#main" style="position:absolute;left:-9999px">Skip to content</a>
 
-<p><a href="../">&larr; tidal</a></p>
+<header class="topbar">
+  <div class="wrap">
+    <span class="brand"><span class="mk">~</span>&nbsp;tidal</span>
+    <nav class="topnav" aria-label="Sections">
+      <a href="../">home</a>
+      <a href="../#gateway">A &middot; gateway</a>
+      <a href="../#engine">B &middot; engine</a>
+      <a class="current" href="./">paper</a>
+      <a class="gh" href="https://github.com/rajagurunath/tidal">github &#8599;</a>
+    </nav>
+  </div>
+</header>
 
-<h1>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</h1>
-<p class="byline">Gurunath Lunkupali Venugopal &middot; August 12, 2026</p>
-<p class="doi">DOI: <a href="https://doi.org/10.5281/zenodo.21905462">10.5281/zenodo.21905462</a></p>
+<main id="main">
 
-<div class="abstract">
-<h2>Abstract</h2>
-<p>A serving node sized for interactive traffic runs far below its throughput ceiling
-most of the time: our online-only GPU baseline emits a third of its node's offline
-ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
-its throughput saturated with offline work, co-serving batch behind live traffic, and
-serving live traffic alone. A batch tier can lift the node from the third toward the
-first without forking the engine. Commercial providers sell that gap as a second product,
-a batch API at half price with a 24-hour completion window; self-hosted deployments have
-none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
-promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
-<code>/v1/batches</code> front end, admission that <em>refuses</em> windows the system's own
-observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
-Qwen2.5-7B, a gateway sidecar recovers <strong>69.3%</strong> of the node's steady-state offline
-ceiling at 1.18&times;/1.23&times; online p50/p99 (flat 20&nbsp;req/s, cross-node); under a
-diurnal trace at 12.1&nbsp;req/s mean offered load it recovers 78.1%. We also implement the
-identical policy <em>inside</em> the engine as a scheduler plugin and compare both
-placements. Code and evidence are open source.</p>
-</div>
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">the paper</p>
+    <h1>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</h1>
+    <p class="byline"><span class="name">Gurunath Lunkupali Venugopal</span> &middot; August 12, 2026</p>
+    <p class="doi">DOI: <a href="https://doi.org/10.5281/zenodo.21905462">10.5281/zenodo.21905462</a></p>
+  </div>
+</section>
 
-<ul class="links">
-  <li><a href="tidal-paper-arxiv.pdf"><strong>PDF</strong></a> &mdash; arXiv-style preprint, 21pp</li>
-  <li><a href="https://doi.org/10.5281/zenodo.21905462"><strong>DOI</strong></a> &mdash; 10.5281/zenodo.21905462 (Zenodo)</li>
-  <li><a href="https://github.com/rajagurunath/tidal"><strong>Code</strong></a> &mdash; rajagurunath/tidal, Apache-2.0</li>
-</ul>
+<section id="abstract">
+  <div class="wrap sec">
+    <p class="mark a">&para;<small>abstract</small></p>
+    <div>
+      <div class="sechead"><h2>abstract</h2></div>
+      <p class="prose">A serving node sized for interactive traffic runs far below its throughput ceiling
+      most of the time: our online-only GPU baseline emits a third of its node's offline
+      ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
+      its throughput saturated with offline work, co-serving batch behind live traffic, and
+      serving live traffic alone. A batch tier can lift the node from the third toward the
+      first without forking the engine. Commercial providers sell that gap as a second product,
+      a batch API at half price with a 24-hour completion window; self-hosted deployments have
+      none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
+      promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
+      <code>/v1/batches</code> front end, admission that <em>refuses</em> windows the system's own
+      observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
+      Qwen2.5-7B, a gateway sidecar recovers <strong>69.3%</strong> of the node's steady-state offline
+      ceiling at 1.18&times;/1.23&times; online p50/p99 (flat 20&nbsp;req/s, cross-node); under a
+      diurnal trace at 12.1&nbsp;req/s mean offered load it recovers 78.1%. We also implement the
+      identical policy <em>inside</em> the engine as a scheduler plugin and compare both
+      placements. Code and evidence are open source.</p>
+    </div>
+  </div>
+</section>
 
-<div class="abstract">
-<h2>BibTeX</h2>
-<pre><code>@misc{lunkupalivenugopal2026tidal,
+<section id="get">
+  <div class="wrap sec">
+    <p class="mark">&darr;<small>get<br>the<br>paper</small></p>
+    <div>
+      <div class="sechead"><h2>read it</h2></div>
+      <ul class="links">
+        <li><a href="tidal-paper-arxiv.pdf">
+          <b>PDF</b>
+          <span>arXiv-style preprint, 21pp</span>
+          <em>download</em></a></li>
+        <li><a href="https://doi.org/10.5281/zenodo.21905462">
+          <b>DOI</b>
+          <span>10.5281/zenodo.21905462</span>
+          <em>zenodo</em></a></li>
+        <li><a href="https://github.com/rajagurunath/tidal">
+          <b>Code</b>
+          <span>rajagurunath/tidal, Apache-2.0</span>
+          <em>source</em></a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="bibtex">
+  <div class="wrap sec">
+    <p class="mark">{}<small>bibtex</small></p>
+    <div>
+      <div class="sechead"><h2>cite this work</h2></div>
+      <pre><code>@misc{lunkupalivenugopal2026tidal,
   title        = {Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines},
   author       = {Lunkupali Venugopal, Gurunath},
   year         = {2026},
@@ -76,10 +229,18 @@ placements. Code and evidence are open source.</p>
   doi          = {10.5281/zenodo.21905462},
   url          = {https://doi.org/10.5281/zenodo.21905462}
 }</code></pre>
-</div>
+    </div>
+  </div>
+</section>
+
+</main>
 
 <footer>
-Source, LaTeX, and measured results: <a href="https://github.com/rajagurunath/tidal">github.com/rajagurunath/tidal</a>
+  <div class="wrap">
+    <span>tidal &#8212; the paper</span>
+    <span>apache-2.0</span>
+    <span><a href="../">&larr; back to tidal</a></span>
+  </div>
 </footer>
 
 </body>
