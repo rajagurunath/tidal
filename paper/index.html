@@ -12,9 +12,9 @@
 <!-- Google Scholar / highwire citation metadata -->
 <meta name="citation_title" content="Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines">
 <meta name="citation_author" content="Lunkupali Venugopal, Gurunath">
-<meta name="citation_publication_date" content="2026/08/12">
+<meta name="citation_publication_date" content="2026/08/16">
 <meta name="citation_pdf_url" content="https://rajagurunath.github.io/tidal/paper/tidal-paper-arxiv.pdf">
-<meta name="citation_doi" content="10.5281/zenodo.21905462">
+<meta name="citation_doi" content="10.5281/zenodo.21967536">
 <meta name="citation_abstract_html_url" content="https://rajagurunath.github.io/tidal/paper/">
 
 <style>
@@ -164,7 +164,7 @@ footer a:hover{color:var(--ink)}
     <p class="eyebrow">the paper</p>
     <h1>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines</h1>
     <p class="byline"><span class="name">Gurunath Lunkupali Venugopal</span> &middot; August 12, 2026</p>
-    <p class="doi">DOI: <a href="https://doi.org/10.5281/zenodo.21905462">10.5281/zenodo.21905462</a></p>
+    <p class="doi">DOI: <a href="https://doi.org/10.5281/zenodo.21967536">10.5281/zenodo.21967536</a></p>
   </div>
 </section>
 
@@ -173,22 +173,30 @@ footer a:hover{color:var(--ink)}
     <p class="mark a">&para;<small>abstract</small></p>
     <div>
       <div class="sechead"><h2>abstract</h2></div>
-      <p class="prose">A serving node sized for interactive traffic runs far below its throughput ceiling
-      most of the time: our online-only GPU baseline emits a third of its node's offline
-      ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
-      its throughput saturated with offline work, co-serving batch behind live traffic, and
-      serving live traffic alone. A batch tier can lift the node from the third toward the
-      first without forking the engine. Commercial providers sell that gap as a second product,
-      a batch API at half price with a 24-hour completion window; self-hosted deployments have
-      none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
-      promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
-      <code>/v1/batches</code> front end, admission that <em>refuses</em> windows the system's own
-      observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
-      Qwen2.5-7B, a gateway sidecar recovers <strong>69.3%</strong> of the node's steady-state offline
-      ceiling at 1.18&times;/1.23&times; online p50/p99 (flat 20&nbsp;req/s, cross-node); under a
-      diurnal trace at 12.1&nbsp;req/s mean offered load it recovers 78.1%. We also implement the
-      identical policy <em>inside</em> the engine as a scheduler plugin and compare both
-      placements. Code and evidence are open source.</p>
+      <p class="prose">A serving node sized for interactive traffic spends most of its life well below
+      its throughput ceiling. On our GPU testbed, a vLLM node serving only online chat
+      traffic emitted about a third of the output tokens per second that the same node
+      sustains when saturated with offline work &mdash; and capacity left unspent in one
+      scheduler iteration cannot be banked for the next. Commercial providers sell exactly
+      this slack as a second product: a batch API at half the online price with a 24-hour
+      completion window. A self-hosted deployment has no equivalent product. vLLM's own
+      batch tooling can drain an offline workload at full speed, but only by dedicating
+      the machine to it, and the research systems that do harvest slack behind live
+      traffic (HyGen, ConServe) fork the engine and promise no completion time &mdash; no
+      deadline a customer could plan around. Tidal supplies the missing product over
+      unmodified vLLM: an OpenAI-compatible <code>/v1/batches</code> front end, an
+      admission test that <em>refuses</em> any deadline window the system's own observed
+      completion rate cannot meet, and per-job escalation governed by laxity &mdash; the
+      classical real-time measure of how much time a job can still afford to lose before
+      its deadline is at risk. On RTX A6000 nodes serving Qwen2.5-7B under a flat
+      20&nbsp;req/s online load, a gateway sidecar recovers <strong>69.3%</strong> of the
+      node's steady-state offline ceiling while online request latency rises to
+      1.18&times; a matched node's online-only baseline at the median and 1.23&times; at
+      the 99th percentile; under a diurnal trace at 12.1&nbsp;req/s mean offered load it
+      recovers 78.1%. We also implement the identical policy <em>inside</em> the engine
+      as a scheduler plugin and compare the two placements of one policy &mdash; outside
+      the engine versus inside it &mdash; as an explicit design axis. Code and evidence
+      are open source.</p>
     </div>
   </div>
 </section>
@@ -203,9 +211,9 @@ footer a:hover{color:var(--ink)}
           <b>PDF</b>
           <span>arXiv-style preprint, 21pp</span>
           <em>download</em></a></li>
-        <li><a href="https://doi.org/10.5281/zenodo.21905462">
+        <li><a href="https://doi.org/10.5281/zenodo.21967536">
           <b>DOI</b>
-          <span>10.5281/zenodo.21905462</span>
+          <span>10.5281/zenodo.21967536</span>
           <em>zenodo</em></a></li>
         <li><a href="https://github.com/rajagurunath/tidal">
           <b>Code</b>
@@ -226,8 +234,8 @@ footer a:hover{color:var(--ink)}
   author       = {Lunkupali Venugopal, Gurunath},
   year         = {2026},
   publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.21905462},
-  url          = {https://doi.org/10.5281/zenodo.21905462}
+  doi          = {10.5281/zenodo.21967536},
+  url          = {https://doi.org/10.5281/zenodo.21967536}
 }</code></pre>
     </div>
   </div>
