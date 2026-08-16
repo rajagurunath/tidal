@@ -79,7 +79,7 @@ on server GPUs is typically some tens of milliseconds --- but what an iteration 
 is capped by a token budget, written $\tau$ throughout this paper: the number of tokens
 the engine will schedule into one step while keeping that step short enough for
 interactive latency. The budget's value is a deployment choice that scales with the
-hardware and the model being served; our testbed runs the vLLM default of 2{,}048. An
+hardware and the model being served; both our testbeds pin it at 2{,}048. An
 engine serving only chat traffic rarely comes close to spending it. A few dozen live
 conversations each decode one token per iteration, so the overwhelming share of the
 budgeted tokens goes unused --- and budget unused in one iteration cannot be saved for
@@ -88,10 +88,10 @@ submit a file of requests, receive results within 24 hours, pay half the online 
 Three gaps keep a self-hosted vLLM deployment from selling the same product:
 
 \begin{itemize}\itemsep2pt
-  \item \textbf{The budget is perishable and mostly unspent.} Unused tokens in an
-    iteration are gone. Our in-engine instrumentation shows online-only traffic on our
-    testbed leaving nearly the whole budget idle in a typical iteration
-    (\cref{sec:tech-b-eval}). vLLM itself can batch: its offline entrypoints drain a
+  \item \textbf{The budget is perishable and mostly unspent.} Our in-engine
+    instrumentation shows online-only traffic on the CPU testbed leaving nearly the
+    whole budget idle in a typical iteration (\cref{sec:tech-b-eval}), and the GPU
+    baseline tells the same story at larger scale (\cref{sec:budget}). vLLM itself can batch: its offline entrypoints drain a
     list of requests at the engine's full throughput. But that path assumes the machine
     is dedicated to it --- it offers no way to sell the \emph{remainder} of a node that
     is also serving live users --- and an SLA-tier proposal for the scheduler was closed
@@ -105,7 +105,7 @@ Three gaps keep a self-hosted vLLM deployment from selling the same product:
     rather than refuse work at submission.
   \item \textbf{The naive path is catastrophic.} vLLM already ships a per-request
     priority field, and simply marking batch work low-priority sounds sufficient. It is
-    not: on our testbed that alone multiplied online median latency by 27.3
+    not: on our CPU testbed that alone multiplied online median latency by 27.3
     ($22.6\times$ at the 99th percentile; \cref{sec:placement}). Priority decides who is
     served \emph{first}, but it does not bound how many batch requests become resident
     in the engine and dilute every subsequent iteration. Something must meter how much
@@ -187,11 +187,12 @@ co-serving system evaluates this choice --- each evaluates only its own placemen
 \subsection{One budget, two products}
 \label{sec:budget}
 
-A vLLM V1 iteration schedules up to \code{max\_num\_batched\_tokens} ($\tau$) tokens
-across running and waiting requests; $\tau$ is sized so an iteration's latency fits the
-inter-token target. A running decode consumes one token per iteration, a prefill up to a
-chunk; the KV cache separately bounds how many requests may be resident. The token budget
-is the perishable good.
+The token budget the introduction sketched has an exact form: a vLLM V1 iteration
+schedules up to \code{max\_num\_batched\_tokens} ($\tau$) tokens across running and
+waiting requests, with $\tau$ sized so an iteration's latency fits the inter-token
+target. A running decode consumes one token per iteration, a prefill up to a chunk; the
+KV cache separately bounds how many requests may be resident. The token budget is the
+perishable good.
 
 Two distinct mechanisms make the slack harvestable, and they spend different idle
 resources. The first spends idle \emph{compute}: batch \emph{prefill} chunks can fill
@@ -237,9 +238,10 @@ over the baseline run's 6-minute window the node emitted 687.6 output tokens/s -
 holding a mean of only 15.64 requests \emph{resident} in the engine. (A request is
 resident while the engine holds its state and schedules it each iteration; residency,
 not arrival rate, is what fills or fails to fill the budget.) The CPU rig at chat-scale
-load is starker still, a mean of 0.41 resident requests (\cref{fig:motivation}). The gateway lifts harvested work to 1{,}408 batch output tok/s
-under that same flat load, and to 1{,}607 under the diurnal trace at 12.1\,req/s mean
-offered load (\cref{sec:gpu}). The chain is an ordering of regimes, not an additive
+load is starker still, a mean of 0.41 resident requests (\cref{fig:motivation}). The
+gateway lifts harvested work to the 1{,}408 batch output tok/s the previous paragraph
+tied to the co-batching arithmetic, and to 1{,}607 under the diurnal trace at
+12.1\,req/s mean offered load (\cref{sec:gpu}). The chain is an ordering of regimes, not an additive
 budget: each term is measured on its own request mix, so the online and batch token rates
 are not summable, and the online rate is set by offered load rather than by capacity ---
 which is why co-serving's price shows up in latency and not in online throughput.
@@ -263,10 +265,11 @@ synchronized threshold nor flood the online tier together.
 \includegraphics[width=0.98\linewidth]{figures/v2/f1_motivation.png}
 \caption{\textbf{The budget is mostly unspent --- and spending it naively is
 catastrophic.} Left: resident online requests ($\approx$ decode tokens per iteration)
-under online-only traffic on our testbed --- mean 0.41, i.e.\ 0.02\% of the
-$\tau = 2048$ budget. Right: the online latency price of naive
-co-location (vLLM's priority field alone), $27.3\times$/$22.6\times$ p50/p99
-(\cref{sec:placement}) --- admission priority does not bound resident-request
+under online-only traffic on the CPU rig --- mean 0.41, i.e.\ 0.02\% of the
+$\tau = 2048$ budget (the GPU baseline's mean of 15.64 resident is the same story at
+0.8\%). Right: the online latency price of naive
+co-location (vLLM's priority field alone), $27.3\times$/$22.6\times$ p50/p99 on the CPU
+rig (\cref{sec:placement}) --- admission priority does not bound resident-request
 contention, which is why something must meter how much batch work exists at all.}
 \label{fig:motivation}
 \end{figure}
@@ -294,8 +297,9 @@ variable; \cref{sec:placement} measures it, and the intuition does not survive c
 durably (SQLite WAL; the store is a repository interface, so Postgres is a DSN change).
 Items progress \code{pending} $\rightarrow$ \code{inflight} $\rightarrow$
 \code{succeeded}/\code{failed} with idempotent terminal transitions. Online traffic never
-traverses the gateway. Placement A stops at the engine's public API; placement B adds an
-in-engine scheduler plugin. Both placements run the same contract arithmetic.
+traverses the gateway. Technique A (the placement outside the engine) stops at the
+engine's public API; technique B (the placement inside) adds a scheduler plugin. Both
+run the same contract arithmetic.
 
 \subsection{The contract: laxity at admission and in scheduling}
 \label{sec:contract}
@@ -311,7 +315,7 @@ denominator). From these it computes:
   \mathrm{urgency}(b)  &= \mathrm{clamp}\!\left(1 - \frac{\mathrm{laxity}(b)}{H},\,0,\,1\right)
     && H = \text{escalation horizon } (6\,\mathrm{h} \ll 24\,\mathrm{h}\ \text{window}) \\
   \mathrm{priority}(b) &= 100 \rightarrow 1 \ \text{linearly with urgency}
-    && (\text{online} = 0;\ \code{sla\_strict}\ \text{allows}\ 0\ \text{at urgency}\ 1)
+    && (\text{online requests are } 0;\ \text{the opt-in \code{sla\_strict} tier may reach } 0)
 \end{align}
 
 \paragraph{A worked example.} A batch of $9{,}000$ items is submitted mid-flight with
@@ -702,10 +706,10 @@ The honest headline of this subsection is a negative result, and we state it pla
 before the numbers. We set out to construct the scenario in which the contract visibly
 changes an outcome: a feasible-but-tight job that best-effort co-location
 \emph{misses} and laxity escalation \emph{meets}. On this testbed we could not
-construct it --- every load regime we tried either left so much slack that both arms
-finished early, or was so saturated that the window was generous anyway. At 3\,req/s with a 900-item/15-minute
-job, the batch completed with 3.5 minutes to spare under the heaviest online load we
-could apply; at 2--2.6\,req/s every configuration completed early for \emph{both} arms
+construct it: every load regime we tried left enough slack that both arms finished
+inside the window. Even at 3\,req/s with a 900-item/15-minute job --- the heaviest
+online load we could apply --- the batch completed with 3.5 minutes to spare, and at
+2--2.6\,req/s every configuration finished early for \emph{both} arms
 (\cref{tab:deadline}; full grid in \cref{app:deadline}). \textbf{We therefore do not
 claim demonstrated deadline improvement.} What the runs do establish: the escalation
 machinery operates (per-tick priority traces show laxity bands engaging, minimum priority
@@ -735,11 +739,11 @@ tight, laxity (+floor) & 2.6\,req/s & 500 & 500/500 & 328\,s & 66 \\
 \subsection{Q5: self-calibration}
 \label{sec:tech-b-eval}
 
-From cold start, $\hat{T}$ passed its $R^2$ gate within the first capped phase of the
-integration run and settled at MAPE $\approx 0.11$ on live traffic; the batch-token cap
-moved from the cold-start 40 to a converged 1 --- correctly tight, since at a 60\,ms
-budget with $\sim$25\,ms online-only steps this box has little slack to sell, and the
-model discovered that (\cref{fig:timeline}). The same trace shows the offline-mode
+From cold start on the CPU rig, $\hat{T}$ passed its $R^2$ gate within the first capped
+phase of the integration run and settled at MAPE $\approx 0.11$ on live traffic; the
+batch-token cap moved from the cold-start 40 to a converged 1 --- correctly tight,
+since at a 60\,ms budget with $\sim$25\,ms online-only steps this box has little slack
+to sell, and the model discovered that (\cref{fig:timeline}). The same trace shows the offline-mode
 transition: when online traffic stops, the held set empties and batch fills the whole
 budget. Regime-change adaptation (model swap, thermal drift) is untested.
 
@@ -757,8 +761,9 @@ $t = 600$\,s; the held set empties and batch takes the whole budget --- offline 
 \label{sec:discussion}
 
 Everything measured above places the batch tier against one aggregated engine. The same
-contract widens along three axes, for which we have local evidence only
-(details, tables, and figures in \cref{app:ladder}).
+contract widens along three axes, and we are precise about the evidence each carries:
+local measurements for fleets and phase splitting, a design mapping only for
+disaggregation (details, tables, and figures in \cref{app:ladder}).
 \textbf{Fleets:} with two phase-shifted replicas, placement that follows slack harvested
 $+32\%$ over pinning all batch to one replica, with per-replica batch completions
 anti-correlating with that replica's own load ($r=-0.83$, $-0.56$) --- mechanism proven
@@ -861,7 +866,9 @@ GPU scale, and is explicit about what remains undemonstrated. We offer it as usa
 infrastructure, a baseline for deadline-contracted serving, and a placement study whose
 GPU evidence currently covers the gateway but not the in-engine scheduler. What is not
 measured here is equally specific: the in-engine GPU matrix, blocked by our harness
-defect, and a load regime that discriminates escalation end-to-end.
+defect; a load regime that discriminates escalation end-to-end; and a repeat of the
+campaign on a current-generation model with kernel-level attribution
+(\cref{sec:limitations}).
 
 \FloatBarrier
 \appendix
