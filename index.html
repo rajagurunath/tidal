@@ -181,6 +181,14 @@ figcaption b{color:var(--ink); font-weight:600}
 .sw.r{background:var(--risk); border-color:var(--risk)}
 .sw.e{background:transparent}
 
+/* ══ ladder grid — the four rungs of technique A's widening scope ══ */
+.ladder-grid{display:grid; gap:1.25rem; margin-top:1.75rem}
+@media (min-width:880px){ .ladder-grid{grid-template-columns:1fr 1fr} }
+.ladder-grid .fig{margin-top:0}
+.fig.dim{opacity:.7}
+.fig.dim .fig-head .tag{border-style:dashed}
+.rung-k{color:var(--batch-t); font-weight:600}
+
 /* ══ svg theming ══ */
 svg{color:var(--ink)}
 .svg-lab{font-family:var(--mono); font-size:11px; fill:var(--ink-2)}
@@ -269,6 +277,7 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
       <a href="#engine">B · engine</a>
       <a href="#sla">sla</a>
       <a href="#run">run</a>
+      <a href="#ladder">ladder</a>
       <a href="#paper">paper</a>
       <button id="motion-toggle" type="button" aria-pressed="false">pause motion</button>
     </nav>
@@ -291,6 +300,7 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
       <li><b>0.5&#215;</b><span>online price per token</span></li>
       <li><b>24&#8239;h</b><span>SLA, laxity-enforced</span></li>
       <li><b>no fork</b><span>stock vLLM, or one plugin class</span></li>
+      <li><b>69.3%</b><span>of the node&#8217;s offline ceiling recovered, measured (GPU)</span></li>
     </ul>
 
     <!-- FIGURE 1 — the tide gauge -->
@@ -908,6 +918,183 @@ b = client.batches.create(input_file_id=f.id,
   </div>
 </section>
 
+<!-- ══════════════════════ LADDER ══════════════════════ -->
+<section id="ladder">
+  <div class="wrap sec">
+    <p class="mark">&#8645;<small>ladder</small></p>
+    <div>
+      <div class="sechead">
+        <h2>the A-ladder: widening the control plane</h2>
+        <p class="lede">The gateway generalizes. The same contract &#8212; laxity
+          admission, deadline windows, metrics-driven throttling &#8212; can place
+          deferrable work over an ever wider scope: one engine, a fleet of replicas, a
+          disaggregated deployment, and finally across <em>time itself</em>. Each rung
+          carries its evidence status honestly: three panels are measured or
+          spike-proven, the dimmed one is design.</p>
+      </div>
+
+      <div class="ladder-grid">
+
+        <!-- A0: one aggregated engine (measured, GPU) -->
+        <figure class="fig">
+          <div class="fig-head">
+            <span><span class="rung-k">A0</span> &#183; one aggregated engine</span>
+            <span class="tag">measured &#183; gpu</span>
+          </div>
+          <div class="scroller" tabindex="0" role="region" aria-label="Animated token budget bar: batch fills what the online tide leaves">
+            <svg viewBox="0 0 460 176" role="img" aria-labelledby="f5a0t" preserveAspectRatio="xMidYMin meet" style="width:100%;height:auto">
+              <title id="f5a0t">Batch fill breathing against the online tide inside one token budget</title>
+              <text class="svg-lab mut sm" x="40" y="26">token budget &#964;</text>
+              <text id="f5a0-read" class="svg-lab ba sm" x="420" y="26" text-anchor="end">harvest 69.3% of ceiling</text>
+              <rect class="svg-box" x="40" y="52" width="380" height="46"/>
+              <rect id="f5a0-batch" class="tok-b" x="100" y="52" width="200" height="46" opacity=".85"/>
+              <rect id="f5a0-on" class="tok-o" x="40" y="52" width="60" height="46"/>
+              <line id="f5a0-edge" x1="300" y1="52" x2="300" y2="98" stroke="var(--panel)" stroke-width="1.5" opacity=".8"/>
+              <text class="svg-lab on sm" x="40" y="118">online (the tide)</text>
+              <text class="svg-lab ba sm" x="185" y="118">batch fill (AIMD)</text>
+              <text id="f5a0-slack" class="svg-lab mut sm" x="420" y="118" text-anchor="end">unfilled slack</text>
+              <text class="svg-lab mut sm" x="40" y="152">online price 1.18&#215; / 1.23&#215; p50/p99 &#8212; A6000 &#215; Qwen2.5-7B, cross-node</text>
+            </svg>
+          </div>
+          <figcaption><b>Harvests one engine&#8217;s blended slack.</b> 69.3% of the
+            node&#8217;s steady-state offline ceiling under flat 20&#8239;req/s load;
+            78.1% under a diurnal trace at 12.1&#8239;req/s mean offered load. The bar
+            breathes the way the measurement did: batch fill expands exactly as far as
+            the online tide lets it.</figcaption>
+        </figure>
+
+        <!-- A-F: fleet placement (mechanism proven, local rig) -->
+        <figure class="fig">
+          <div class="fig-head">
+            <span><span class="rung-k">A-F</span> &#183; fleet placement</span>
+            <span class="tag">mechanism proven &#183; local</span>
+          </div>
+          <div class="scroller" tabindex="0" role="region" aria-label="Animated fleet diagram: batch flows to whichever replica is at its load trough">
+            <svg viewBox="0 0 460 176" role="img" aria-labelledby="f5aft" preserveAspectRatio="xMidYMin meet" style="width:100%;height:auto">
+              <title id="f5aft">Batch dots flow to the replica currently in its load trough</title>
+              <rect class="svg-box lift" x="16" y="66" width="86" height="44" rx="2"/>
+              <text class="svg-lab hd" x="59" y="85" text-anchor="middle">Tidal</text>
+              <text class="svg-lab" x="59" y="100" text-anchor="middle">gateway</text>
+              <rect class="svg-box lift" x="352" y="20" width="92" height="38" rx="2"/>
+              <text class="svg-lab" x="398" y="37" text-anchor="middle">replica 1</text>
+              <text id="f5af-s1" class="svg-lab ba sm" x="398" y="51" text-anchor="middle">at its trough</text>
+              <rect class="svg-box lift" x="352" y="118" width="92" height="38" rx="2"/>
+              <text class="svg-lab" x="398" y="135" text-anchor="middle">replica 2</text>
+              <text id="f5af-s2" class="svg-lab mut sm" x="398" y="149" text-anchor="middle">at its peak</text>
+              <path id="f5af-p1" d="M 102 78 L 352 42" fill="none" stroke="var(--batch)" stroke-width="1" stroke-dasharray="4 3" opacity=".65"/>
+              <path id="f5af-p2" d="M 102 98 L 352 134" fill="none" stroke="var(--batch)" stroke-width="1" stroke-dasharray="4 3" opacity=".65"/>
+              <g id="f5af-dots">
+                <circle class="dot1" r="3" fill="var(--batch)"/><circle class="dot1" r="3" fill="var(--batch)"/>
+                <circle class="dot1" r="3" fill="var(--batch)"/><circle class="dot2" r="3" fill="var(--batch)"/>
+                <circle class="dot2" r="3" fill="var(--batch)"/><circle class="dot2" r="3" fill="var(--batch)"/>
+              </g>
+              <!-- mini anti-phase load curves -->
+              <g transform="translate(130,58)">
+                <path id="f5af-c1" d="" fill="none" stroke="var(--online)" stroke-width="1.2" opacity=".8"/>
+                <path id="f5af-c2" d="" fill="none" stroke="var(--ink-3)" stroke-width="1.2" opacity=".8"/>
+                <line id="f5af-now" x1="0" y1="-6" x2="0" y2="66" stroke="var(--rule-2)" stroke-width="1"/>
+                <text class="svg-lab mut sm" x="0" y="80">phase-shifted load &#183; period 600&#8239;s</text>
+              </g>
+              <text class="svg-lab ba sm" x="16" y="30">+32% harvest vs pinning all batch to one replica</text>
+            </svg>
+          </div>
+          <figcaption><b>Chases uncorrelated troughs across replicas.</b> Batch volume
+            split almost evenly (1239/1255) but <em>timed</em> into each replica&#8217;s
+            own trough: per-replica anti-phase r&#8239;=&#8239;&#8722;0.83 /
+            &#8722;0.56. Proven on a shared-memory CPU rig &#8212; the latency side
+            awaits GPU fleets with real isolation.</figcaption>
+        </figure>
+
+        <!-- A-D: disaggregation-aware (design only, dimmed, static) -->
+        <figure class="fig dim">
+          <div class="fig-head">
+            <span><span class="rung-k">A-D</span> &#183; disaggregation-aware</span>
+            <span class="tag">design only &#183; not yet measured</span>
+          </div>
+          <div class="scroller" tabindex="0" role="region" aria-label="Static design diagram: gateway signals map onto a disaggregated deployment">
+            <svg viewBox="0 0 460 176" role="img" aria-labelledby="f5adt" preserveAspectRatio="xMidYMin meet" style="width:100%;height:auto">
+              <title id="f5adt">Signal mapping onto NVIDIA Dynamo-style disaggregation</title>
+              <rect class="svg-box lift" x="16" y="66" width="86" height="44" rx="2"/>
+              <text class="svg-lab hd" x="59" y="85" text-anchor="middle">Tidal</text>
+              <text class="svg-lab" x="59" y="100" text-anchor="middle">gateway</text>
+              <rect class="svg-box lift" x="352" y="20" width="92" height="38" rx="2"/>
+              <text class="svg-lab sm" x="398" y="43" text-anchor="middle">prefill workers</text>
+              <rect class="svg-box lift" x="352" y="118" width="92" height="38" rx="2"/>
+              <text class="svg-lab sm" x="398" y="141" text-anchor="middle">decode workers</text>
+              <path d="M 102 78 L 352 42" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="4 3" opacity=".5"/>
+              <text class="svg-lab mut sm" x="110" y="34">inject when the prefill pool idles</text>
+              <text class="svg-lab mut sm" x="130" y="86">kv_usage &#8594; KVBM block metrics</text>
+              <text class="svg-lab mut sm" x="130" y="102">waiting &#8594; router queue depth</text>
+              <text class="svg-lab mut sm" x="130" y="118">observed rate &#8594; per-worker throughput</text>
+            </svg>
+          </div>
+          <figcaption><b>Targets phase-specific slack.</b> Batch work is prefill-heavy
+            while steady-state online is decode-heavy, so the two are complementary.
+            Every signal the gateway scrapes has a direct Dynamo counterpart &#8212;
+            this rung needs no new policy, only new signal names. Drawn dimmed because
+            it is design, not measurement.</figcaption>
+        </figure>
+
+        <!-- A-P: phase-split freeze/thaw (spike-proven, local) -->
+        <figure class="fig">
+          <div class="fig-head">
+            <span><span class="rung-k">A-P</span> &#183; phase-split freeze&#8239;/&#8239;thaw</span>
+            <span class="tag">spike-proven &#183; local</span>
+          </div>
+          <div class="scroller" tabindex="0" role="region" aria-label="Animated freeze-thaw timeline: prefill now, decode hours later from persisted KV">
+            <svg viewBox="0 0 460 176" role="img" aria-labelledby="f5apt" preserveAspectRatio="xMidYMin meet" style="width:100%;height:auto">
+              <title id="f5apt">A prefill's KV frozen to disk, thawed into a decode worker hours later</title>
+              <rect class="svg-box lift" x="16" y="46" width="88" height="44" rx="2"/>
+              <text class="svg-lab" x="60" y="65" text-anchor="middle">prefill</text>
+              <text class="svg-lab" x="60" y="80" text-anchor="middle">worker</text>
+              <g>
+                <ellipse cx="230" cy="52" rx="34" ry="8" class="svg-box"/>
+                <rect x="196" y="52" width="68" height="30" class="svg-box" stroke="none"/>
+                <line x1="196" y1="52" x2="196" y2="82" stroke="var(--rule-2)"/>
+                <line x1="264" y1="52" x2="264" y2="82" stroke="var(--rule-2)"/>
+                <ellipse cx="230" cy="82" rx="34" ry="8" class="svg-box"/>
+                <text class="svg-lab sm" x="230" y="72" text-anchor="middle">KV store</text>
+                <text id="f5ap-snow" class="svg-lab ba sm" x="230" y="100" text-anchor="middle" opacity="0">&#10052; frozen &#183; 12&#8239;KiB/token</text>
+              </g>
+              <rect class="svg-box lift" x="356" y="46" width="88" height="44" rx="2"/>
+              <text class="svg-lab" x="400" y="65" text-anchor="middle">decode</text>
+              <text class="svg-lab" x="400" y="80" text-anchor="middle">worker</text>
+              <circle id="f5ap-dot" r="4" fill="var(--batch)" cx="104" cy="68" opacity="0"/>
+              <g id="f5ap-toks">
+                <circle r="2.5" fill="var(--batch)" opacity="0"/><circle r="2.5" fill="var(--batch)" opacity="0"/>
+                <circle r="2.5" fill="var(--batch)" opacity="0"/><circle r="2.5" fill="var(--batch)" opacity="0"/>
+              </g>
+              <line class="svg-rule2" x1="30" y1="132" x2="430" y2="132"/>
+              <line x1="60" y1="126" x2="60" y2="138" stroke="var(--batch-t)" stroke-width="1.5"/>
+              <line x1="400" y1="126" x2="400" y2="138" stroke="var(--batch-t)" stroke-width="1.5"/>
+              <text class="svg-lab sm" x="60" y="152" text-anchor="middle">t&#8321; prefill</text>
+              <text class="svg-lab sm" x="400" y="152" text-anchor="middle">t&#8322; decode</text>
+              <line id="f5ap-gap" x1="60" y1="132" x2="60" y2="132" stroke="var(--batch)" stroke-width="3" opacity=".5"/>
+              <text id="f5ap-clock" class="svg-lab mut sm" x="230" y="122" text-anchor="middle">held 0&#8239;h &#8212; the 24&#8239;h SLA legalizes the gap</text>
+              <text id="f5ap-lab" class="svg-lab hd" x="230" y="170" text-anchor="middle">freeze: persist the finished prefill&#8217;s KV</text>
+            </svg>
+          </div>
+          <figcaption><b>Prefill when prefill is free, decode when decode is free.</b>
+            A thawed TTFT is <b>31.8&#215;</b> faster than recomputing
+            (7.277&#8239;&#8594;&#8239;0.229&#8239;s, median of 5) with bit-identical
+            greedy output, across process death. Total FLOPs unchanged; only their
+            placement in time moves, and the bill moves to storage. Local spike,
+            debug-grade connector.</figcaption>
+        </figure>
+
+      </div>
+      <p class="src" style="margin-top:1.25rem">
+        Rung status matches the paper exactly: A0 measured on GPU (&#167;5), A-F
+        mechanism-proven on a local rig (appendix C), A-D design plus a Dynamo metric
+        mapping, A-P spike-proven locally. The ladder is the complement of technique B,
+        not a competitor: B is maximum visibility over minimum scope; the ladder trades
+        coarser signals for widening scope, ending in a decision B cannot express &#8212;
+        parking work in time.
+      </p>
+    </div>
+  </div>
+</section>
+
 <!-- ══════════════════════ PAPER ══════════════════════ -->
 <section id="paper">
   <div class="wrap sec">
@@ -1280,6 +1467,110 @@ b = client.batches.create(input_file_id=f.id,
       panel("f4-b-", simB(t));
     };
   }, 5.96);   // static frame: t = 3300 s (55 m) — B has just crossed into the horizon
+
+  /* ─────────── fig 5a — ladder A0: batch breathes against the online tide ─────────── */
+  register("f5a0-batch", function () {
+    var on = el("f5a0-on"), batch = el("f5a0-batch"), edge = el("f5a0-edge"),
+        read = el("f5a0-read");
+    var X = 40, W = 380;
+    return function (t) {
+      var tide = 0.5 + 0.5 * Math.sin(t * 0.55 - 1.2);      // online load, 0..1
+      var ow = 26 + tide * 96;
+      var frac = 0.62 + 0.16 * Math.sin(t * 1.7 + 0.6);     // batch's fill of the rest
+      var bw = (W - ow) * frac;
+      attr(on, "width", ow.toFixed(1));
+      attr(batch, "x", (X + ow).toFixed(1));
+      attr(batch, "width", bw.toFixed(1));
+      var e = X + ow + bw;
+      attr(edge, "x1", e.toFixed(1)); attr(edge, "x2", e.toFixed(1));
+      setText(read, (Math.floor(t / 6) % 2 === 0)
+        ? "harvest 69.3% — flat"
+        : "harvest 78.1% — diurnal");
+    };
+  }, 2.2);
+
+  /* ─────────── fig 5b — ladder A-F: batch follows each replica's trough ─────────── */
+  register("f5af-dots", function (g) {
+    var c1 = el("f5af-c1"), c2 = el("f5af-c2"), now = el("f5af-now"),
+        s1 = el("f5af-s1"), s2 = el("f5af-s2");
+    if (!c1 || !c2) return null;
+    var CW = 190, CH = 56;
+    function curve(phase) {
+      var d = "";
+      for (var x = 0; x <= CW; x += 4) {
+        var y = CH / 2 - Math.sin((x / CW) * Math.PI * 2 + phase) * (CH / 2 - 6);
+        d += (x ? " L " : "M ") + x + " " + y.toFixed(1);
+      }
+      return d;
+    }
+    attr(c1, "d", curve(0)); attr(c2, "d", curve(Math.PI));
+    var dots1 = g.querySelectorAll(".dot1"), dots2 = g.querySelectorAll(".dot2");
+    function placeLine(node, x0, y0, x1, y1, u, show) {
+      node.style.opacity = show ? "1" : "0";
+      attr(node, "cx", (x0 + (x1 - x0) * u).toFixed(1));
+      attr(node, "cy", (y0 + (y1 - y0) * u).toFixed(1));
+    }
+    var PERIOD = 12;
+    return function (t) {
+      var u = (t % PERIOD) / PERIOD;
+      attr(now, "x1", (u * CW).toFixed(1)); attr(now, "x2", (u * CW).toFixed(1));
+      var r1trough = Math.sin(u * Math.PI * 2) < 0;   // replica 1's load below mean
+      setText(s1, r1trough ? "at its trough" : "at its peak");
+      attr(s1, "class", r1trough ? "svg-lab ba sm" : "svg-lab mut sm");
+      setText(s2, r1trough ? "at its peak" : "at its trough");
+      attr(s2, "class", r1trough ? "svg-lab mut sm" : "svg-lab ba sm");
+      for (var i = 0; i < dots1.length; i++)
+        placeLine(dots1[i], 102, 78, 352, 42, (t * 0.22 + i / dots1.length) % 1, r1trough);
+      for (var j = 0; j < dots2.length; j++)
+        placeLine(dots2[j], 102, 98, 352, 134, (t * 0.22 + j / dots2.length) % 1, !r1trough);
+    };
+  }, 3.4);
+
+  /* ─────────── fig 5c — ladder A-P: freeze / hold / thaw / tokens out ─────────── */
+  register("f5ap-dot", function () {
+    var dot = el("f5ap-dot"), snow = el("f5ap-snow"), clock = el("f5ap-clock"),
+        gap = el("f5ap-gap"), lab = el("f5ap-lab");
+    var toks = document.querySelectorAll("#f5ap-toks circle");
+    var PERIOD = 13;
+    return function (t) {
+      var p = t % PERIOD, i;
+      var showToks = false, gapW = 0, hours = 0;
+      if (p < 2.2) {                          // freeze: prefill -> KV store
+        var u0 = p / 2.2;
+        dot.style.opacity = "1";
+        attr(dot, "cx", (104 + u0 * 92).toFixed(1)); attr(dot, "cy", "68");
+        snow.setAttribute("opacity", u0 > 0.8 ? "1" : "0");
+        setText(lab, "freeze: persist the finished prefill’s KV");
+      } else if (p < 7) {                     // hold: the deadline funds the gap
+        var u1 = (p - 2.2) / 4.8;
+        dot.style.opacity = "0";
+        snow.setAttribute("opacity", "1");
+        hours = u1 * 9; gapW = u1 * 340;
+        setText(lab, "the 24 h window legalizes an hours-long gap");
+      } else if (p < 9) {                     // thaw: KV store -> decode
+        var u2 = (p - 7) / 2;
+        dot.style.opacity = "1";
+        attr(dot, "cx", (264 + u2 * 92).toFixed(1)); attr(dot, "cy", "68");
+        snow.setAttribute("opacity", (1 - u2).toFixed(2));
+        hours = 9; gapW = 340;
+        setText(lab, "thaw: a fresh process restores the KV");
+      } else {                                // decode emits tokens
+        dot.style.opacity = "0";
+        showToks = true; hours = 9; gapW = 340;
+        setText(lab, "TTFT 0.229 s vs 7.277 s cold — 31.8×, bit-identical");
+      }
+      attr(gap, "x2", (60 + gapW).toFixed(1));
+      setText(clock, "held " + hours.toFixed(1) + " h — deadline-funded");
+      for (i = 0; i < toks.length; i++) {
+        toks[i].style.opacity = showToks ? "1" : "0";
+        if (showToks) {
+          var v = (t * 0.9 + i / toks.length) % 1;
+          attr(toks[i], "cx", (446 + v * 12).toFixed(1));
+          attr(toks[i], "cy", "68");
+        }
+      }
+    };
+  }, 11.0);   // static frame: tokens-out, the 31.8x headline visible
 
   /* ─────────── driver ─────────── */
   var paused = reduce, raf = null, base = null, clock = 0;
