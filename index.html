@@ -269,6 +269,7 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
       <a href="#engine">B · engine</a>
       <a href="#sla">sla</a>
       <a href="#run">run</a>
+      <a href="#paper">paper</a>
       <button id="motion-toggle" type="button" aria-pressed="false">pause motion</button>
     </nav>
   </div>
@@ -907,6 +908,39 @@ b = client.batches.create(input_file_id=f.id,
   </div>
 </section>
 
+<!-- ══════════════════════ PAPER ══════════════════════ -->
+<section id="paper">
+  <div class="wrap sec">
+    <p class="mark">&#182;<small>paper</small></p>
+    <div>
+      <div class="sechead">
+        <h2>the paper</h2>
+        <p class="lede"><strong>Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM
+          Serving Engines</strong> — the measured version of everything above. On A6000
+          nodes serving Qwen2.5-7B, the gateway recovers <strong>69.3%</strong> of the
+          node&#8217;s steady-state offline ceiling at 1.18&#215;/1.23&#215; online p50/p99
+          under flat load, and <strong>78.1%</strong> under a diurnal trace &#8212; and the
+          same policy is run <em>inside</em> the engine so both placements are compared
+          head-to-head.</p>
+      </div>
+      <ul class="links">
+        <li><a href="paper/">
+          <b>read it in the browser</b>
+          <span>Abstract, metadata, and the full preprint on one page.</span>
+          <em>preprint &#8212; v2.1 &#183; 21 pp</em></a></li>
+        <li><a href="paper/tidal-paper-arxiv.pdf">
+          <b>tidal-paper-arxiv.pdf</b>
+          <span>The PDF, direct.</span>
+          <em>pdf</em></a></li>
+        <li><a href="https://doi.org/10.5281/zenodo.21905462">
+          <b>doi:10.5281/zenodo.21905462</b>
+          <span>Archived on Zenodo, CC&nbsp;BY&nbsp;4.0 &#8212; the citable record.</span>
+          <em>zenodo</em></a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
 <!-- ══════════════════════ LINKS ══════════════════════ -->
 <section id="more">
   <div class="wrap sec">
@@ -931,8 +965,8 @@ b = client.batches.create(input_file_id=f.id,
       </ul>
       <p class="src" style="margin-top:1.25rem">
         Every figure on this page is a schematic of the designed mechanism, drawn from the
-        specs and the configuration defaults — not a measurement. Benchmark results land with
-        the paper.
+        specs and the configuration defaults — not a measurement. The measured results are
+        in <a href="#paper">the paper</a>.
       </p>
     </div>
   </div>
