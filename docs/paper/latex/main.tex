@@ -46,51 +46,70 @@
 
 \begin{abstract}
 \noindent
-A serving node sized for interactive traffic runs far below its throughput ceiling
-most of the time: our online-only GPU baseline emits a third of its node's offline
-ceiling, and scheduler budget left unspent in an iteration is gone. Three capacities order the node:
-its throughput saturated with offline work, co-serving batch behind live traffic, and
-serving live traffic alone. A batch tier can lift the node from the third toward the
-first without forking the engine. Commercial providers sell that gap as a second product,
-a batch API at half price with a 24-hour completion window; self-hosted deployments have
-none, and the systems that harvest idle capacity (HyGen, ConServe) fork the engine and
-promise no completion time. Tidal is that contract over unmodified vLLM: an OpenAI-wire
-\code{/v1/batches} front end, admission that \emph{refuses} windows the system's own
-observed rate cannot meet, and per-job least-laxity escalation. On A6000 nodes serving
-Qwen2.5-7B, a gateway sidecar recovers \textbf{69.3\%} of the node's steady-state offline
-ceiling at $1.18\times$/$1.23\times$ online p50/p99 (flat 20\,req/s, cross-node); under a
-diurnal trace at 12.1\,req/s mean offered load it recovers 78.1\%. We also implement the
-identical policy \emph{inside} the engine as a scheduler plugin and compare both
-placements. Code and evidence are open source.
+A serving node sized for interactive traffic spends most of its life well below its
+throughput ceiling. On our GPU testbed, a vLLM node serving only online chat traffic
+emitted about a third of the output tokens per second that the same node sustains when
+saturated with offline work --- and capacity left unspent in one scheduler iteration
+cannot be banked for the next. Commercial providers sell exactly this slack as a second
+product: a batch API at half the online price with a 24-hour completion window. A
+self-hosted deployment has no equivalent product. vLLM's own batch tooling can drain an
+offline workload at full speed, but only by dedicating the machine to it, and the
+research systems that do harvest slack behind live traffic (HyGen, ConServe) fork the
+engine and promise no completion time --- no deadline a customer could plan around.
+Tidal supplies the missing product over unmodified vLLM: an OpenAI-compatible
+\code{/v1/batches} front end, an admission test that \emph{refuses} any deadline window
+the system's own observed completion rate cannot meet, and per-job escalation governed
+by laxity --- the classical real-time measure of how much time a job can still afford to
+lose before its deadline is at risk. On RTX A6000 nodes serving Qwen2.5-7B under a flat
+20\,req/s online load, a gateway sidecar recovers \textbf{69.3\%} of the node's
+steady-state offline ceiling while online request latency rises to $1.18\times$ a
+matched node's online-only baseline at the median and $1.23\times$ at the 99th
+percentile; under a diurnal trace at 12.1\,req/s mean offered load it recovers 78.1\%.
+We also implement the identical policy \emph{inside} the engine as a scheduler plugin
+and compare the two placements of one policy --- outside the engine versus inside it ---
+as an explicit design axis. Code and evidence are open source.
 \end{abstract}
 
 \section{Introduction}
 
-An engine serving interactive chat traffic runs its scheduler every few tens of
-milliseconds; in each iteration it may decode one token for each of a few dozen live
-requests while its token budget --- the number of tokens the hardware could process in
-that iteration at acceptable latency --- sits in the thousands. That slack is the margin
-commercial providers monetize as a second product: submit a file of requests, receive
-results within 24 hours, pay half the online price. Three gaps keep a self-hosted vLLM
-deployment from selling it:
+A vLLM engine serves requests in a loop: the scheduler assembles a batch of work, the
+model runs one forward step, and the loop repeats. Nothing fixes the pace of that loop
+--- each iteration takes as long as its forward step takes, which for a 7B-class model
+on server GPUs is typically some tens of milliseconds --- but what an iteration may do
+is capped by a token budget, written $\tau$ throughout this paper: the number of tokens
+the engine will schedule into one step while keeping that step short enough for
+interactive latency. The budget's value is a deployment choice that scales with the
+hardware and the model being served; our testbed runs the vLLM default of 2{,}048. An
+engine serving only chat traffic rarely comes close to spending it. A few dozen live
+conversations each decode one token per iteration, so the overwhelming share of the
+budgeted tokens goes unused --- and budget unused in one iteration cannot be saved for
+the next. That slack is the margin commercial providers monetize as a second product:
+submit a file of requests, receive results within 24 hours, pay half the online price.
+Three gaps keep a self-hosted vLLM deployment from selling the same product:
 
 \begin{itemize}\itemsep2pt
   \item \textbf{The budget is perishable and mostly unspent.} Unused tokens in an
     iteration are gone. Our in-engine instrumentation shows online-only traffic on our
-    testbed leaving most of $\tau=2048$ tokens idle in a typical iteration
-    (\cref{sec:tech-b-eval}); vLLM ships no surface that sells the remainder --- its
-    offline runner requires dedicating the machine, and an SLA-tier proposal for its
-    scheduler was closed without adoption~\citep{vllm-rfc-30256}.
-  \item \textbf{Best-effort co-location is not a product.} Harvesting systems ---
-    HyGen~\citep{hygen} and ConServe~\citep{conserve} recover 78--88\% of
-    dedicated-offline throughput behind online traffic --- expose no per-job deadline, no
-    admission decision, and no promise a customer can plan around; both are forks of the
-    engine. Deadline-aware schedulers (Niyama~\citep{niyama}) target second-to-minute
-    horizons and degrade rather than refuse.
-  \item \textbf{The naive path is catastrophic.} vLLM's own priority field, used alone,
-    costs $27.3\times$/$22.6\times$ online p50/p99 on our testbed
-    (\cref{sec:placement}): admission priority does not bound resident-request
-    contention. Something must meter how much batch work exists at all.
+    testbed leaving nearly the whole budget idle in a typical iteration
+    (\cref{sec:tech-b-eval}). vLLM itself can batch: its offline entrypoints drain a
+    list of requests at the engine's full throughput. But that path assumes the machine
+    is dedicated to it --- it offers no way to sell the \emph{remainder} of a node that
+    is also serving live users --- and an SLA-tier proposal for the scheduler was closed
+    without adoption~\citep{vllm-rfc-30256}.
+  \item \textbf{Best-effort co-location is not a product.} The harvesting systems that
+    come closest --- HyGen~\citep{hygen} and ConServe~\citep{conserve}, which recover
+    78--88\% of dedicated-offline throughput behind online traffic --- expose no per-job
+    deadline, no admission decision, and no promise a customer can plan around
+    (no SLA); both are forks of the engine. Deadline-aware schedulers
+    (Niyama~\citep{niyama}) target second-to-minute horizons and degrade under overload
+    rather than refuse work at submission.
+  \item \textbf{The naive path is catastrophic.} vLLM already ships a per-request
+    priority field, and simply marking batch work low-priority sounds sufficient. It is
+    not: on our testbed that alone multiplied online median latency by 27.3
+    ($22.6\times$ at the 99th percentile; \cref{sec:placement}). Priority decides who is
+    served \emph{first}, but it does not bound how many batch requests become resident
+    in the engine and dilute every subsequent iteration. Something must meter how much
+    batch work exists at all.
 \end{itemize}
 
 The missing piece is not a better preemption mechanism --- ConServe's layer-wise
@@ -105,23 +124,33 @@ because that window is dependable. And the contract changes what the scheduler m
 where disaggregation separates prefill from decode in \emph{space}, a
 deadline-contracted tier may separate work in \emph{time} (\cref{sec:discussion}).
 
-Tidal implements the contract with deliberately classical machinery. Per batch job it
-tracks \emph{laxity} --- time remaining minus work remaining at the observed completion
-rate~\citep{llf}. At admission, a job whose projected completion exceeds its window is
-refused with an error naming the arithmetic. In scheduling, urgency ramps only inside a
-short escalation horizon of remaining \emph{slack}: an on-track job never rises above the
-lowest priority band no matter how long it has run, an at-risk job escalates early,
-continuously, and independently of other jobs, and a token-bucket floor guarantees
-forward progress at maximum urgency --- progress that feeds back into laxity and
-stabilizes the job at the floor rather than oscillating.
+Tidal implements the contract with deliberately classical machinery. The central
+quantity is \emph{laxity}, an idea from hard-real-time scheduling~\citep{llf} with a
+one-sentence intuition: \emph{how much time can this job still afford to lose?}
+Concretely, laxity is the time remaining until the deadline minus the time the remaining
+work will take at the observed completion rate; a job with five hours of laxity could be
+starved for five hours before its deadline came under threat.
+(\cref{sec:contract} gives the definitions and a worked example.) The same arithmetic
+serves twice. At admission, a job whose projected completion already exceeds its window
+is refused outright, with an error that shows the numbers. During execution, a job's
+scheduling urgency ramps up only once its laxity falls inside a short escalation
+horizon: a job that is on track stays at the lowest priority no matter how long it has
+been running, a job at risk escalates early, continuously, and independently of other
+jobs, and a token-bucket floor guarantees a minimum rate of progress at maximum urgency
+--- progress that feeds back into the laxity calculation and settles the job at the
+floor instead of oscillating around it.
 
-We implement this policy at two placements and compare them --- the axis no prior
-co-serving system evaluates, since each evaluates only its own. \emph{Technique A} is a
-sidecar gateway over a stock engine: batch items enter as low-priority requests,
-throttled at 1\,Hz by AIMD over public metrics. \emph{Technique B} moves admission into
-the engine through vLLM's pluggable scheduler interface: a subclass wraps the stock
-scheduler and caps batch tokens per iteration against a latency model fitted continuously
-from the engine's own step timings. Neither placement forks the engine.
+The same policy can live in two different places, and we implement both --- this
+comparison is the axis the paper turns on, so we name the placements here and keep the
+names throughout. \emph{Technique A} places the policy \emph{outside} the engine: a
+sidecar gateway submits batch items to a stock vLLM as low-priority requests and
+throttles how many are in flight, once per second, with a TCP-style feedback rule
+driven by the engine's public metrics (\cref{sec:tech-a}). \emph{Technique B} places the
+identical policy \emph{inside} the engine, through vLLM's pluggable scheduler
+interface: a subclass wraps the stock scheduler and caps the batch tokens admitted to
+each iteration against a latency model fitted continuously from the engine's own step
+timings (\cref{sec:tech-b}). Neither placement forks the engine, and no prior
+co-serving system evaluates this choice --- each evaluates only its own placement.
 
 \smallskip
 \noindent Contributions:
@@ -130,8 +159,11 @@ from the engine's own step timings. Neither placement forks the engine.
     (\cref{sec:contract}): OpenAI-wire \code{/v1/batches} with durable per-job state,
     laxity-based admission refusal, horizon-scaled escalation, and a progress floor ---
     semantics neither the co-serving nor the deadline-scheduling literature exposes.
-    The contract is validated in mechanism but not in outcome: no load regime we
-    constructed discriminates escalation end-to-end (\cref{sec:contract-eval}).
+    One caveat, stated here and examined in \cref{sec:contract-eval}: the contract's
+    machinery demonstrably operates --- escalation engages, admission refuses, the
+    progress floor holds --- but we have not yet constructed a load regime in which the
+    contract makes a deadline that best-effort scheduling would have missed. The
+    mechanism is validated; the end-to-end outcome is not yet demonstrated.
   \item \textbf{The measured price of the no-fork placement at GPU scale}
     (\cref{sec:gpu}): 69.3\% of a same-node steady-state offline ceiling at
     $1.18\times$/$1.23\times$ online p50/p99 under flat load, 78.1\% under a diurnal
@@ -161,19 +193,26 @@ inter-token target. A running decode consumes one token per iteration, a prefill
 chunk; the KV cache separately bounds how many requests may be resident. The token budget
 is the perishable good.
 
-Two distinct mechanisms make the slack harvestable. Filling residual budget with batch
-\emph{prefill} chunks spends idle \emph{compute}: prefill is compute-bound, and
-chunked-prefill schedulers already interleave it under a latency
-budget~\citep{sarathi}. Co-batching batch \emph{decodes} alongside online decodes spends
-idle \emph{memory bandwidth}: with $B$ concurrent decodes, one HBM traversal of the
-weight matrices serves $B$ tokens, so a thicker decode batch moves the projection and MLP
-multiplies from thin, GEMV-like shapes toward higher-arithmetic-intensity GEMM regimes
---- throughput rises with $B$ at nearly flat iteration latency until compute, or the
-KV-cache reads that do \emph{not} amortize (each request reads its own history), bind
-instead. Neither effect is monotonic or free; both are bounded by the online latency
-budget. Our GPU result --- 1{,}408 batch output tok/s added at $1.18\times$ online p50
---- is \emph{consistent with} this arithmetic; we have not run the controlled batch-size
-sweep that would demonstrate it mechanistically.
+Two distinct mechanisms make the slack harvestable, and they spend different idle
+resources. The first spends idle \emph{compute}: batch \emph{prefill} chunks can fill
+whatever budget online work leaves in an iteration, because prefill is compute-bound and
+chunked-prefill schedulers already know how to interleave it under a latency
+budget~\citep{sarathi}. The second spends idle \emph{memory bandwidth}: batch
+\emph{decodes} ride alongside online decodes. During decode, every iteration must
+stream the model's weight matrices out of GPU memory, and with $B$ requests decoding
+concurrently that single traversal serves all $B$ tokens at once. A thicker decode
+batch therefore moves the projection and MLP multiplies from thin matrix--vector shapes
+(GEMV, one token per traversal) toward genuine matrix--matrix work (GEMM, higher
+arithmetic intensity), and throughput rises with $B$ at nearly flat iteration latency.
+The free ride ends where compute saturates, or where the KV-cache reads become the
+binding cost --- those do \emph{not} amortize, because each request reads its own
+private history. Neither effect is monotonic or free; both are bounded by the online
+latency budget. Our GPU result --- 1{,}408 batch output tokens/s added while online
+median latency rose to $1.18\times$ baseline --- is \emph{consistent with} this
+arithmetic, but we have not run the controlled batch-size sweep, with kernel-level
+profiling (e.g.\ NVIDIA Nsight) attributing the gain to the GEMV$\to$GEMM transition,
+that would demonstrate the mechanism directly; \cref{sec:limitations} names that
+experiment as future work.
 
 \paragraph{A roofline reading.} The roofline model bounds attainable performance by the
 lower of a compute ceiling and a bandwidth ceiling selected by a kernel's arithmetic
@@ -192,11 +231,13 @@ model, and node saturated with offline work and nothing else sustains 2049.6, 20
 2057.0 output tok/s in steady state across our three nodes (\cref{sec:ceiling}). It is an
 operational stand-in --- a measured lower bound sitting under the hardware roofline, and
 the only denominator we are entitled to divide by. The distance below it is what this
-paper is about. Online-only traffic at 20\,req/s Poisson leaves the node emitting
-687.6 output tok/s --- its own completions summed over the baseline run's 6-minute
-window --- 33.5\% of that node's 2049.6\,tok/s offline ceiling, at a mean of 15.64
-resident requests; the CPU rig at chat-scale load is starker, a mean of 0.41
-(\cref{fig:motivation}). The gateway lifts harvested work to 1{,}408 batch output tok/s
+paper is about. Online-only traffic at 20\,req/s Poisson makes that distance concrete:
+over the baseline run's 6-minute window the node emitted 687.6 output tokens/s ---
+33.5\% of the 2{,}049.6\,tok/s the same node sustains when saturated offline --- while
+holding a mean of only 15.64 requests \emph{resident} in the engine. (A request is
+resident while the engine holds its state and schedules it each iteration; residency,
+not arrival rate, is what fills or fails to fill the budget.) The CPU rig at chat-scale
+load is starker still, a mean of 0.41 resident requests (\cref{fig:motivation}). The gateway lifts harvested work to 1{,}408 batch output tok/s
 under that same flat load, and to 1{,}607 under the diurnal trace at 12.1\,req/s mean
 offered load (\cref{sec:gpu}). The chain is an ordering of regimes, not an additive
 budget: each term is measured on its own request mix, so the online and batch token rates
@@ -259,10 +300,12 @@ in-engine scheduler plugin. Both placements run the same contract arithmetic.
 \subsection{The contract: laxity at admission and in scheduling}
 \label{sec:contract}
 
-For each active batch $b$ with deadline $D_b$, remaining items $R_b$, and observed
-completion rate $r_b$ (sliding window; with no completion history the drain term is
-dropped --- jobs escalate on evidence or deadline proximity, never on a missing
-denominator):
+The contract's arithmetic is small enough to state in full. For each active batch $b$
+the dispatcher tracks three quantities: the deadline $D_b$, the count of remaining items
+$R_b$, and the rate $r_b$ at which the job's items have recently been completing (a
+sliding-window estimate; while a job has no completion history the drain term is dropped
+entirely, so a job escalates on evidence or on deadline proximity, never on a missing
+denominator). From these it computes:
 \begin{align}
   \mathrm{laxity}(b)   &= (D_b - \mathrm{now}) - R_b / r_b \\
   \mathrm{urgency}(b)  &= \mathrm{clamp}\!\left(1 - \frac{\mathrm{laxity}(b)}{H},\,0,\,1\right)
@@ -271,61 +314,113 @@ denominator):
     && (\text{online} = 0;\ \code{sla\_strict}\ \text{allows}\ 0\ \text{at urgency}\ 1)
 \end{align}
 
-\paragraph{Admission (R2).} At \code{POST /v1/batches}, projected completion
-$R/r_{\mathrm{global}}$ is checked against the window with a configurable margin;
-infeasible jobs are rejected with an error naming the arithmetic. No history
-$\rightarrow$ accept (the system cannot judge).
+\paragraph{A worked example.} A batch of $9{,}000$ items is submitted mid-flight with
+10 hours left in its window, and the dispatcher has been observing $r_b = 0.5$ items/s
+for this job. Draining the remaining work needs $9{,}000 / 0.5 = 18{,}000$\,s, five
+hours, so $\mathrm{laxity}(b) = 10 - 5 = 5$ hours: this job could lose five whole hours
+to online bursts before its deadline came under threat. Five hours is inside the
+$H = 6$-hour escalation horizon, so the job starts to escalate --- mildly:
+$\mathrm{urgency} = 1 - 5/6 \approx 0.17$, mapping to priority $\approx 83$, a step
+above the lowest band and still far from the online tier at 0. Had 20 hours remained,
+laxity (15\,h) would sit beyond the horizon and the job would stay pinned at priority
+100 no matter how long it had already run. Had only 5.5 hours remained, laxity
+(0.5\,h) would drive urgency to $0.92$ --- past the $0.9$ threshold where the
+token-bucket floor guarantees the job a minimum admission rate regardless of what else
+wants the node.
 
-\paragraph{Scheduling (R1, R3).} An on-track job ($\mathrm{laxity} \ge H$) never rises
-above priority 100 --- it exerts no \emph{escalation} pressure whatever the clock says.
-The horizon, not the window, scales urgency: scaling by the window is wall-clock aging in
-disguise. Escalated jobs climb independently; above urgency 0.9 a token bucket guarantees
-a minimum admission rate, and the floor's assured progress feeds back into laxity,
-stabilizing the job at the floor. Escalation applies at submission time (vLLM fixes a
-request's priority at admission); the backlog, where laxity lives, is by construction the
-unsubmitted portion. \Cref{fig:priority} contrasts the resulting curves with wall-clock
-aging. Co-location has a latency price even at the lowest band ---
-\cref{sec:eval} measures it; the contract's property is never spending \emph{more}
-online headroom than the deadline requires, not zero cost.
+\paragraph{Admission (R2).} The same arithmetic runs once more at \code{POST
+/v1/batches}: projected completion $R/r_{\mathrm{global}}$ is checked against the
+requested window with a configurable margin, and an infeasible job is rejected with an
+error naming the numbers. A system with no completion history yet accepts --- it cannot
+judge what it has never measured.
+
+\paragraph{What refusal means operationally (and what it does not).} Refusal is a
+signal, not a dead end. The rejected submission carries the arithmetic --- requested
+window, observed rate, projected completion --- so a client can immediately resubmit
+with a window the node can honor, or split the job across nodes. Two further responses
+build naturally on the same signal, and we are explicit that Tidal implements neither
+today. First, an explicit best-effort tier: accept the job with no deadline and
+schedule it beneath every contracted job --- precisely the service the harvesting
+literature already provides, and one that composes cleanly with the contracted tier.
+Second, refusals as an autoscaling signal: a run of infeasible submissions is a
+precise, deadline-denominated statement that demand has outgrown this node, which an
+operator or a serverless control plane can answer by adding capacity. Both are
+roadmap; the measured system refuses, reports the numbers, and stops there.
+
+\paragraph{Scheduling (R1, R3).} \Cref{fig:priority} is the picture to hold onto; the
+rules below only formalize its three curves. A job that is on track --- laxity at least
+the horizon $H$ --- stays pinned at priority 100, the lowest band, however deep into its
+window the clock has run: having been submitted eighteen hours ago is not, by itself, a
+reason to push ahead of anyone (R1). What moves a job is its own laxity falling inside
+the horizon; from there, urgency climbs continuously as laxity shrinks, each job
+independently of every other, which is what prevents a synchronized stampede of at-risk
+jobs into the online tier (R3). The horizon rather than the 24-hour window is the
+yardstick deliberately: scaling urgency by the window would make urgency grow with
+elapsed wall-clock time, which is exactly the aging rule \cref{sec:why-contract}
+rejected, in disguise. Above urgency 0.9 a token bucket guarantees the job a minimum
+admission rate, and that assured progress feeds back into the laxity calculation, so
+the job settles at the floor instead of oscillating around it. One vLLM-specific
+consequence: the engine fixes a request's priority at submission, so escalation acts on
+each newly submitted item, and the backlog that laxity governs is by construction the
+not-yet-submitted portion of the job. Co-location has a latency price even at the
+lowest band --- \cref{sec:eval} measures it. The contract's property is never spending
+\emph{more} online headroom than the deadline requires, not zero cost.
 
 \input{fig-priority}
 
 \subsection{Technique A: external control}
 \label{sec:tech-a}
 
-A 1\,Hz loop scrapes three public metrics (waiting count, KV usage, completion rate),
-smooths them, and adjusts a target in-flight batch count by AIMD: halve on detected
-online queueing or a high KV watermark, increment below a low watermark. The waiting
-metric is not priority-partitioned, so the halving conservatively assumes every queued
-request is ours. Items are claimed in deadline order, grouped by shared prompt prefix to
-recover some prefix-cache locality through arrival order (unablated against HyGen's
-engine-side ordering~\citep{hygen}), and submitted at their batch's current laxity
-priority. Engine unavailability opens a circuit; in-flight items re-queue idempotently.
-Cost: one metrics scrape and one $O(\text{jobs})$ laxity pass per second --- negligible
-beside a single decode step.
+Technique A never touches the engine; it controls the one variable available from
+outside --- how many batch requests exist in the engine at all. A loop wakes once per
+second, reads three metrics every vLLM already exports (queue depth, KV-cache usage,
+completion rate), smooths them, and adjusts a target for the number of batch items in
+flight by additive-increase/multiplicative-decrease (AIMD), the feedback rule that
+governs TCP congestion control~\citep{aimd}: while the engine shows headroom, raise the
+target by one; at the first sign of online queueing or a high KV watermark, cut it in
+half. The asymmetry is the point --- probe upward gently, retreat drastically --- and
+it keeps the controller hovering just below the level where batch work would start to
+interfere. One conservative twist: vLLM's waiting-queue metric is not partitioned by
+priority, so the controller cannot tell whose requests are queued, and it halves as if
+every one of them were its own. Items are claimed in deadline order, grouped by shared
+prompt prefix so that arrival order recovers some prefix-cache locality (a heuristic we
+did not ablate against HyGen's engine-side ordering~\citep{hygen}), and each item is
+submitted at its batch's current laxity priority. If the engine becomes unreachable, a
+circuit opens and in-flight items re-queue idempotently. The cost of all of this is one
+metrics scrape and one $O(\text{jobs})$ laxity pass per second --- negligible beside a
+single decode step.
 
 \subsection{Technique B: in-engine work conservation}
 \label{sec:tech-b}
 
-\code{TidalScheduler} subclasses the V1 scheduler behind \code{--scheduler-cls} and wraps
---- never reimplements --- the stock \code{schedule()} (\cref{alg:pregate}). Requests
-with priority $\ge 1$ are the batch class. Each iteration solves for the largest batch
-admission $x$ with $\hat{T}(P_{\mathrm{on}} + x, C) \le \mathrm{TBT}_{\mathrm{budget}}$,
-where $\hat{T}(P,C) = k_1 P + k_2 P(P{+}C) + k_4 (P{+}C) + k_5$ is ConServe's
-context-aware form~\citep{conserve} --- it prices the attention cost a pure token count
-misses --- but fitted \emph{continuously} from the engine's own $(P, C,
-\text{step-time})$ stream: ring buffer, periodic least squares, non-negativity clamps,
-and an $R^2$ gate with a conservative static fallback, removing the offline profiling
-sweep HyGen and ConServe require. With zero online requests resident the cap lifts
-entirely (offline mode: fill $\tau$). A KV guardband (EWMA of online demand, clamped
-5--30\%) stops batch admission before online bursts can starve, and proactive eviction
-picks the batch victim with the least non-prefix-cached work. Enforcement is at chunk
-granularity --- we bound which requests the stock scheduler sees, not its inner token
-loop --- which is what keeps the wrapper robust to upstream drift (it survived an
-upstream jump of roughly 1{,}700 commits during development; porting to release v0.26.0
-required one keyword argument) at the interference cost \cref{sec:placement} quantifies. Per-iteration
-overhead: one closed-form cap solve and two list partitions; the least-squares refit is
-periodic and off the step path.
+\code{TidalScheduler} subclasses the V1 scheduler behind \code{--scheduler-cls} and
+wraps --- never reimplements --- the stock \code{schedule()} (\cref{alg:pregate}). The
+idea fits in one sentence: before each stock scheduling pass, decide how many batch
+requests that pass is allowed to see, and hide the rest. Requests with priority
+$\ge 1$ are the batch class. The decision is a small feasibility problem solved each
+iteration: given the online work that must run --- $P_{\mathrm{on}}$ prefill tokens
+against total attention context $C$ --- find the largest batch admission $x$ such that
+the predicted step time still fits the inter-token latency budget,
+$\hat{T}(P_{\mathrm{on}} + x, C) \le \mathrm{TBT}_{\mathrm{budget}}$. The predictor is
+ConServe's context-aware form $\hat{T}(P,C) = k_1 P + k_2 P(P{+}C) + k_4 (P{+}C) +
+k_5$~\citep{conserve}, chosen because it prices the attention cost that a pure token
+count misses. Where ConServe fits its model in an offline profiling sweep, however,
+TidalScheduler fits the same form \emph{continuously} from the engine's own
+$(P, C, \text{step-time})$ stream --- a ring buffer of recent observations, periodic
+least squares, non-negativity clamps, and an $R^2$ gate that falls back to a
+conservative static cap whenever the fit turns poor --- which removes the profiling
+sweep HyGen and ConServe both require. With zero online requests resident the cap
+lifts entirely (offline mode: batch fills $\tau$). Two protections guard the KV cache:
+a guardband (an EWMA of online demand, clamped to 5--30\%) stops batch admission before
+an online burst can be starved of cache space, and proactive eviction picks as its
+victim the batch request with the least non-prefix-cached work to lose. Enforcement is
+deliberately coarse --- at chunk granularity, we bound which requests the stock
+scheduler may see, never its inner token loop --- and that coarseness is what keeps the
+wrapper robust to upstream drift: it survived an upstream jump of roughly 1{,}700
+commits during development, and porting to release v0.26.0 required one keyword
+argument. The price of the same coarseness is the interference \cref{sec:placement}
+quantifies. Per-iteration overhead is one closed-form cap solve and two list
+partitions; the least-squares refit is periodic and off the step path.
 
 \begin{algorithm}[t]
 \caption{TidalScheduler pre-gate (one iteration)}
@@ -603,9 +698,12 @@ moves: the median tax that costs $2.54\times$ on CPU costs $1.18\times$ on the A
 \subsection{Q4: the contract, honestly}
 \label{sec:contract-eval}
 
-We attempted to demonstrate end-to-end deadline discrimination --- a feasible-but-tight
-job that best-effort co-location misses and laxity escalation meets --- and did not find
-a load regime on this testbed that discriminates. At 3\,req/s with a 900-item/15-minute
+The honest headline of this subsection is a negative result, and we state it plainly
+before the numbers. We set out to construct the scenario in which the contract visibly
+changes an outcome: a feasible-but-tight job that best-effort co-location
+\emph{misses} and laxity escalation \emph{meets}. On this testbed we could not
+construct it --- every load regime we tried either left so much slack that both arms
+finished early, or was so saturated that the window was generous anyway. At 3\,req/s with a 900-item/15-minute
 job, the batch completed with 3.5 minutes to spare under the heaviest online load we
 could apply; at 2--2.6\,req/s every configuration completed early for \emph{both} arms
 (\cref{tab:deadline}; full grid in \cref{app:deadline}). \textbf{We therefore do not
@@ -738,7 +836,7 @@ measurement, and the audited synthesis.
 \section{Limitations}
 \label{sec:limitations}
 
-Six, one line each; full provenance in \cref{app:provenance}.
+Seven, one line each; full provenance in \cref{app:provenance}.
 (1) Technique B's admission gating does not bound resident-request inflation --- the
 dominant residual interference channel on the CPU testbed; bounding it requires
 sub-iteration control. (2) The contract is mechanism-validated, not
@@ -749,7 +847,10 @@ to a harness defect. (4) The GPU ceiling is a steady-state tail of a probe burst
 latency side is confounded by shared memory bandwidth (thread-count isolation only).
 (6) Single engine, single model, one dispatcher per store (no lease);
 submission-time escalation cannot re-age already-queued items; \code{scheduler\_cls} is
-not a stable interface.
+not a stable interface. (7) The models measured (Qwen2.5-7B on GPU, Qwen2.5-0.5B on
+CPU) are a generation old; repeating the GPU campaign on a current model, and
+attributing the co-batching gain mechanistically with kernel-level profiling (NVIDIA
+Nsight), are the named next measurements.
 
 \section{Conclusion}
 
@@ -991,6 +1092,10 @@ transfer engine). \href{https://github.com/LMCache/LMCache}{\code{github.com/LMC
 
 \bibitem{llf} A. K. Mok. Fundamental Design Problems of Distributed Systems for the Hard-
 Real-Time Environment. MIT, 1983.
+
+\bibitem{aimd} D.-M. Chiu, R. Jain. Analysis of the Increase and Decrease Algorithms for
+Congestion Avoidance in Computer Networks. \emph{Computer Networks and ISDN Systems}
+17(1):1--14, 1989.
 
 \bibitem{vllm} W. Kwon et al. Efficient Memory Management for Large Language Model Serving
 with PagedAttention. SOSP 2023.

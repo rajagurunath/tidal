@@ -25,23 +25,32 @@ Gurunath Lunkupali Venugopal — gurunathrajagopal@gmail.com
 
 ## Abstract (plain text)
 
-A serving node sized for interactive traffic runs far below its throughput
-ceiling most of the time: our online-only GPU baseline emits a third of its
-node's offline ceiling, and scheduler budget left unspent in an iteration is
-gone. Three capacities order the node: its throughput saturated with offline
-work, co-serving batch behind live traffic, and serving live traffic alone. A
-batch tier can lift the node from the third toward the first without forking
-the engine. Commercial providers sell that gap as a second product, a batch API
-at half price with a 24-hour completion window; self-hosted deployments have
-none, and the systems that harvest idle capacity (HyGen, ConServe) fork the
-engine and promise no completion time. Tidal is that contract over unmodified
-vLLM: an OpenAI-wire /v1/batches front end, admission that refuses windows the
-system's own observed rate cannot meet, and per-job least-laxity escalation. On
-A6000 nodes serving Qwen2.5-7B, a gateway sidecar recovers 69.3% of the node's
-steady-state offline ceiling at 1.18x/1.23x online p50/p99 (flat 20 req/s,
-cross-node); under a diurnal trace at 12.1 req/s mean offered load it recovers
-78.1%. We also implement the identical policy inside the engine as a scheduler
-plugin and compare both placements. Code and evidence are open source.
+**(v2.2 draft — in review; v2.1 remains the published Zenodo abstract.)**
+
+A serving node sized for interactive traffic spends most of its life well below
+its throughput ceiling. On our GPU testbed, a vLLM node serving only online
+chat traffic emitted about a third of the output tokens per second that the
+same node sustains when saturated with offline work — and capacity left unspent
+in one scheduler iteration cannot be banked for the next. Commercial providers
+sell exactly this slack as a second product: a batch API at half the online
+price with a 24-hour completion window. A self-hosted deployment has no
+equivalent product. vLLM's own batch tooling can drain an offline workload at
+full speed, but only by dedicating the machine to it, and the research systems
+that do harvest slack behind live traffic (HyGen, ConServe) fork the engine and
+promise no completion time — no deadline a customer could plan around. Tidal
+supplies the missing product over unmodified vLLM: an OpenAI-compatible
+/v1/batches front end, an admission test that refuses any deadline window the
+system's own observed completion rate cannot meet, and per-job escalation
+governed by laxity — the classical real-time measure of how much time a job can
+still afford to lose before its deadline is at risk. On RTX A6000 nodes serving
+Qwen2.5-7B under a flat 20 req/s online load, a gateway sidecar recovers 69.3%
+of the node's steady-state offline ceiling while online request latency rises
+to 1.18x a matched node's online-only baseline at the median and 1.23x at the
+99th percentile; under a diurnal trace at 12.1 req/s mean offered load it
+recovers 78.1%. We also implement the identical policy inside the engine as a
+scheduler plugin and compare the two placements of one policy — outside the
+engine versus inside it — as an explicit design axis. Code and evidence are
+open source.
 
 ## Keywords
 
