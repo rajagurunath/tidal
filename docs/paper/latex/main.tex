@@ -72,15 +72,15 @@ as an explicit design axis. Code and evidence are open source.
 
 \section{Introduction}
 
-A vLLM engine serves requests in a loop: the scheduler assembles a batch of work, the
-model runs one forward step, and the loop repeats. Nothing fixes the pace of that loop
+A vLLM engine serves requests in a loop: the scheduler assembles the work for one step,
+the model runs that forward step, and the loop repeats. Nothing fixes the pace of that loop
 --- each iteration takes as long as its forward step takes, which for a 7B-class model
 on server GPUs is typically some tens of milliseconds --- but what an iteration may do
 is capped by a token budget, written $\tau$ throughout this paper: the number of tokens
 the engine will schedule into one step while keeping that step short enough for
 interactive latency. The budget's value is a deployment choice that scales with the
 hardware and the model being served; both our testbeds pin it at 2{,}048. An
-engine serving only chat traffic rarely comes close to spending it. A few dozen live
+engine serving only online traffic rarely comes close to spending it. A few dozen live
 conversations each decode one token per iteration, so the overwhelming share of the
 budgeted tokens goes unused --- and budget unused in one iteration cannot be saved for
 the next. That slack is the margin commercial providers monetize as a second product:
@@ -94,7 +94,7 @@ Three gaps keep a self-hosted vLLM deployment from selling the same product:
     baseline tells the same story at larger scale (\cref{sec:budget}). vLLM itself can batch: its offline entrypoints drain a
     list of requests at the engine's full throughput. But that path assumes the machine
     is dedicated to it --- it offers no way to sell the \emph{remainder} of a node that
-    is also serving live users --- and an SLA-tier proposal for the scheduler was closed
+    is also serving online users --- and an SLA-tier proposal for the scheduler was closed
     without adoption~\citep{vllm-rfc-30256}.
   \item \textbf{Best-effort co-location is not a product.} The harvesting systems that
     come closest --- HyGen~\citep{hygen} and ConServe~\citep{conserve}, which recover
@@ -151,6 +151,21 @@ interface: a subclass wraps the stock scheduler and caps the batch tokens admitt
 each iteration against a latency model fitted continuously from the engine's own step
 timings (\cref{sec:tech-b}). Neither placement forks the engine, and no prior
 co-serving system evaluates this choice --- each evaluates only its own placement.
+
+\paragraph{Terminology.} ``Batch'' is overloaded in this domain, so we fix our words
+here and hold to them for the rest of the paper. An \emph{online request} is a
+latency-sensitive request from a live user; it reaches the engine directly and runs at
+priority 0, and we call this traffic as a whole the \emph{online tier}. A \emph{batch
+job} is the customer-facing unit of the product: one file of requests submitted to
+\code{/v1/batches} under one deadline window, and the unit to which laxity, admission,
+and escalation apply. The lines of that file are \emph{batch items}; when the
+dispatcher submits an item to the engine it becomes a \emph{batch request},
+distinguished from an online request only by its non-zero priority. \emph{Offline}
+always names a regime rather than a request class: a machine dedicated to draining
+batch work with no online tier present --- the regime that defines the throughput
+ceiling we normalize against. Finally, when we mean vLLM's per-iteration grouping of
+work (continuous batching), we say \emph{iteration} or \emph{decode batch}, never bare
+``batch.''
 
 \smallskip
 \noindent Contributions:
@@ -304,8 +319,8 @@ run the same contract arithmetic.
 \subsection{The contract: laxity at admission and in scheduling}
 \label{sec:contract}
 
-The contract's arithmetic is small enough to state in full. For each active batch $b$
-the dispatcher tracks three quantities: the deadline $D_b$, the count of remaining items
+The contract's arithmetic is small enough to state in full. For each active batch job
+$b$ the dispatcher tracks three quantities: the deadline $D_b$, the count of remaining items
 $R_b$, and the rate $r_b$ at which the job's items have recently been completing (a
 sliding-window estimate; while a job has no completion history the drain term is dropped
 entirely, so a job escalates on evidence or on deadline proximity, never on a missing
@@ -708,7 +723,7 @@ changes an outcome: a feasible-but-tight job that best-effort co-location
 \emph{misses} and laxity escalation \emph{meets}. On this testbed we could not
 construct it: every load regime we tried left enough slack that both arms finished
 inside the window. Even at 3\,req/s with a 900-item/15-minute job --- the heaviest
-online load we could apply --- the batch completed with 3.5 minutes to spare, and at
+online load we could apply --- the job completed with 3.5 minutes to spare, and at
 2--2.6\,req/s every configuration finished early for \emph{both} arms
 (\cref{tab:deadline}; full grid in \cref{app:deadline}). \textbf{We therefore do not
 claim demonstrated deadline improvement.} What the runs do establish: the escalation
