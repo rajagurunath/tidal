@@ -1,6 +1,6 @@
 # Tidal — preprint / venue submission package
 
-**PUBLISHED preprint: DOI [10.5281/zenodo.21905462](https://doi.org/10.5281/zenodo.21905462) (Zenodo, 2026-08-12, CC BY 4.0)**
+**PUBLISHED preprint v2.2: DOI [10.5281/zenodo.21967536](https://doi.org/10.5281/zenodo.21967536) (Zenodo, 2026-08-16, CC BY 4.0). Concept DOI (all versions): 10.5281/zenodo.21905461; v2.1 was 10.5281/zenodo.21905462.**
 
 Everything below is paste-ready for a preprint server (Zenodo; TechRxiv when it
 reopens) or a conference submission portal. Keep this file in sync with
@@ -25,7 +25,7 @@ Gurunath Lunkupali Venugopal — gurunathrajagopal@gmail.com
 
 ## Abstract (plain text)
 
-**(v2.2 draft — in review; v2.1 remains the published Zenodo abstract.)**
+**(v2.2 — published 2026-08-16.)**
 
 A serving node sized for interactive traffic spends most of its life well below
 its throughput ceiling. On our GPU testbed, a vLLM node serving only online
