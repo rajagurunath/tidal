@@ -1,0 +1,117 @@
+% The batching lineage, drawn as token grids: rows are engine slots, columns are
+% iterations, cells are scheduled tokens. (a)-(c) are the known history; (d) is
+% this paper. The story each panel must carry: where the waste lives.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  cell/.style={draw=black!35, line width=0.3pt, inner sep=0},
+  lab/.style={font=\sffamily\tiny, align=left},
+]
+% cell geometry
+\def\s{0.30}   % cell size, cm
+
+% ---- cell painters: #1 panel x, #2 panel y, #3 row, #4 col ----------------
+\newcommand{\conn}[4]{\fill[accent!85] ({#1+#4*\s},{#2-#3*\s}) rectangle
+  ({#1+#4*\s+\s},{#2-#3*\s-\s}); \draw[black!35, line width=0.3pt]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});}
+\newcommand{\cpre}[4]{\fill[accent!30] ({#1+#4*\s},{#2-#3*\s}) rectangle
+  ({#1+#4*\s+\s},{#2-#3*\s-\s}); \draw[black!35, line width=0.3pt]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});}
+\newcommand{\cbat}[4]{\fill[black!40] ({#1+#4*\s},{#2-#3*\s}) rectangle
+  ({#1+#4*\s+\s},{#2-#3*\s-\s}); \draw[black!35, line width=0.3pt]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});}
+\newcommand{\cwaste}[4]{\fill[pattern=north east lines, pattern color=black!30]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});
+  \draw[black!25, line width=0.3pt]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});}
+\newcommand{\cqueue}[4]{\draw[black!35, line width=0.3pt, densely dotted]
+  ({#1+#4*\s},{#2-#3*\s}) rectangle ({#1+#4*\s+\s},{#2-#3*\s-\s});}
+
+% ═══════════ legend (top, spans both columns) ═══════════
+\begin{scope}[shift={(0,0.9)}]
+  \fill[accent!85] (0,0) rectangle (\s,-\s);   \node[lab, anchor=west] at (0.36,-0.15) {online tokens};
+  \fill[accent!30] (2.0,0) rectangle (2.3,-\s); \node[lab, anchor=west] at (2.36,-0.15) {prefill chunk};
+  \fill[black!40]  (3.9,0) rectangle (4.2,-\s); \node[lab, anchor=west] at (4.26,-0.15) {batch-job tokens};
+  \fill[pattern=north east lines, pattern color=black!30] (6.3,0) rectangle (6.6,-\s);
+  \node[lab, anchor=west] at (6.66,-0.15) {budget wasted / unspent};
+  \draw[black!35, densely dotted, line width=0.3pt] (9.2,0) rectangle (9.5,-\s);
+  \node[lab, anchor=west] at (9.56,-0.15) {arrival queued outside};
+\end{scope}
+
+% ═══════════ (a) static batching (top-left) ═══════════
+\begin{scope}[shift={(0,0)}]
+  \node[anchor=west, font=\sffamily\scriptsize\bfseries] at (0,0.35) {(a) static batching};
+  % rows finish at different cols; all wait for the longest (col 8)
+  \cpre{0}{0}{0}{0}\foreach \c in {1,2,3}{\conn{0}{0}{0}{\c}}\foreach \c in {4,...,8}{\cwaste{0}{0}{0}{\c}}
+  \cpre{0}{0}{1}{0}\foreach \c in {1,...,8}{\conn{0}{0}{1}{\c}}
+  \cpre{0}{0}{2}{0}\foreach \c in {1,...,5}{\conn{0}{0}{2}{\c}}\foreach \c in {6,7,8}{\cwaste{0}{0}{2}{\c}}
+  \cpre{0}{0}{3}{0}\foreach \c in {1,...,4}{\conn{0}{0}{3}{\c}}\foreach \c in {5,...,8}{\cwaste{0}{0}{3}{\c}}
+  \node[lab, anchor=north west, text=black!60] at (0,-1.32)
+    {every early finisher idles until the longest\\ request ends; arrivals wait for the next batch};
+\end{scope}
+
+% ═══════════ (b) dynamic batching (top-right) ═══════════
+\begin{scope}[shift={(6.6,0)}]
+  \node[anchor=west, font=\sffamily\scriptsize\bfseries] at (0,0.35) {(b) dynamic batching};
+  \cpre{0}{0}{0}{0}\foreach \c in {1,2,3}{\conn{0}{0}{0}{\c}}\foreach \c in {4,5}{\cwaste{0}{0}{0}{\c}}
+  \cpre{0}{0}{1}{0}\foreach \c in {1,...,5}{\conn{0}{0}{1}{\c}}
+  % second batch: arrives col 2, must queue until col 6
+  \foreach \c in {2,...,5}{\cqueue{0}{0}{2}{\c}}\cpre{0}{0}{2}{6}\foreach \c in {7,8}{\conn{0}{0}{2}{\c}}
+  \foreach \c in {2,...,5}{\cqueue{0}{0}{3}{\c}}\cpre{0}{0}{3}{6}\foreach \c in {7,8}{\conn{0}{0}{3}{\c}}
+  \node[lab, anchor=north west, text=black!60] at (0,-1.32)
+    {batches re-formed between runs: the door\\ moves faster, the waste inside remains};
+\end{scope}
+
+% ═══════════ (c) continuous batching + chunked prefill (bottom-left) ═══════════
+\begin{scope}[shift={(0,-2.6)}]
+  \node[anchor=west, font=\sffamily\scriptsize\bfseries] at (0,0.35)
+    {(c) continuous batching $+$ chunked prefill};
+  % row 0: request finishes col 4, a NEW request takes the slot at col 5
+  \cpre{0}{0}{0}{0}\foreach \c in {1,...,4}{\conn{0}{0}{0}{\c}}\cpre{0}{0}{0}{5}\foreach \c in {6,7,8}{\conn{0}{0}{0}{\c}}
+  % row 1: request enters mid-flight at col 2 (chunked prefill spans 2 cols)
+  \cqueue{0}{0}{1}{0}\cqueue{0}{0}{1}{1}\cpre{0}{0}{1}{2}\cpre{0}{0}{1}{3}\foreach \c in {4,...,8}{\conn{0}{0}{1}{\c}}
+  % rows 2-4: the budget nobody uses at sparse online load
+  \foreach \r in {2,3,4}{\foreach \c in {0,...,8}{\cwaste{0}{0}{\r}{\c}}}
+  \draw[decorate, decoration={brace, amplitude=3pt}, black!50]
+    (2.78,-0.60) -- (2.78,-1.50);
+  \node[lab, anchor=west, text=black!60] at (2.95,-1.05) {$\tau$ unspent:\\ nothing to run};
+  \node[lab, anchor=north west, text=black!60] at (0,-1.62)
+    {requests join and leave \emph{per iteration}; prefill is chunked\\
+     under $\tau$ --- but sparse online traffic leaves $\tau$ unspent};
+\end{scope}
+
+% ═══════════ (d) tidal: the contracted iteration (bottom-right) ═══════════
+\begin{scope}[shift={(6.6,-2.6)}]
+  \node[anchor=west, font=\sffamily\scriptsize\bfseries] at (0,0.35)
+    {(d) $+$ deadline-contracted batch jobs (Tidal)};
+  % same online pattern as (c)
+  \cpre{0}{0}{0}{0}\foreach \c in {1,...,4}{\conn{0}{0}{0}{\c}}\cpre{0}{0}{0}{5}\foreach \c in {6,7,8}{\conn{0}{0}{0}{\c}}
+  \cqueue{0}{0}{1}{0}\cqueue{0}{0}{1}{1}\cpre{0}{0}{1}{2}\cpre{0}{0}{1}{3}\foreach \c in {4,...,8}{\conn{0}{0}{1}{\c}}
+  % rows 2-3: batch-job tokens fill the slack, thinner where online prefills
+  \foreach \c in {0,...,8}{\cbat{0}{0}{2}{\c}}
+  \foreach \c in {0,1,4,5,6,7,8}{\cbat{0}{0}{3}{\c}}\cwaste{0}{0}{3}{2}\cwaste{0}{0}{3}{3}
+  % row 4: guardband stays open
+  \foreach \c in {0,...,8}{\cwaste{0}{0}{4}{\c}}
+  \draw[accent, dashed, line width=0.7pt] (0,-1.20) -- (2.70,-1.20);
+  \node[lab, anchor=west, text=accent!70!black] at (2.82,-1.20) {cap $X$ $+$\\ KV guardband};
+  \node[lab, anchor=north west, text=black!60] at (0,-1.62)
+    {the unspent remainder is \emph{sold}: batch requests at priority\\
+     $\ge 1$ fill to a cap, yielding where online work needs the room};
+\end{scope}
+\end{tikzpicture}
+\caption[The batching lineage]{\textbf{How serving learned to batch, and where Tidal
+sits.} Rows are engine slots, columns are iterations, cells are scheduled tokens.
+\emph{(a) Static batching} runs a fixed group to completion, so every early finisher
+idles until the longest request ends. \emph{(b) Dynamic batching} re-forms groups
+between runs; arrivals queue less, but the waste inside each run remains. \emph{(c)
+Continuous batching}~\citep{orca} rebuilds the working set every iteration and chunked
+prefill~\citep{sarathi} slices prompt processing under the token budget $\tau$ ---
+which removes the batching waste, but cannot conjure work: sparse online traffic
+leaves $\tau$ unspent. \emph{(d) Tidal} fills that remainder with tokens from
+deadline-contracted batch jobs, capped by the latency model and KV guardband so online
+work always has the room it needs. Each step widens what may share one iteration:
+requests of different lengths, then requests at different phases, then --- here ---
+two different products.}
+\label{fig:batching}
+\end{figure}

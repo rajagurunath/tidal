@@ -202,6 +202,29 @@ work (continuous batching), we say \emph{iteration} or \emph{decode batch}, neve
 \subsection{One budget, two products}
 \label{sec:budget}
 
+Where that budget comes from is best seen as the latest step in how LLM serving
+learned to batch, and \cref{fig:batching} draws the whole lineage. \emph{Static
+batching} runs a fixed group of requests to completion: the group is assembled once,
+and because generation lengths vary wildly, every request that finishes early leaves
+its slot idle until the longest one ends, while new arrivals wait outside for the next
+group. \emph{Dynamic batching} --- the pattern inference frontends popularized ---
+re-forms the group between runs, which shortens the wait at the door but keeps the
+waste inside each run. \emph{Continuous batching} dissolved the group altogether:
+Orca's iteration-level scheduling~\citep{orca} rebuilds the working set every
+iteration, so a finished request exits immediately and a new one takes its slot
+mid-flight, and chunked prefill~\citep{sarathi} slices long prompt processing under the
+same per-iteration token budget --- the $\tau$ that vLLM V1
+inherits~\citep{vllm,sarathi}. That step removed the waste batching granularity
+causes, but it cannot conjure work: when online traffic is sparse, the budget goes
+unspent all the same. Each step in this lineage widened what may share one iteration
+--- first requests of different lengths, then requests in different phases. Tidal is
+the next widening, to two different \emph{products}: the budget the online tier leaves
+unspent is filled, under an explicit latency cap, with tokens from deadline-contracted
+batch jobs. Continuous batching decides which requests join an iteration; Tidal
+decides on whose behalf the iteration runs.
+
+\input{fig-batching}
+
 The token budget the introduction sketched has an exact form: a vLLM V1 iteration
 schedules up to \code{max\_num\_batched\_tokens} ($\tau$) tokens across running and
 waiting requests, with $\tau$ sized so an iteration's latency fits the inter-token
