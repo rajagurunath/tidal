@@ -273,6 +273,7 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
   <div class="wrap">
     <span class="brand"><span class="mark">~</span>&nbsp;tidal</span>
     <nav class="topnav" aria-label="Sections">
+      <a href="#lineage">lineage</a>
       <a href="#gateway">A · gateway</a>
       <a href="#engine">B · engine</a>
       <a href="#sla">sla</a>
@@ -364,6 +365,62 @@ footer .wrap{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem}
 </section>
 
 <!-- ══════════════════════ TECHNIQUE A ══════════════════════ -->
+
+<!-- ══════════════════════ LINEAGE ══════════════════════ -->
+<section id="lineage">
+  <div class="wrap sec">
+    <p class="mark">&#8656;<small>how we<br>got here</small></p>
+    <div>
+      <div class="sechead">
+        <h2>how serving learned to batch</h2>
+        <p class="lede">Each generation of batching widened what may share one engine
+          iteration: first requests of different lengths, then requests in different
+          phases &#8212; and Tidal widens it to two different <em>products</em>.
+          Continuous batching decides which requests join an iteration; Tidal decides
+          on whose behalf the iteration runs. Watch one grid live through all four
+          eras.</p>
+      </div>
+
+      <figure class="fig">
+        <div class="fig-head">
+          <span id="f6-era">era 1 / 4 &#8212; static batching</span>
+          <span class="tag">rows = engine slots &#183; columns = iterations</span>
+        </div>
+        <div class="scroller s-mid" tabindex="0" role="region" aria-label="Animated batching lineage: one token grid cycling through static, dynamic, continuous, and Tidal eras">
+          <svg viewBox="0 0 640 260" role="img" aria-labelledby="f6t" preserveAspectRatio="xMinYMin meet">
+            <title id="f6t">One token grid living through four eras of batching</title>
+            <defs>
+              <pattern id="f6hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+                <line x1="0" y1="0" x2="0" y2="6" stroke="var(--rule-2)" stroke-width="1.4"/>
+              </pattern>
+            </defs>
+            <g id="f6-cells"></g>
+            <line id="f6-sweep" x1="60" y1="30" x2="60" y2="205" stroke="var(--risk)" stroke-width="1.2" opacity=".85"/>
+            <line id="f6-cap" x1="60" y1="170" x2="560" y2="170" stroke="var(--batch-t)" stroke-width="1.6" stroke-dasharray="6 4" opacity="0"/>
+            <text id="f6-caplab" class="svg-lab ba sm" x="558" y="186" text-anchor="end" opacity="0">cap X + KV guardband</text>
+            <text id="f6-note" class="svg-lab sm" x="60" y="234">a fixed group runs to completion &#8212; early finishers idle until the longest ends</text>
+          </svg>
+        </div>
+        <figcaption>
+          <ul class="legend">
+            <li><span class="sw o"></span>online tokens</li>
+            <li><span class="sw" style="background:var(--online); opacity:.35"></span>prefill chunk</li>
+            <li><span class="sw b"></span>batch-job tokens (Tidal)</li>
+            <li><span class="sw e" style="background:repeating-linear-gradient(45deg,var(--rule-2) 0 1px,transparent 1px 5px)"></span>budget wasted / unspent</li>
+            <li><span class="sw e" style="border-style:dotted"></span>arrival queued outside</li>
+          </ul>
+          <b>The same figure is Figure&nbsp;1 of the paper.</b> Static and dynamic
+          batching waste inside the run; continuous batching (Orca) with chunked
+          prefill (Sarathi-Serve) removes that waste but cannot conjure work &#8212;
+          sparse online traffic leaves the budget unspent. The fourth era fills the
+          remainder with deadline-contracted batch tokens under a latency cap and KV
+          guardband.
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
 <section id="gateway">
   <div class="wrap sec">
     <p class="mark a">A<small>gateway<br>technique</small></p>
@@ -1571,6 +1628,71 @@ b = client.batches.create(input_file_id=f.id,
       }
     };
   }, 11.0);   // static frame: tokens-out, the 31.8x headline visible
+
+  /* ─────────── fig 6 — the batching lineage, one grid through four eras ─────────── */
+  register("f6-cells", function (g) {
+    var X0 = 60, Y0 = 30, CW = 50, CH = 35, COLS = 10, ROWS = 5, PAD = 3;
+    var svgns = "http://www.w3.org/2000/svg";
+    var rects = [];
+    for (var r = 0; r < ROWS; r++) {
+      rects.push([]);
+      for (var c = 0; c < COLS; c++) {
+        var rc = document.createElementNS(svgns, "rect");
+        rc.setAttribute("x", X0 + c * CW + PAD); rc.setAttribute("y", Y0 + r * CH + PAD);
+        rc.setAttribute("width", CW - 2 * PAD); rc.setAttribute("height", CH - 2 * PAD);
+        rc.setAttribute("rx", 1.5);
+        g.appendChild(rc); rects[r].push(rc);
+      }
+    }
+    // P prefill, O online, B batch tokens, W waste/unspent, Q queued, . empty slot
+    var ERAS = [
+      { name: "era 1 / 4 — static batching",
+        note: "a fixed group runs to completion — early finishers idle until the longest ends",
+        grid: ["POOOWWWWWW", "POOOOOOOOO", "POOOOOWWWW", "POOOOWWWWW", ".........."] },
+      { name: "era 2 / 4 — dynamic batching",
+        note: "groups re-form between runs — the door moves faster, the waste inside remains",
+        grid: ["POOOWW....", "POOOOO....", "..QQQQPOOO", "..QQQQPOOO", ".........."] },
+      { name: "era 3 / 4 — continuous batching + chunked prefill",
+        note: "requests join/leave per iteration, prefill chunked under τ — sparse online load leaves τ unspent",
+        grid: ["POOOOPOOOO", "QQPPOOOOOO", "WWWWWWWWWW", "WWWWWWWWWW", "WWWWWWWWWW"] },
+      { name: "era 4 / 4 — + deadline-contracted batch jobs (Tidal)",
+        note: "the remainder is sold — batch tokens fill to cap X, yielding where online needs room",
+        grid: ["POOOOPOOOO", "QQPPOOOOOO", "BBBBBBBBBB", "BBWWBBBBBB", "WWWWWWWWWW"] }
+    ];
+    function paint(rc, s, revealed) {
+      rc.setAttribute("stroke-dasharray", s === "Q" ? "2 3" : "none");
+      if (!revealed) {
+        rc.setAttribute("fill", "none");
+        rc.setAttribute("stroke", "var(--rule)"); rc.setAttribute("opacity", ".45");
+        return;
+      }
+      rc.setAttribute("opacity", "1"); rc.setAttribute("stroke", "var(--rule-2)");
+      if (s === "P") { rc.setAttribute("fill", "var(--online)"); rc.setAttribute("opacity", ".35"); }
+      else if (s === "O") rc.setAttribute("fill", "var(--online)");
+      else if (s === "B") { rc.setAttribute("fill", "var(--batch)"); rc.setAttribute("opacity", ".85"); }
+      else if (s === "W") rc.setAttribute("fill", "url(#f6hatch)");
+      else if (s === "Q") rc.setAttribute("fill", "none");
+      else { rc.setAttribute("fill", "none"); rc.setAttribute("stroke", "var(--rule)"); rc.setAttribute("opacity", ".45"); }
+    }
+    var eraN = el("f6-era"), note = el("f6-note"), sweep = el("f6-sweep"),
+        cap = el("f6-cap"), caplab = el("f6-caplab");
+    var EP = 8, SWEEP_S = 5;
+    return function (t) {
+      var era = Math.floor(t / EP) % 4, p = t % EP;
+      var u = Math.min(1, p / SWEEP_S), col = u * COLS;
+      var E = ERAS[era];
+      setText(eraN, E.name); setText(note, E.note);
+      attr(sweep, "x1", (X0 + col * CW).toFixed(1));
+      attr(sweep, "x2", (X0 + col * CW).toFixed(1));
+      sweep.style.opacity = u < 1 ? ".85" : "0";
+      var showCap = era === 3;
+      cap.setAttribute("opacity", showCap ? ".9" : "0");
+      caplab.setAttribute("opacity", showCap ? "1" : "0");
+      for (var r = 0; r < ROWS; r++)
+        for (var c = 0; c < COLS; c++)
+          paint(rects[r][c], E.grid[r][c], c < col);
+    };
+  }, 30.0);   // static frame: era 4 fully swept — Tidal filling the remainder
 
   /* ─────────── driver ─────────── */
   var paused = reduce, raf = null, base = null, clock = 0;
