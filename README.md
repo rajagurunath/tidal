@@ -1,6 +1,6 @@
 # Tidal 🌊
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21905462.svg)](https://doi.org/10.5281/zenodo.21905462)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22067989.svg)](https://doi.org/10.5281/zenodo.22067989)
 
 **Batch + online co-serving for vLLM** — an OpenAI-compatible Batch API (`/v1/batches`, 24h SLA, half price) that runs on the *same* GPU as your online traffic, filling every iteration's spare token budget with batch work.
 

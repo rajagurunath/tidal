@@ -1,6 +1,6 @@
 # Tidal — preprint / venue submission package
 
-**PUBLISHED preprint v2.2: DOI [10.5281/zenodo.21967536](https://doi.org/10.5281/zenodo.21967536) (Zenodo, 2026-08-16, CC BY 4.0). Concept DOI (all versions): 10.5281/zenodo.21905461; v2.1 was 10.5281/zenodo.21905462.**
+**PUBLISHED preprint v2.3: DOI [10.5281/zenodo.22067989](https://doi.org/10.5281/zenodo.22067989) (Zenodo, 2026-08-23, CC BY 4.0). Concept DOI (all versions): 10.5281/zenodo.21905461; v2.2 was 10.5281/zenodo.21967536, v2.1 was 10.5281/zenodo.21905462.**
 
 Everything below is paste-ready for a preprint server (Zenodo; TechRxiv when it
 reopens) or a conference submission portal. Keep this file in sync with
@@ -11,7 +11,7 @@ reopens) or a conference submission portal. Keep this file in sync with
 
 | Purpose | File |
 |---|---|
-| Preprint PDF (upload this) | `docs/paper/tidal-paper-arxiv.pdf` (21 pp) |
+| Preprint PDF (upload this) | `docs/paper/tidal-paper-arxiv.pdf` (26 pp) |
 | IEEE conference version | `docs/paper/ieee/main-ieee.pdf` (15 pp, IEEEtran) |
 | LaTeX sources | `docs/paper/latex/`, `docs/paper/ieee/` |
 
@@ -25,7 +25,7 @@ Gurunath Lunkupali Venugopal — gurunathrajagopal@gmail.com
 
 ## Abstract (plain text)
 
-**(v2.2 — published 2026-08-16.)**
+**(v2.3 — published 2026-08-23. Abstract unchanged from v2.2; v2.3 adds the terminology convention and batching-lineage figure, fixes appendix float placement, trims Appendix A provenance.)**
 
 A serving node sized for interactive traffic spends most of its life well below
 its throughput ceiling. On our GPU testbed, a vLLM node serving only online
