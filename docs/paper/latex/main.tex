@@ -914,15 +914,6 @@ campaign on a current-generation model with kernel-level attribution
 \section{Artifact and provenance}
 \label{app:provenance}
 
-\paragraph{Spend and teardown.} Total GPU spend $\approx$\$7.73: \$6.79 in archived
-price-quote receipts across six hires plus a one-hour extension ($\approx$\$0.94) whose
-HTTP 200 was observed in-session but not archived. Three of six hires have archived
-DELETE receipts; two were expiry-reclaimed (DELETE returned 400 resource-not-found); the
-last was deleted manually with a receipt note in \code{evidence/TEARDOWN\_NOTES.md}. A
-live check after close showed zero running deployments. \$1.98 of spend (the first two
-hires) produced no data --- marketplace node failures --- and an honest
-cost-per-datapoint includes it.
-
 \paragraph{Harness defects.} (1) The direct-submission path fails at GPU scale
 twice-over: an unbounded drain (fixed with bounded salvage, 12 tests) and a remaining
 stall-after-warmup mode; it cost the \code{offline\_only}, \code{naive}, and technique-B
