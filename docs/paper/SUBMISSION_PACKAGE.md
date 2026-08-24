@@ -17,7 +17,7 @@ reopens) or a conference submission portal. Keep this file in sync with
 
 ## Title
 
-Tidal: A Deadline-Contracted Batch Tier for Unmodified LLM Serving Engines
+Tidal: Co-Serving Online and Batch LLM Traffic under Deadline Contracts
 
 ## Author
 
