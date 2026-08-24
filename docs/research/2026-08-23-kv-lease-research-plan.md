@@ -34,8 +34,8 @@ deadline + memory.
 
 ## What we already have (assets)
 
-- Tidal gateway + laxity dispatcher over unmodified vLLM (paper v2.3, DOI
-  10.5281/zenodo.22067989); the A-P freeze/thaw spike: 31.8× TTFT,
+- Tidal gateway + laxity dispatcher over unmodified vLLM (paper v2.4, DOI
+  10.5281/zenodo.22076918); the A-P freeze/thaw spike: 31.8× TTFT,
   bit-identical, KV ≈ 12 KiB/token on the spike model.
 - LazyCode: content-addressed waves, memo keys, plan DAGs — a real agentic
   batch client that emits exactly the structure hints this plan needs

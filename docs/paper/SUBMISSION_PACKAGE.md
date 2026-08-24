@@ -1,6 +1,6 @@
 # Tidal — preprint / venue submission package
 
-**PUBLISHED preprint v2.3: DOI [10.5281/zenodo.22067989](https://doi.org/10.5281/zenodo.22067989) (Zenodo, 2026-08-23, CC BY 4.0). Concept DOI (all versions): 10.5281/zenodo.21905461; v2.2 was 10.5281/zenodo.21967536, v2.1 was 10.5281/zenodo.21905462.**
+**PUBLISHED preprint v2.4: DOI [10.5281/zenodo.22076918](https://doi.org/10.5281/zenodo.22076918) (Zenodo, 2026-08-24, CC BY 4.0; retitled — content identical to v2.3). Concept DOI (all versions): 10.5281/zenodo.21905461; v2.3 was 10.5281/zenodo.22067989, v2.2 was 10.5281/zenodo.21967536, v2.1 was 10.5281/zenodo.21905462.**
 
 Everything below is paste-ready for a preprint server (Zenodo; TechRxiv when it
 reopens) or a conference submission portal. Keep this file in sync with
