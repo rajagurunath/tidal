@@ -48,9 +48,7 @@ batch discount. The [paper](docs/paper/) compares them head-to-head.
 The scheduling signal is **laxity** — how much time a job can still afford to
 lose before its deadline is at risk. A batch draining fast enough never escalates;
 one falling behind climbs on its own, early, without dragging every other batch
-with it:
-
-![Least-laxity-first escalation inside a 24h window](docs/assets/laxity.gif)
+with it. (Animated on the [project site](https://rajagurunath.github.io/tidal/).)
 
 ## Quickstart
 
@@ -71,15 +69,6 @@ b = client.batches.create(input_file_id=f.id, endpoint="/v1/chat/completions",
 ```
 
 Technique B: add `--scheduler-cls tidal.engine.scheduler.TidalScheduler` to `vllm serve`.
-
-## Widening the scope: the A-ladder
-
-The same idea climbs from one engine to a fleet, to disaggregated prefill/decode
-pools, and finally to parking work in *time* — freezing a finished prefill's KV
-to storage and thawing it hours later on a decode worker (31.8× faster than
-recomputing, bit-identical):
-
-![The A-ladder: A0 one engine, A-F fleet, A-D disaggregation, A-P freeze/thaw](docs/assets/a-ladder.gif)
 
 ## Status
 
